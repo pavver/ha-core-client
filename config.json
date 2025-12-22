@@ -1,0 +1,4 @@
+{
+  "HA_URL": "ws://homeassistant.local:8123/api/websocket",
+  "HA_TOKEN": "eyJhbGciOiJIUzI1NiIsInR6cCI6IkpXVCJ9.eyJpc3MiOiI3ZjRlNTgzZTNiZjM0MTBlYTRkMTRkZDM3MjQ0ZmQ4YiIsImlhdCI6MTc2NjI1Mzg3NywiZXhwIjoyMDgxNjEzODc3fQ.CFty4JjHts9y6bah8r1SUWubEeeoh_43CEdsbNwAlpQ"
+}
