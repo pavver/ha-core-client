@@ -1,14 +1,16 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use futures_util::{
     SinkExt, StreamExt,
     stream::{SplitSink, SplitStream},
 };
-use serde_json::json;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{error, info, warn};
+use log::trace;
+
+use super::protocol::{AuthMessage, BaseMessage, IncomingMsgType, OutgoingMsgType};
 
 async fn establish_ws_connection(
     url: &str,
@@ -25,36 +27,51 @@ async fn establish_ws_connection(
 
     let (mut writer, mut reader) = ws_stream.split();
 
-    // Отримання auth_required
-    let auth_required = reader.next().await.context("No auth_required message")??;
-    info!("Auth required: {:?}", auth_required);
+    // 1. Wait for auth_required
+    let auth_required_msg = reader.next().await.context("Did not receive a message from the server")??;
+    let auth_required_text = auth_required_msg.to_text()?;
+    trace!("<<< Received Auth Required: {}", auth_required_text);
+    let auth_required: BaseMessage = serde_json::from_str(auth_required_text)
+        .context("Failed to parse the first message from the server")?;
 
-    // TODO: Перевірити auth_required на успіх/невдачу
+    if auth_required.msg_type != IncomingMsgType::AuthRequired {
+        return Err(anyhow!(
+            "Expected 'auth_required', but got '{:?}'",
+            auth_required.msg_type
+        ));
+    }
+    info!("'auth_required' message received.");
 
-    // Відправка токену
-    let auth_msg = json!({
-        "type": "auth",
-        "access_token": token
-    })
-    .to_string();
-    writer.send(Message::Text(auth_msg.into())).await?;
+    // 2. Send auth token
+    let auth_msg = AuthMessage {
+        msg_type: OutgoingMsgType::Auth,
+        access_token: token,
+    };
+    let auth_str = serde_json::to_string(&auth_msg).context("Failed to serialize auth message")?;
+    trace!(">>> Sending Auth: {}", auth_str);
+    writer.send(Message::Text(auth_str.into())).await?;
+    info!("Authentication message sent.");
 
-    // Підтвердження аутентифікації
-    let auth_result_msg = reader.next().await.context("No auth result")??;
+    // 3. Wait for auth result
+    let auth_result_msg = reader.next().await.context("Did not receive auth result")??;
     let auth_result_text = auth_result_msg.to_text()?;
-    let auth_result_json: serde_json::Value = serde_json::from_str(auth_result_text)
-        .context("Failed to parse auth result JSON")?;
-    info!("Auth result: {}", auth_result_json);
+    trace!("<<< Received Auth Result: {}", auth_result_text);
+    let auth_result: BaseMessage = serde_json::from_str(auth_result_text)
+        .context("Failed to parse auth result")?;
 
-    if auth_result_json.get("type").and_then(|v| v.as_str()) == Some("auth_invalid") {
-        panic!("Authentication failed: Invalid token or credentials. Please check your configuration.");
+    match auth_result.msg_type {
+        IncomingMsgType::AuthOk => {
+            info!("Authentication successful ('auth_ok').");
+            Ok((writer, reader))
+        }
+        IncomingMsgType::AuthInvalid => Err(anyhow!(
+            "Authentication failed: Invalid token or credentials ('auth_invalid'). Please check your configuration."
+        )),
+        other => Err(anyhow!(
+            "Authentication failed: Expected 'auth_ok' or 'auth_invalid', but got '{:?}'",
+            other
+        )),
     }
-
-    if auth_result_json.get("type").and_then(|v| v.as_str()) != Some("auth_ok") {
-        panic!("Authentication failed: Did not receive auth_ok. Got: {}", auth_result_json);
-    }
-
-    Ok((writer, reader))
 }
 
 pub struct WsConnection {
@@ -65,9 +82,12 @@ pub struct WsConnection {
 }
 
 impl WsConnection {
-    pub async fn new(url: String, token: String) -> Result<Self> {
+    pub async fn new(url: &str, token: &str) -> Result<Self> {
         let (send_to_ws_tx, mut send_to_ws_rx) = mpsc::channel::<Message>(100); // HAClient sends here
         let (recv_from_ws_tx, recv_from_ws_rx) = mpsc::channel::<Message>(100); // HAClient receives from here
+
+        let url = url.to_string();
+        let token = token.to_string();
 
         tokio::spawn(async move {
             let retry_delay = std::time::Duration::from_secs(1);
@@ -91,6 +111,9 @@ impl WsConnection {
                                 while let Some(msg) = reader.next().await {
                                     match msg {
                                         Ok(message) => {
+                                            if let Message::Text(text) = &message {
+                                                trace!("<<< Received: {}", text);
+                                            }
                                             if let Err(e) = recv_from_ws_tx.send(message).await {
                                                 error!(
                                                     "Failed to send received message to HAClient: {}",
@@ -115,6 +138,9 @@ impl WsConnection {
                         // Spawn writer task for this connection
                         let mut writer_task_handle = tokio::spawn(async move {
                             while let Some(message) = current_conn_send_rx.recv().await {
+                                if let Message::Text(text) = &message {
+                                    trace!(">>> Sending: {}", text);
+                                }
                                 if let Err(e) = writer.send(message).await {
                                     error!("Failed to send message to WebSocket: {}", e);
                                     break;
@@ -132,6 +158,7 @@ impl WsConnection {
                                             error!("Failed to forward message to current connection writer, connection might be down.");
                                             break; // Break inner loop to try reconnect
                                         }
+
                                     } else {
                                         // send_to_ws_rx is closed, WsConnection was dropped
                                         info!("HAClient send channel closed, shutting down connection manager.");

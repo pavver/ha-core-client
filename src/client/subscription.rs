@@ -1,105 +1,62 @@
-use super::events;
-use super::state::HaState;
-use anyhow::{anyhow, Result};
-use serde_json::Value;
+use super::events::{self, HistoricalState};
+use super::state::{Domain, Service, HaState};
+use anyhow::Result;
+use chrono::{DateTime, Utc}; // Re-add
+use serde_json::Value; // Re-add
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 // --- New definitions for handler context and commands ---
 
-#[derive(Debug)]
 pub enum HandlerCommand {
-    GetState {
+    GetStateOnce {
         entity_id: String,
-        responder: oneshot::Sender<Result<Option<Value>>>,
+        responder: oneshot::Sender<Result<HaState>>,
     },
     CallService {
-        domain: String,
-        service: String,
+        domain: Domain,
+        service: Service,
         entity_id: Option<String>,
         service_data: Option<Value>,
         responder: oneshot::Sender<Result<()>>,
     },
+    GetHistory {
+        entity_id: String,
+        start_time: DateTime<Utc>,
+        end_time: DateTime<Utc>,
+        significant_changes_only: Option<bool>,
+        responder: oneshot::Sender<Result<Vec<HistoricalState>>>,
+    },
+    Subscribe {
+        event_type: String,
+        filter: EventFilter,
+        callback: EventCallback,
+        responder: oneshot::Sender<Result<Subscription>>,
+    },
+    Unsubscribe {
+        subscription_id: u32,
+        responder: oneshot::Sender<Result<()>>,
+    },
 }
 
-#[derive(Clone)]
-pub struct EventHandlerContext {
-    pub(super) command_tx: mpsc::Sender<HandlerCommand>,
+impl HandlerCommand {
+    pub fn name(&self) -> &'static str {
+        match self {
+            HandlerCommand::GetStateOnce { .. } => "GetStateOnce",
+            HandlerCommand::CallService { .. } => "CallService",
+            HandlerCommand::GetHistory { .. } => "GetHistory",
+            HandlerCommand::Subscribe { .. } => "Subscribe",
+            HandlerCommand::Unsubscribe { .. } => "Unsubscribe",
+        }
+    }
 }
 
-impl EventHandlerContext {
-    pub fn new(command_tx: mpsc::Sender<HandlerCommand>) -> Self {
-        Self { command_tx }
-    }
-
-    /// Fetches the state of an entity and returns it as a strongly-typed `HaState` enum.
-    pub async fn get_state(&self, entity_id: &str) -> Result<HaState> {
-        let (tx, rx) = oneshot::channel();
-        let cmd = HandlerCommand::GetState {
-            entity_id: entity_id.to_string(),
-            responder: tx,
-        };
-
-        if self.command_tx.send(cmd).await.is_err() {
-            return Err(anyhow!(
-                "Failed to send command to client: command channel closed."
-            ));
-        }
-
-        // Wait for the response from the client's event loop
-        let response = match tokio::time::timeout(Duration::from_secs(10), rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => return Err(anyhow!("Responder channel was dropped for get_state.")),
-            Err(_) => {
-                return Err(anyhow!(
-                    "Request timed out waiting for state of {}",
-                    entity_id
-                ))
-            }
-        };
-
-        // Convert the raw response into the HaState enum
-        match response {
-            Ok(Some(value)) => Ok(HaState::from_value(&value)),
-            Ok(None) => Err(anyhow!("Entity '{}' not found or state is null.", entity_id)),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// The core, generic function for calling any service. Helpers are preferred.
-    pub async fn call_service(
-        &self,
-        domain: String,
-        service: String,
-        entity_id: Option<String>,
-        service_data: Option<Value>,
-    ) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        let cmd = HandlerCommand::CallService {
-            domain,
-            service,
-            entity_id,
-            service_data,
-            responder: tx,
-        };
-
-        if self.command_tx.send(cmd).await.is_err() {
-            return Err(anyhow::anyhow!(
-                "Failed to send command to client: command channel closed."
-            ));
-        }
-
-        match tokio::time::timeout(Duration::from_secs(10), rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(anyhow::anyhow!(
-                "Responder channel was dropped for service call."
-            )),
-            Err(_) => Err(anyhow::anyhow!("Service call timed out.")),
-        }
-    }
+/// A handle to a subscription that can be used to unsubscribe.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Subscription {
+    pub id: u32,
 }
 
 // --- Modified EventCallback type for async handlers ---
@@ -107,7 +64,7 @@ impl EventHandlerContext {
 // Now uses the type-safe `events::Event` enum and returns a Result
 pub type EventCallback = Arc<
     dyn Fn(
-            EventHandlerContext,
+            super::HAClient, // The first argument is now the client handle
             events::Event,
         ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>
         + Send
@@ -131,12 +88,27 @@ pub enum EventFilter {
     Custom(Arc<dyn Fn(&serde_json::Value) -> bool + Send + Sync>),
 }
 
+impl std::fmt::Debug for EventFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EventFilter::Any => write!(f, "Any"),
+            EventFilter::ByEntityId(id) => f.debug_tuple("ByEntityId").field(id).finish(),
+            EventFilter::Custom(_) => f.debug_tuple("Custom").field(&"<function>").finish(),
+        }
+    }
+}
+
 impl HaEventSubscription {
-    pub fn new_state_changed(id: u32, entity_id: &str, callback: EventCallback) -> Self {
+    pub fn new(
+        id: u32,
+        event_type: String,
+        filter: EventFilter,
+        callback: EventCallback,
+    ) -> Self {
         HaEventSubscription {
             id,
-            event_type: "state_changed".to_string(),
-            filter: EventFilter::ByEntityId(entity_id.to_string()),
+            event_type,
+            filter,
             callback,
         }
     }

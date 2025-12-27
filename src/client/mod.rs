@@ -1,150 +1,251 @@
 pub mod connection;
 pub mod context_helpers;
 pub mod events;
-pub mod handler;
 pub mod pending;
+pub mod protocol;
+pub mod runner;
 pub mod state;
 pub mod subscription;
 
-use anyhow::Result;
-use serde_json::json;
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, error, info, warn};
+use std::sync::atomic::AtomicU64; // Ordering is needed by AtomicU64
+use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+use log::{info, debug};
 
-use connection::WsConnection;
-use subscription::{EventCallback, HandlerCommand, HaEventSubscription};
-use pending::{PendingCall, PendingGetStateCall, PendingServiceCall};
+use crate::client::events::HistoricalState;
+use crate::client::connection::WsConnection;
+use crate::client::state::{Domain, HaState, Service};
+use crate::client::subscription::{
+    EventCallback, EventFilter, HandlerCommand, Subscription,
+};
+
+
+// --- Main Client Struct ---
 
 pub struct HAClient {
-    conn: WsConnection,
-    msg_id: AtomicU64,
-    subscriptions: HashMap<u32, HaEventSubscription>,
+    command_tx: Option<Arc<mpsc::Sender<HandlerCommand>>>,
+    shutdown_tx: Option<Arc<watch::Sender<bool>>>,
+    #[doc(hidden)]
+    task_handle: Option<JoinHandle<Result<()>>>,
+}
+
+// Manual implementation of Clone for HAClient
+impl Clone for HAClient {
+    fn clone(&self) -> Self {
+        Self {
+            command_tx: self.command_tx.clone(),
+            shutdown_tx: self.shutdown_tx.clone(),
+            task_handle: None, // task_handle should not be cloned
+        }
+    }
+}
+
+impl Default for HAClient {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HAClient {
-    pub async fn new(url: &str, token: &str) -> Result<Self> {
-        let conn = WsConnection::new(url.to_string(), token.to_string()).await?;
-        Ok(Self {
+    /// Creates a new, un-connected Home Assistant client.
+    pub fn new() -> Self {
+        debug!("Creating new HAClient.");
+        Self {
+            command_tx: None,
+            shutdown_tx: None,
+            task_handle: None,
+        }
+    }
+
+    /// Connects to the Home Assistant instance, authenticates, and starts the background event loop.
+    pub async fn run(&mut self, url: &str, token: &str) -> Result<()> {
+        info!("HAClient attempting to run with URL: {} and token (hidden).", url);
+        if self.task_handle.is_some() {
+            return Err(anyhow!("Client is already running."));
+        }
+
+        let conn = WsConnection::new(url, token).await?;
+        let (command_tx_inner, command_rx) = mpsc::channel(100);
+        let command_tx = Arc::new(command_tx_inner);
+        let (shutdown_tx_inner, shutdown_rx) = watch::channel(false);
+        let shutdown_tx = Arc::new(shutdown_tx_inner);
+
+        self.command_tx = Some(command_tx.clone());
+        self.shutdown_tx = Some(shutdown_tx.clone());
+
+        let runner = ClientRunner {
             conn,
             msg_id: AtomicU64::new(1),
             subscriptions: HashMap::new(),
+            pending_one_shot_gets: HashMap::new(),
+            pending_api_calls: HashMap::new(),
+            shutdown_tx: shutdown_tx.clone(),
+        };
+
+        let handle = tokio::spawn(runner.run_loop(command_rx, shutdown_rx, command_tx.clone()));
+        self.task_handle = Some(handle);
+        debug!("HAClient runner task spawned.");
+
+        Ok(())
+    }
+
+    /// Stops the client's background event loop and waits for it to finish.
+    pub async fn stop(&mut self) -> Result<()> {
+        info!("HAClient stopping...");
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            if shutdown_tx.send(true).is_err() {
+                return Err(anyhow!(
+                    "Failed to send shutdown signal: receiver was dropped."
+                ));
+            }
+            debug!("Shutdown signal sent to HAClient runner.");
+        }
+
+        if let Some(handle) = self.task_handle.take() {
+            match handle.await {
+                Ok(Ok(_)) => {
+                    info!("HAClient stopped successfully.");
+                    Ok(())
+                },
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(anyhow!("Client task panicked: {}", e)),
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    fn get_command_tx(&self) -> Result<&Arc<mpsc::Sender<HandlerCommand>>> {
+        self.command_tx
+            .as_ref()
+            .ok_or_else(|| anyhow!("Client is not running."))
+    }
+
+    /// Subscribes to entities with a given `entity_id`.
+    pub async fn subscribe_entity(
+        &self,
+        entity_id: &str,
+        callback: EventCallback,
+    ) -> Result<Subscription> {
+        debug!("Subscribing to entity: {}", entity_id);
+        let (tx, rx) = oneshot::channel();
+        let cmd = HandlerCommand::Subscribe {
+            event_type: "state_changed".to_string(),
+            filter: EventFilter::ByEntityId(entity_id.to_string()),
+            callback,
+            responder: tx,
+        };
+        self.get_command_tx()?.send(cmd).await?;
+        rx.await?
+    }
+
+    /// Unsubscribes from an event stream.
+    pub async fn unsubscribe(&self, subscription: Subscription) -> Result<()> {
+        debug!("Unsubscribing from subscription ID: {}", subscription.id);
+        let (tx, rx) = oneshot::channel();
+        let cmd = HandlerCommand::Unsubscribe {
+            subscription_id: subscription.id,
+            responder: tx,
+        };
+        self.get_command_tx()?.send(cmd).await?;
+        rx.await?
+    }
+
+    // --- Methods for interacting with Home Assistant ---
+
+    pub async fn get_state(&self, entity_id: &str) -> Result<HaState> {
+        debug!("Requesting state for entity: {}", entity_id);
+        let (tx, rx) = oneshot::channel();
+        let cmd = HandlerCommand::GetStateOnce {
+            entity_id: entity_id.to_string(),
+            responder: tx,
+        };
+        self.get_command_tx()?.send(cmd).await?;
+        rx.await?
+    }
+
+    pub async fn get_history(
+        &self,
+        entity_id: &str,
+        start_time: chrono::DateTime<chrono::Utc>,
+        end_time: chrono::DateTime<chrono::Utc>,
+        significant_changes_only: Option<bool>,
+    ) -> Result<Vec<HistoricalState>> {
+        let (tx, rx) = oneshot::channel();
+        let cmd = HandlerCommand::GetHistory {
+            entity_id: entity_id.to_string(),
+            start_time,
+            end_time,
+            significant_changes_only,
+            responder: tx,
+        };
+        self.get_command_tx()?.send(cmd).await?;
+        rx.await?
+    }
+
+    pub async fn get_state_at_time(
+        &self,
+        entity_id: &str,
+        timestamp: chrono::DateTime<chrono::Utc>,
+        lookback_duration: chrono::Duration,
+    ) -> Result<events::State> {
+        debug!(
+            "Requesting state for entity: {} at time: {} with lookback duration: {:?}",
+            entity_id, timestamp, lookback_duration
+        );
+        // Query a period (lookback_duration) before the target timestamp to ensure we capture the state.
+        // We use significant_changes_only for efficiency.
+        let start_time = timestamp - lookback_duration;
+        let history = self
+            .get_history(entity_id, start_time, timestamp, Some(true))
+            .await?;
+
+        get_state_from_history(history, timestamp).ok_or_else(|| {
+            anyhow!(
+                "Could not find a state for entity '{}' in the time window ending at {}",
+                entity_id,
+                timestamp
+            )
         })
     }
 
-    pub async fn subscribe_entity(
-        &mut self,
-        entity_id: &str,
-        callback: EventCallback,
+    pub async fn call_service(
+        &self,
+        domain: Domain,
+        service: Service,
+        entity_id: Option<&str>,
+        service_data: Option<serde_json::Value>,
     ) -> Result<()> {
-        let id = self.msg_id.fetch_add(1, Ordering::Relaxed) as u32;
-        let sub = HaEventSubscription::new_state_changed(id, entity_id, callback);
-        
-        let subscribe_msg = json!({
-            "id": id,
-            "type": "subscribe_events",
-            "event_type": &sub.event_type,
-        });
-
-        self.conn.send_tx.send(Message::Text(subscribe_msg.to_string().into())).await?;
-        info!("Subscribed to event type '{}' for entity '{}'", &sub.event_type, entity_id);
-
-        self.subscriptions.insert(id, sub);
-        Ok(())
+        debug!("Calling service: {}.{} for entity: {:?}", domain, service, entity_id);
+        let (tx, rx) = oneshot::channel();
+        let cmd = HandlerCommand::CallService {
+            domain,
+            service,
+            entity_id: entity_id.map(|s| s.to_string()),
+            service_data,
+            responder: tx,
+        };
+        self.get_command_tx()?.send(cmd).await?;
+        rx.await?
     }
+}
 
-    pub async fn run(mut self) -> Result<()> {
-        info!("Starting HAClient event loop...");
-        
-        let (handler_cmd_tx, mut handler_cmd_rx) = mpsc::channel::<HandlerCommand>(100);
-        let mut pending_api_calls: HashMap<u64, PendingCall> = HashMap::new();
+use crate::client::runner::ClientRunner;
 
-        loop {
-            tokio::select! {
-                Some(cmd) = handler_cmd_rx.recv() => {
-                    let call_id = self.msg_id.fetch_add(1, Ordering::Relaxed);
-                    
-                    let (pending_call, ha_message) = match cmd {
-                        HandlerCommand::GetState { entity_id, responder } => {
-                            debug!("Processing get_state for '{}' with call_id {}", entity_id, call_id);
-                            let pending = PendingCall::GetState(PendingGetStateCall { entity_id, responder });
-                            let msg = json!({ "id": call_id, "type": "get_states" });
-                            (pending, msg)
-                        },
-                        HandlerCommand::CallService { domain, service, entity_id, service_data, responder } => {
-                            debug!("Processing call_service {}.{} with call_id {}", domain, service, call_id);
-                            let pending = PendingCall::ServiceCall(PendingServiceCall { responder });
-                            
-                            // Merge entity_id into service_data if it exists
-                            let mut final_service_data = service_data.unwrap_or_else(|| json!({}));
-                            if let Some(eid) = entity_id {
-                                if let Some(map) = final_service_data.as_object_mut() {
-                                    map.insert("entity_id".to_string(), json!(eid));
-                                } else {
-                                    // If service_data is not an object, we create one.
-                                    // This is unlikely but good to handle.
-                                    final_service_data = json!({ "entity_id": eid });
-                                }
-                            }
+// --- Private helper functions ---
 
-                            let msg = json!({
-                                "id": call_id,
-                                "type": "call_service",
-                                "domain": domain,
-                                "service": service,
-                                "service_data": final_service_data
-                            });
-                            (pending, msg)
-                        }
-                    };
-
-                    if self.conn.send_tx.send(Message::Text(ha_message.to_string().into())).await.is_err() {
-                        error!("Connection send channel closed, cannot process command.");
-                        // The pending call is dropped here, which closes the oneshot, signaling an error.
-                    } else {
-                        pending_api_calls.insert(call_id, pending_call);
-                    }
-                },
-
-                Some(ws_msg) = self.conn.recv_rx.recv() => {
-                    match ws_msg {
-                        Message::Text(text) => {
-                            if text == "CONNECTED" {
-                                info!("WebSocket connected. Re-subscribing...");
-                                for (id, sub) in &self.subscriptions {
-                                    let subscribe_msg = json!({
-                                        "id": id,
-                                        "type": "subscribe_events",
-                                        "event_type": &sub.event_type,
-                                    });
-                                                                         if self.conn.send_tx.send(Message::Text(subscribe_msg.to_string().into())).await.is_err() {                                        error!("Failed to re-subscribe {}, connection send channel closed.", id);
-                                    }
-                                }
-                                continue;
-                            }
-                            if text == "DISCONNECTED" {
-                                warn!("WebSocket disconnected. Pending API calls will fail.");
-                                pending_api_calls.clear();
-                                continue;
-                            }
-                            self.handle_ha_message(&text, &handler_cmd_tx, &mut pending_api_calls).await;
-                        }
-                        Message::Close(_) => {
-                            info!("WebSocket connection closed. Shutting down client.");
-                            break;
-                        }
-                        _ => { /* Ignore Ping/Pong/Binary */ }
-                    }
-                },
-                
-                else => {
-                    info!("Client channels closed. Shutting down.");
-                    break
-                },
-            }
-        }
-        Ok(())
-    }
+/// Helper function to find the state of an entity at a specific timestamp from a list of historical states.
+/// It robustly finds the latest state at or before the target time, without assuming the list is sorted.
+fn get_state_from_history(
+    history: Vec<HistoricalState>,
+    target_timestamp: chrono::DateTime<chrono::Utc>,
+) -> Option<events::State> {
+    history
+        .into_iter()
+        .filter(|state| state.last_updated <= target_timestamp)
+        .max_by_key(|state| state.last_updated)
+        .map(Into::into)
 }
