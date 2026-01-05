@@ -2,10 +2,12 @@ pub mod connection;
 pub mod context_helpers;
 pub mod events;
 pub mod pending;
+pub mod handler; // Add this
 pub mod protocol;
 pub mod runner;
 pub mod state;
 pub mod subscription;
+pub mod triggers;
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -14,6 +16,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use log::{info, debug};
+use std::time::Duration; // Add this
 
 use crate::client::events::HistoricalState;
 use crate::client::connection::WsConnection;
@@ -125,17 +128,23 @@ impl HAClient {
     }
 
     /// Subscribes to entities with a given `entity_id`.
-    pub async fn subscribe_entity(
+    pub async fn subscribe_entity<F, Fut>(
         &self,
         entity_id: &str,
-        callback: EventCallback,
-    ) -> Result<Subscription> {
+        callback: F,
+    ) -> Result<Subscription>
+    where
+        F: Fn(crate::client::HAClient, crate::client::events::Event) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
         debug!("Subscribing to entity: {}", entity_id);
         let (tx, rx) = oneshot::channel();
         let cmd = HandlerCommand::Subscribe {
-            event_type: "state_changed".to_string(),
-            filter: EventFilter::ByEntityId(entity_id.to_string()),
-            callback,
+            details: crate::client::subscription::InternalSubscriptionDetails::Event {
+                event_type: "state_changed".to_string(),
+                filter: EventFilter::ByEntityId(entity_id.to_string()),
+            },
+            callback: Arc::new(move |client, event| Box::pin(callback(client, event))), // Wrap in Arc
             responder: tx,
         };
         self.get_command_tx()?.send(cmd).await?;
@@ -156,7 +165,7 @@ impl HAClient {
 
     // --- Methods for interacting with Home Assistant ---
 
-    pub async fn get_state(&self, entity_id: &str) -> Result<HaState> {
+    pub async fn get_state(&self, entity_id: &str) -> Result<events::State> {
         debug!("Requesting state for entity: {}", entity_id);
         let (tx, rx) = oneshot::channel();
         let cmd = HandlerCommand::GetStateOnce {
@@ -212,6 +221,38 @@ impl HAClient {
         })
     }
 
+    pub async fn get_states(&self) -> Result<Vec<events::State>> {
+        debug!("Requesting all states");
+        let (tx, rx) = oneshot::channel();
+        let cmd = HandlerCommand::GetStates { responder: tx };
+        self.get_command_tx()?.send(cmd).await?;
+        rx.await?
+    }
+
+    /// Subscribes to all `call_service` events.
+    /// The provided callback will be invoked whenever any service is called in Home Assistant.
+    pub async fn subscribe_service_calls<F, Fut>(
+        &self,
+        callback: F,
+    ) -> Result<Subscription>
+    where
+        F: Fn(crate::client::HAClient, crate::client::events::Event) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        debug!("Subscribing to all service_called events");
+        let (tx, rx) = oneshot::channel();
+        let cmd = HandlerCommand::Subscribe {
+            details: crate::client::subscription::InternalSubscriptionDetails::Event {
+                event_type: "call_service".to_string(),
+                filter: EventFilter::Any,
+            },
+            callback: Arc::new(move |client, event| Box::pin(callback(client, event))), // Wrap in Arc
+            responder: tx,
+        };
+        self.get_command_tx()?.send(cmd).await?;
+        rx.await?
+    }
+
     pub async fn call_service(
         &self,
         domain: Domain,
@@ -230,6 +271,158 @@ impl HAClient {
         };
         self.get_command_tx()?.send(cmd).await?;
         rx.await?
+    }
+
+    async fn subscribe_trigger_internal(
+        &self,
+        trigger_config: triggers::Trigger,
+        callback: EventCallback,
+    ) -> Result<Subscription> {
+        debug!("Subscribing to trigger: {:?}", trigger_config);
+        let (tx, rx) = oneshot::channel();
+        let cmd = HandlerCommand::Subscribe {
+            details: crate::client::subscription::InternalSubscriptionDetails::Trigger { trigger: trigger_config },
+            callback,
+            responder: tx,
+        };
+        self.get_command_tx()?.send(cmd).await?;
+        rx.await?
+    }
+
+    pub async fn subscribe_state_trigger<F, Fut>(
+        &self,
+        entity_id: &str,
+        to: Option<HaState>,
+        from: Option<HaState>,
+        for_duration: Option<Duration>,
+        callback: F,
+    ) -> Result<Subscription>
+    where
+        F: Fn(crate::client::HAClient, crate::client::events::Event) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        let trigger_config = triggers::Trigger::State(triggers::StateTrigger {
+            entity_id: entity_id.to_string(),
+            to,
+            from,
+            r#for: for_duration,
+            attribute: None,
+        });
+        let arc_callback: EventCallback = Arc::new(move |client, event| Box::pin(callback(client, event)));
+        self.subscribe_trigger_internal(trigger_config, arc_callback).await
+    }
+
+    pub async fn subscribe_numeric_state_trigger<F, Fut>(
+        &self,
+        entity_id: &str,
+        above: Option<f64>,
+        below: Option<f64>,
+        for_duration: Option<Duration>,
+        callback: F,
+    ) -> Result<Subscription>
+    where
+        F: Fn(crate::client::HAClient, crate::client::events::Event) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        let trigger_config = triggers::Trigger::NumericState(triggers::NumericStateTrigger {
+            entity_id: entity_id.to_string(),
+            above,
+            below,
+            r#for: for_duration,
+            attribute: None,
+        });
+        let arc_callback: EventCallback = Arc::new(move |client, event| Box::pin(callback(client, event)));
+        self.subscribe_trigger_internal(trigger_config, arc_callback).await
+    }
+
+    pub async fn subscribe_sun_trigger<F, Fut>(
+        &self,
+        event: triggers::SunEvent,
+        offset: Option<Duration>,
+        callback: F,
+    ) -> Result<Subscription>
+    where
+        F: Fn(crate::client::HAClient, crate::client::events::Event) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        let trigger_config = triggers::Trigger::Sun(triggers::SunTrigger {
+            event,
+            offset,
+        });
+        let arc_callback: EventCallback = Arc::new(move |client, event| Box::pin(callback(client, event)));
+        self.subscribe_trigger_internal(trigger_config, arc_callback).await
+    }
+
+    pub async fn subscribe_time_trigger<F, Fut>(
+        &self,
+        at: String,
+        callback: F,
+    ) -> Result<Subscription>
+    where
+        F: Fn(crate::client::HAClient, crate::client::events::Event) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        let trigger_config = triggers::Trigger::Time(triggers::TimeTrigger { at });
+        let arc_callback: EventCallback = Arc::new(move |client, event| Box::pin(callback(client, event)));
+        self.subscribe_trigger_internal(trigger_config, arc_callback).await
+    }
+
+    pub async fn subscribe_time_pattern_trigger<F, Fut>(
+        &self,
+        hours: Option<String>,
+        minutes: Option<String>,
+        seconds: Option<String>,
+        callback: F,
+    ) -> Result<Subscription>
+    where
+        F: Fn(crate::client::HAClient, crate::client::events::Event) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        let trigger_config = triggers::Trigger::TimePattern(triggers::TimePatternTrigger {
+            hours,
+            minutes,
+            seconds,
+        });
+        let arc_callback: EventCallback = Arc::new(move |client, event| Box::pin(callback(client, event)));
+        self.subscribe_trigger_internal(trigger_config, arc_callback).await
+    }
+
+    pub async fn subscribe_template_trigger<F, Fut>(
+        &self,
+        value_template: String,
+        for_duration: Option<Duration>,
+        callback: F,
+    ) -> Result<Subscription>
+    where
+        F: Fn(crate::client::HAClient, crate::client::events::Event) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        let trigger_config = triggers::Trigger::Template(triggers::TemplateTrigger {
+            value_template,
+            r#for: for_duration,
+        });
+        let arc_callback: EventCallback = Arc::new(move |client, event| Box::pin(callback(client, event)));
+        self.subscribe_trigger_internal(trigger_config, arc_callback).await
+    }
+
+    pub async fn subscribe_zone_trigger<F, Fut>(
+        &self,
+        entity_id: &str,
+        zone: &str,
+        event: triggers::ZoneEvent,
+        callback: F,
+    ) -> Result<Subscription>
+    where
+        F: Fn(crate::client::HAClient, crate::client::events::Event) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        let trigger_config = triggers::Trigger::Zone(triggers::ZoneTrigger {
+            entity_id: entity_id.to_string(),
+            zone: zone.to_string(),
+            event,
+        });
+        let arc_callback: EventCallback = Arc::new(move |client, event| Box::pin(callback(client, event)));
+        self.subscribe_trigger_internal(trigger_config, arc_callback).await
     }
 }
 

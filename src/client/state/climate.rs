@@ -1,8 +1,10 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use strum::{EnumString, Display, AsRefStr};
 
 /// Represents the possible HVAC modes for a climate entity.
-#[derive(Debug, PartialEq, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, PartialEq, Clone, Copy, Deserialize, EnumString, Display, AsRefStr, Serialize)]
+#[serde(rename_all = "snake_case")] // Keep for serde deserialization
+#[strum(serialize_all = "snake_case", ascii_case_insensitive)] // Add for strum EnumString and Display
 pub enum HvacMode {
     Off,
     Heat,
@@ -13,24 +15,10 @@ pub enum HvacMode {
     FanOnly,
 }
 
-impl HvacMode {
-    /// Converts the enum variant to the string representation Home Assistant expects.
-    pub fn to_ha_string(&self) -> &'static str {
-        match self {
-            HvacMode::Off => "off",
-            HvacMode::Heat => "heat",
-            HvacMode::Cool => "cool",
-            HvacMode::HeatCool => "heat_cool",
-            HvacMode::Auto => "auto",
-            HvacMode::Dry => "dry",
-            HvacMode::FanOnly => "fan_only",
-        }
-    }
-}
-
 /// Represents the fan modes for a climate entity.
-#[derive(Debug, PartialEq, Clone, Copy, Deserialize)]
+#[derive(Debug, PartialEq, Clone, Copy, Deserialize, EnumString, Display, AsRefStr, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
 pub enum FanMode {
     Auto,
     Low,
@@ -38,20 +26,10 @@ pub enum FanMode {
     High,
 }
 
-impl FanMode {
-    pub fn to_ha_string(&self) -> &'static str {
-        match self {
-            FanMode::Auto => "auto",
-            FanMode::Low => "low",
-            FanMode::Medium => "medium",
-            FanMode::High => "high",
-        }
-    }
-}
-
 /// Represents the swing modes for a climate entity.
-#[derive(Debug, PartialEq, Clone, Copy, Deserialize)]
+#[derive(Debug, PartialEq, Clone, Copy, Deserialize, EnumString, Display, AsRefStr, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
 pub enum SwingMode {
     On,
     Off,
@@ -59,20 +37,8 @@ pub enum SwingMode {
     Horizontal,
     Both,
 }
-
-impl SwingMode {
-    pub fn to_ha_string(&self) -> &'static str {
-        match self {
-            SwingMode::On => "on",
-            SwingMode::Off => "off",
-            SwingMode::Vertical => "vertical",
-            SwingMode::Horizontal => "horizontal",
-            SwingMode::Both => "both",
-        }
-    }
-}
 /// Represents common preset modes, with a fallback for custom presets.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Display, AsRefStr)]
 pub enum PresetMode {
     Eco,
     Away,
@@ -103,17 +69,23 @@ impl<'de> Deserialize<'de> for PresetMode {
     }
 }
 
-impl PresetMode {
-    pub fn to_ha_string(&self) -> String {
+impl Serialize for PresetMode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
         match self {
-            PresetMode::Eco => "eco".to_string(),
-            PresetMode::Away => "away".to_string(),
-            PresetMode::Boost => "boost".to_string(),
-            PresetMode::Comfort => "comfort".to_string(),
-            PresetMode::Home => "home".to_string(),
-            PresetMode::Sleep => "sleep".to_string(),
-            PresetMode::Activity => "activity".to_string(),
-            PresetMode::Custom(custom) => custom.clone(),
+            PresetMode::Eco => serializer.serialize_str("eco"),
+            PresetMode::Away => serializer.serialize_str("away"),
+            PresetMode::Boost => serializer.serialize_str("boost"),
+            PresetMode::Comfort => serializer.serialize_str("comfort"),
+            PresetMode::Home => serializer.serialize_str("home"),
+            PresetMode::Sleep => serializer.serialize_str("sleep"),
+            PresetMode::Activity => serializer.serialize_str("activity"),
+            PresetMode::Custom(s) => serializer.serialize_str(s),
         }
     }
 }
+
+
+

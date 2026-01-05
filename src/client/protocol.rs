@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use chrono::{DateTime, Utc};
+use crate::client::triggers::Trigger;
 
 // Outgoing Messages
 
@@ -26,6 +27,14 @@ pub(crate) struct SubscribeEventsMessage {
 }
 
 #[derive(Debug, Serialize)]
+pub(crate) struct SubscribeTriggerMessage {
+    #[serde(rename = "type")]
+    pub msg_type: OutgoingMsgType,
+    #[serde(flatten)]
+    pub trigger: Trigger,
+}
+
+#[derive(Debug, Serialize)]
 pub(crate) struct SubscribeEntitiesMessage<'a> {
     #[serde(rename = "type")]
     pub msg_type: OutgoingMsgType,
@@ -47,12 +56,6 @@ pub(crate) struct CallServiceMessage {
     pub service: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_data: Option<Value>,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct GetStatesMessage {
-    #[serde(rename = "type")]
-    pub msg_type: OutgoingMsgType,
 }
 
 #[derive(Debug, Serialize)]
@@ -98,6 +101,8 @@ pub(crate) enum OutgoingMsgType {
     Auth,
     #[serde(rename = "subscribe_events")]
     SubscribeEvents,
+    #[serde(rename = "subscribe_triggers")]
+    SubscribeTriggers,
     #[serde(rename = "subscribe_entities")]
     SubscribeEntities,
     #[serde(rename = "unsubscribe_events")]

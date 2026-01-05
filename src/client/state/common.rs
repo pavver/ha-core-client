@@ -1,7 +1,7 @@
-use serde::Deserialize;
-use std::fmt;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use strum::Display;
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Display)]
 pub enum UnitOfMeasurement {
     // Electrical
     Volts,
@@ -21,7 +21,7 @@ pub enum UnitOfMeasurement {
 impl<'de> Deserialize<'de> for UnitOfMeasurement {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        D: serde::Deserializer<'de>,
+        D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
         Ok(match s.as_str() {
@@ -37,18 +37,22 @@ impl<'de> Deserialize<'de> for UnitOfMeasurement {
     }
 }
 
-impl fmt::Display for UnitOfMeasurement {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let text = match self {
+impl Serialize for UnitOfMeasurement {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match self {
             UnitOfMeasurement::Volts => "V",
             UnitOfMeasurement::Amperes => "A",
             UnitOfMeasurement::Watts => "W",
-            UnitOfMeasurement::KilowattHours => "kWh",
+            UnitOfMeasurement::KilowattHours => "kW",
             UnitOfMeasurement::Celsius => "°C",
             UnitOfMeasurement::Fahrenheit => "°F",
             UnitOfMeasurement::Percentage => "%",
-            UnitOfMeasurement::Custom(s) => s.as_str(),
-        };
-        write!(f, "{}", text)
+            UnitOfMeasurement::Custom(s) => s,
+        })
     }
 }
+
+

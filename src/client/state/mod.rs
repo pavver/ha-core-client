@@ -2,16 +2,22 @@ pub mod alarm;
 pub mod climate;
 pub mod common;
 pub mod cover;
+pub mod device_class;
 pub mod lock;
+pub mod state_class;
 
+use strum::{EnumString, Display};
 use self::{
     alarm::AlarmState, climate::HvacMode, cover::CoverState, lock::LockState,
 };
 use serde_json::Value;
 use std::fmt;
+use std::str::FromStr;
+use serde::Serialize;
 
 /// Represents the state of a Home Assistant entity in a strongly-typed way.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Serialize)]
+#[serde(untagged)]
 pub enum HaState {
     // General
     On,
@@ -63,17 +69,17 @@ impl HaState {
 
             _ => {
                 // Check domain-specific states before falling back to generic types
-                if let Some(state) = LockState::from_str(s) {
+                if let Ok(state) = LockState::from_str(s) {
                     return HaState::Lock(state);
                 }
-                if let Some(state) = AlarmState::from_str(s) {
+                if let Ok(state) = AlarmState::from_str(s) {
                     return HaState::Alarm(state);
                 }
-                if let Some(state) = CoverState::from_str(s) {
+                if let Ok(state) = CoverState::from_str(s) {
                     return HaState::Cover(state);
                 }
 				//This can be done with a macro in future
-                if let Ok(state) = serde_json::from_str::<HvacMode>(&format!("\"{}\"", s)) {
+                if let Ok(state) = HvacMode::from_str(s) {
                     return HaState::Climate(state);
                 }
 
@@ -105,7 +111,7 @@ impl fmt::Display for HaState {
 
             // Domain-specific
             HaState::Alarm(state) => write!(f, "{}", state),
-            HaState::Climate(state) => write!(f, "{}", state.to_ha_string()),
+            HaState::Climate(state) => write!(f, "{}", state.to_string()),
             HaState::Cover(state) => write!(f, "{}", state),
             HaState::Lock(state) => write!(f, "{}", state),
             
@@ -116,7 +122,8 @@ impl fmt::Display for HaState {
     }
 }
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy, EnumString, Display, Serialize)]
+#[strum(serialize_all = "snake_case")]
 pub enum Domain {
     InputNumber,
     HomeAssistant,
@@ -126,30 +133,13 @@ pub enum Domain {
     AlarmControlPanel,
     Lock,
     Cover,
+    Switch,
+    Light,
 }
 
-impl Domain {
-    pub fn to_str(&self) -> &'static str {
-        match self {
-            Domain::InputNumber => "input_number",
-            Domain::HomeAssistant => "homeassistant",
-            Domain::InputText => "input_text",
-            Domain::InputSelect => "input_select",
-            Domain::Climate => "climate",
-            Domain::AlarmControlPanel => "alarm_control_panel",
-            Domain::Lock => "lock",
-            Domain::Cover => "cover",
-        }
-    }
-}
 
-impl fmt::Display for Domain {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.to_str())
-    }
-}
-
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy, EnumString, Display, Serialize)]
+#[strum(serialize_all = "snake_case")]
 pub enum Service {
     SetValue,
     TurnOn,
@@ -173,39 +163,4 @@ pub enum Service {
     StopCover,
     SetCoverPosition,
     SetCoverTiltPosition,
-}
-
-impl Service {
-    pub fn to_str(&self) -> &'static str {
-        match self {
-            Service::SetValue => "set_value",
-            Service::TurnOn => "turn_on",
-            Service::TurnOff => "turn_off",
-            Service::Toggle => "toggle",
-            Service::SelectOption => "select_option",
-            Service::SetHvacMode => "set_hvac_mode",
-            Service::SetTemperature => "set_temperature",
-            Service::SetFanMode => "set_fan_mode",
-            Service::SetPresetMode => "set_preset_mode",
-            Service::SetSwingMode => "set_swing_mode",
-            Service::AlarmDisarm => "alarm_disarm",
-            Service::AlarmArmHome => "alarm_arm_home",
-            Service::AlarmArmAway => "alarm_arm_away",
-            Service::AlarmArmNight => "alarm_arm_night",
-            Service::AlarmArmVacation => "alarm_arm_vacation",
-            Service::Lock => "lock",
-            Service::Unlock => "unlock",
-            Service::OpenCover => "open_cover",
-            Service::CloseCover => "close_cover",
-            Service::StopCover => "stop_cover",
-            Service::SetCoverPosition => "set_cover_position",
-            Service::SetCoverTiltPosition => "set_cover_tilt_position",
-        }
-    }
-}
-
-impl fmt::Display for Service {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.to_str())
-    }
 }

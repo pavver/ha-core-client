@@ -1,12 +1,11 @@
-use super::events::HistoricalState;
-use super::state::HaState;
+use super::events::{self, HistoricalState};
 use anyhow::Result;
 use tokio::sync::oneshot;
 
 // --- Structs and enums for managing pending API calls ---
 
-pub(crate) struct PendingGetStateOnceCall {
-    pub(super) responder: oneshot::Sender<Result<HaState>>,
+pub(crate) struct PendingGetStatesCall {
+    pub(super) responder: oneshot::Sender<Result<Vec<events::State>>>,
 }
 
 pub(crate) struct PendingGetHistoryCall {
@@ -23,7 +22,7 @@ pub(crate) struct PendingUnsubscribeCall {
 }
 
 pub(crate) enum PendingCall {
-    GetStateOnce(PendingGetStateOnceCall),
+    GetStates(PendingGetStatesCall),
     ServiceCall(PendingServiceCall),
     GetHistory(PendingGetHistoryCall),
     Unsubscribe(PendingUnsubscribeCall),

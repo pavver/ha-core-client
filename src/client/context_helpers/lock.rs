@@ -1,9 +1,9 @@
 use anyhow::Result;
 use serde_json::json;
 
-use crate::client::{
-    state::{Domain, Service},
-    HAClient,
+use crate::{
+    client::state::{Domain, Service},
+    client::HAClient,
 };
 
 impl HAClient {

@@ -1,0 +1,92 @@
+use serde::{Deserialize, Serialize};
+use strum::{AsRefStr, Display, EnumString};
+
+#[derive(Debug, PartialEq, Clone, Copy, Deserialize, EnumString, Display, AsRefStr, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
+pub enum DeviceClass {
+    // Binary Sensor
+    Battery,
+    BatteryCharging,
+    CarbonMonoxide,
+    Cold,
+    Connectivity,
+    Door,
+    GarageDoor,
+    Gas,
+    Heat,
+    Light,
+    Lock,
+    Moisture,
+    Motion,
+    Moving,
+    Occupancy,
+    Opening,
+    Plug,
+    Power,
+    Presence,
+    Problem,
+    Running,
+    Safety,
+    Smoke,
+    Sound,
+    Tamper,
+    Update,
+    Vibration,
+    Window,
+
+    // Sensor
+    ApparentPower,
+    Aqi,
+    AtmosphericPressure,
+    // Battery is already defined for Binary Sensor
+    CarbonDioxide,
+    // CarbonMonoxide is already defined for Binary Sensor
+    Current,
+    DataRate,
+    DataSize,
+    Date,
+    Distance,
+    Duration,
+    Energy,
+    EnergyStorage,
+    Enum,
+    Frequency,
+    // Gas is already defined for Binary Sensor
+    Humidity,
+    Illuminance,
+    Irradiance,
+    // Moisture is already defined for Binary Sensor
+    Monetary,
+    NitrogenDioxide,
+    NitrogenMonoxide,
+    NitrousOxide,
+    Ozone,
+    Ph,
+    Pm1,
+    Pm10,
+    Pm25,
+    // Power is already defined for Binary Sensor
+    PowerFactor,
+    Precipitation,
+    PrecipitationIntensity,
+    Pressure,
+    ReactivePower,
+    SignalStrength,
+    SoundPressure,
+    Speed,
+    SulphurDioxide,
+    Temperature,
+    Timestamp,
+    VolatileOrganicCompounds,
+    Voltage,
+    Volume,
+    Water,
+    Weight,
+    WindSpeed,
+
+    Restart,
+    Switch,
+    Firmware,
+    Identify,
+}
