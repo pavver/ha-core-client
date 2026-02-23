@@ -2,7 +2,7 @@ pub mod connection;
 pub mod context_helpers;
 pub mod events;
 pub mod pending;
-pub mod handler; // Add this
+pub mod handler;
 pub mod protocol;
 pub mod runner;
 pub mod state;
@@ -11,23 +11,25 @@ pub mod triggers;
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64; // Ordering is needed by AtomicU64
+use std::sync::atomic::AtomicU64; 
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use log::{info, debug};
-use std::time::Duration; // Add this
+use std::time::Duration;
 
-use crate::client::events::HistoricalState;
-use crate::client::connection::WsConnection;
-use crate::client::state::{Domain, HaState, Service};
-use crate::client::subscription::{
+use crate::events::HistoricalState;
+use crate::connection::WsConnection;
+use crate::state::{Domain, HaState, Service};
+use crate::subscription::{
     EventCallback, EventFilter, HandlerCommand, Subscription,
 };
 
 
-// --- Main Client Struct ---
-
+/// The main handle for interacting with the Home Assistant WebSocket API.
+/// 
+/// `HAClient` follows the handle/runner pattern. It is a lightweight, cloneable 
+/// handle that sends commands to a background runner task.
 pub struct HAClient {
     command_tx: Option<Arc<mpsc::Sender<HandlerCommand>>>,
     shutdown_tx: Option<Arc<watch::Sender<bool>>>,
@@ -35,13 +37,12 @@ pub struct HAClient {
     task_handle: Option<JoinHandle<Result<()>>>,
 }
 
-// Manual implementation of Clone for HAClient
 impl Clone for HAClient {
     fn clone(&self) -> Self {
         Self {
             command_tx: self.command_tx.clone(),
             shutdown_tx: self.shutdown_tx.clone(),
-            task_handle: None, // task_handle should not be cloned
+            task_handle: None, 
         }
     }
 }
@@ -64,6 +65,10 @@ impl HAClient {
     }
 
     /// Connects to the Home Assistant instance, authenticates, and starts the background event loop.
+    /// 
+    /// # Arguments
+    /// * `url` - The WebSocket URL of the Home Assistant instance (e.g., "ws://localhost:8123/api/websocket").
+    /// * `token` - A Long-Lived Access Token generated in Home Assistant.
     pub async fn run(&mut self, url: &str, token: &str) -> Result<()> {
         info!("HAClient attempting to run with URL: {} and token (hidden).", url);
         if self.task_handle.is_some() {
@@ -127,31 +132,33 @@ impl HAClient {
             .ok_or_else(|| anyhow!("Client is not running."))
     }
 
-    /// Subscribes to entities with a given `entity_id`.
+    /// Subscribes to `state_changed` events for a specific entity.
+    /// 
+    /// The provided callback will be invoked whenever the entity's state changes.
     pub async fn subscribe_entity<F, Fut>(
         &self,
         entity_id: &str,
         callback: F,
     ) -> Result<Subscription>
     where
-        F: Fn(crate::client::HAClient, crate::client::events::Event) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
+        F: Fn(crate::HAClient, crate::events::Event) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
         debug!("Subscribing to entity: {}", entity_id);
         let (tx, rx) = oneshot::channel();
         let cmd = HandlerCommand::Subscribe {
-            details: crate::client::subscription::InternalSubscriptionDetails::Event {
+            details: crate::subscription::InternalSubscriptionDetails::Event {
                 event_type: "state_changed".to_string(),
                 filter: EventFilter::ByEntityId(entity_id.to_string()),
             },
-            callback: Arc::new(move |client, event| Box::pin(callback(client, event))), // Wrap in Arc
+            callback: Arc::new(move |client, event| Box::pin(callback(client, event))), 
             responder: tx,
         };
         self.get_command_tx()?.send(cmd).await?;
         rx.await?
     }
 
-    /// Unsubscribes from an event stream.
+    /// Unsubscribes from an active event stream or trigger.
     pub async fn unsubscribe(&self, subscription: Subscription) -> Result<()> {
         debug!("Unsubscribing from subscription ID: {}", subscription.id);
         let (tx, rx) = oneshot::channel();
@@ -163,8 +170,7 @@ impl HAClient {
         rx.await?
     }
 
-    // --- Methods for interacting with Home Assistant ---
-
+    /// Fetches the current state of a specific entity.
     pub async fn get_state(&self, entity_id: &str) -> Result<events::State> {
         debug!("Requesting state for entity: {}", entity_id);
         let (tx, rx) = oneshot::channel();
@@ -176,6 +182,7 @@ impl HAClient {
         rx.await?
     }
 
+    /// Fetches the history of states for a specific entity within a time range.
     pub async fn get_history(
         &self,
         entity_id: &str,
@@ -195,6 +202,11 @@ impl HAClient {
         rx.await?
     }
 
+    /// Finds the state of an entity at a specific point in time in the past.
+    /// 
+    /// This method queries the history API within a `lookback_duration` window 
+    /// ending at the target `timestamp` and returns the latest state recorded 
+    /// at or before that timestamp.
     pub async fn get_state_at_time(
         &self,
         entity_id: &str,
@@ -205,8 +217,6 @@ impl HAClient {
             "Requesting state for entity: {} at time: {} with lookback duration: {:?}",
             entity_id, timestamp, lookback_duration
         );
-        // Query a period (lookback_duration) before the target timestamp to ensure we capture the state.
-        // We use significant_changes_only for efficiency.
         let start_time = timestamp - lookback_duration;
         let history = self
             .get_history(entity_id, start_time, timestamp, Some(true))
@@ -221,6 +231,7 @@ impl HAClient {
         })
     }
 
+    /// Fetches the current state of all entities in Home Assistant.
     pub async fn get_states(&self) -> Result<Vec<events::State>> {
         debug!("Requesting all states");
         let (tx, rx) = oneshot::channel();
@@ -229,30 +240,30 @@ impl HAClient {
         rx.await?
     }
 
-    /// Subscribes to all `call_service` events.
-    /// The provided callback will be invoked whenever any service is called in Home Assistant.
+    /// Subscribes to all `call_service` events on the Home Assistant event bus.
     pub async fn subscribe_service_calls<F, Fut>(
         &self,
         callback: F,
     ) -> Result<Subscription>
     where
-        F: Fn(crate::client::HAClient, crate::client::events::Event) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
+        F: Fn(crate::HAClient, crate::events::Event) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
         debug!("Subscribing to all service_called events");
         let (tx, rx) = oneshot::channel();
         let cmd = HandlerCommand::Subscribe {
-            details: crate::client::subscription::InternalSubscriptionDetails::Event {
+            details: crate::subscription::InternalSubscriptionDetails::Event {
                 event_type: "call_service".to_string(),
                 filter: EventFilter::Any,
             },
-            callback: Arc::new(move |client, event| Box::pin(callback(client, event))), // Wrap in Arc
+            callback: Arc::new(move |client, event| Box::pin(callback(client, event))), 
             responder: tx,
         };
         self.get_command_tx()?.send(cmd).await?;
         rx.await?
     }
 
+    /// Generic method to call any Home Assistant service.
     pub async fn call_service(
         &self,
         domain: Domain,
@@ -281,7 +292,7 @@ impl HAClient {
         debug!("Subscribing to trigger: {:?}", trigger_config);
         let (tx, rx) = oneshot::channel();
         let cmd = HandlerCommand::Subscribe {
-            details: crate::client::subscription::InternalSubscriptionDetails::Trigger { trigger: trigger_config },
+            details: crate::subscription::InternalSubscriptionDetails::Trigger { trigger: trigger_config },
             callback,
             responder: tx,
         };
@@ -289,6 +300,9 @@ impl HAClient {
         rx.await?
     }
 
+    /// Subscribes to a state trigger.
+    /// 
+    /// Fires when an entity changes state.
     pub async fn subscribe_state_trigger<F, Fut>(
         &self,
         entity_id: &str,
@@ -298,8 +312,8 @@ impl HAClient {
         callback: F,
     ) -> Result<Subscription>
     where
-        F: Fn(crate::client::HAClient, crate::client::events::Event) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
+        F: Fn(crate::HAClient, crate::events::Event) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
         let trigger_config = triggers::Trigger::State(triggers::StateTrigger {
             entity_id: entity_id.to_string(),
@@ -312,6 +326,9 @@ impl HAClient {
         self.subscribe_trigger_internal(trigger_config, arc_callback).await
     }
 
+    /// Subscribes to a numeric state trigger.
+    /// 
+    /// Fires when an entity's numeric state crosses a threshold.
     pub async fn subscribe_numeric_state_trigger<F, Fut>(
         &self,
         entity_id: &str,
@@ -321,8 +338,8 @@ impl HAClient {
         callback: F,
     ) -> Result<Subscription>
     where
-        F: Fn(crate::client::HAClient, crate::client::events::Event) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
+        F: Fn(crate::HAClient, crate::events::Event) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
         let trigger_config = triggers::Trigger::NumericState(triggers::NumericStateTrigger {
             entity_id: entity_id.to_string(),
@@ -335,6 +352,7 @@ impl HAClient {
         self.subscribe_trigger_internal(trigger_config, arc_callback).await
     }
 
+    /// Subscribes to a sun trigger (sunrise or sunset).
     pub async fn subscribe_sun_trigger<F, Fut>(
         &self,
         event: triggers::SunEvent,
@@ -342,8 +360,8 @@ impl HAClient {
         callback: F,
     ) -> Result<Subscription>
     where
-        F: Fn(crate::client::HAClient, crate::client::events::Event) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
+        F: Fn(crate::HAClient, crate::events::Event) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
         let trigger_config = triggers::Trigger::Sun(triggers::SunTrigger {
             event,
@@ -353,20 +371,24 @@ impl HAClient {
         self.subscribe_trigger_internal(trigger_config, arc_callback).await
     }
 
+    /// Subscribes to a time trigger.
+    /// 
+    /// `at` is a time string like "12:00:00".
     pub async fn subscribe_time_trigger<F, Fut>(
         &self,
         at: String,
         callback: F,
     ) -> Result<Subscription>
     where
-        F: Fn(crate::client::HAClient, crate::client::events::Event) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
+        F: Fn(crate::HAClient, crate::events::Event) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
         let trigger_config = triggers::Trigger::Time(triggers::TimeTrigger { at });
         let arc_callback: EventCallback = Arc::new(move |client, event| Box::pin(callback(client, event)));
         self.subscribe_trigger_internal(trigger_config, arc_callback).await
     }
 
+    /// Subscribes to a time pattern trigger (cron-like).
     pub async fn subscribe_time_pattern_trigger<F, Fut>(
         &self,
         hours: Option<String>,
@@ -375,8 +397,8 @@ impl HAClient {
         callback: F,
     ) -> Result<Subscription>
     where
-        F: Fn(crate::client::HAClient, crate::client::events::Event) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
+        F: Fn(crate::HAClient, crate::events::Event) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
         let trigger_config = triggers::Trigger::TimePattern(triggers::TimePatternTrigger {
             hours,
@@ -387,6 +409,9 @@ impl HAClient {
         self.subscribe_trigger_internal(trigger_config, arc_callback).await
     }
 
+    /// Subscribes to a template trigger.
+    /// 
+    /// Evaluates a Home Assistant Jinja2 template and fires when it turns true.
     pub async fn subscribe_template_trigger<F, Fut>(
         &self,
         value_template: String,
@@ -394,8 +419,8 @@ impl HAClient {
         callback: F,
     ) -> Result<Subscription>
     where
-        F: Fn(crate::client::HAClient, crate::client::events::Event) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
+        F: Fn(crate::HAClient, crate::events::Event) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
         let trigger_config = triggers::Trigger::Template(triggers::TemplateTrigger {
             value_template,
@@ -405,6 +430,9 @@ impl HAClient {
         self.subscribe_trigger_internal(trigger_config, arc_callback).await
     }
 
+    /// Subscribes to a zone trigger.
+    /// 
+    /// Fires when an entity enters or leaves a zone.
     pub async fn subscribe_zone_trigger<F, Fut>(
         &self,
         entity_id: &str,
@@ -413,8 +441,8 @@ impl HAClient {
         callback: F,
     ) -> Result<Subscription>
     where
-        F: Fn(crate::client::HAClient, crate::client::events::Event) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
+        F: Fn(crate::HAClient, crate::events::Event) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
         let trigger_config = triggers::Trigger::Zone(triggers::ZoneTrigger {
             entity_id: entity_id.to_string(),
@@ -426,12 +454,10 @@ impl HAClient {
     }
 }
 
-use crate::client::runner::ClientRunner;
+use crate::runner::ClientRunner;
 
 // --- Private helper functions ---
 
-/// Helper function to find the state of an entity at a specific timestamp from a list of historical states.
-/// It robustly finds the latest state at or before the target time, without assuming the list is sorted.
 fn get_state_from_history(
     history: Vec<HistoricalState>,
     target_timestamp: chrono::DateTime<chrono::Utc>,

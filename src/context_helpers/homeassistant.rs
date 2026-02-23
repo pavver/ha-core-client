@@ -2,8 +2,8 @@ use anyhow::{anyhow, Result};
 use std::str::FromStr;
 
 use crate::{
-    client::state::{Domain, Service},
-    client::HAClient,
+    state::{Domain, Service},
+    HAClient,
 };
 
 impl HAClient {

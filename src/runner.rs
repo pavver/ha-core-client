@@ -5,12 +5,12 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::client::connection::WsConnection;
-use crate::client::handler;
-use crate::client::pending::PendingCall;
-use crate::client::protocol::{OutgoingMsgType, SubscribeEventsMessage, SubscribeTriggerMessage};
-use crate::client::events;
-use crate::client::subscription::{HandlerCommand, HaEventSubscription, InternalSubscriptionDetails};
+use crate::connection::WsConnection;
+use crate::handler;
+use crate::pending::PendingCall;
+use crate::protocol::{OutgoingMsgType, SubscribeEventsMessage, SubscribeTriggerMessage};
+use crate::events;
+use crate::subscription::{HandlerCommand, HaEventSubscription, InternalSubscriptionDetails};
 
 // --- Internal client runner that owns the state and connection ---
 

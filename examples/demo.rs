@@ -1,28 +1,24 @@
-
-use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc}; // Leave chrono::Duration as it's used elsewhere
-use crate::client::state::climate::{FanMode, HvacMode, PresetMode, SwingMode};
-use crate::client::HAClient;
+use chrono::{DateTime, Duration, Local, NaiveDateTime, Utc, TimeZone}; 
+use ha_core_client::state::climate::{FanMode, HvacMode, PresetMode, SwingMode};
+use ha_core_client::HAClient;
+use ha_core_client::triggers::SunEvent;
 use log::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use anyhow::Result;
 use std::time::Duration as StdDuration;
-use crate::client::triggers::SunEvent;
-// Import std::time::Duration with an alias
-
 
 use std::fs::File;
-use std::io::{Write};
+use std::io::Write;
 use std::ops::Add;
 use std::path::Path;
 use serde_json;
 use std::future::Future;
 
-pub mod client;
-mod config;
+// mod demo_config; // Removed
 
 async fn handle_state_changed_event(
     _client: HAClient,
-    event: client::events::Event,
+    event: ha_core_client::events::Event,
 ) -> Result<()> {
     info!("[Subscription Callback] Received state_changed event: {:?}", event);
     Ok(())
@@ -30,7 +26,7 @@ async fn handle_state_changed_event(
 
 async fn handle_service_called_event(
     _client: HAClient,
-    event: client::events::Event,
+    event: ha_core_client::events::Event,
 ) -> Result<()> {
     info!("[Subscription Callback] Received call_service event: {:?}", event);
     Ok(())
@@ -38,7 +34,7 @@ async fn handle_service_called_event(
 
 async fn handle_trigger_fired_event(
     _client: HAClient,
-    event: client::events::Event,
+    event: ha_core_client::events::Event,
 ) -> Result<()> {
     info!("[Subscription Callback] Received trigger_fired event: {:?}", event);
     Ok(())
@@ -47,7 +43,7 @@ async fn handle_trigger_fired_event(
 
 fn save_to_file(path: &str, text:&str)
 {
-    let _file = File::create(&path);
+    let _file = File::create(path);
 
     if _file.is_err() { return; }
 
@@ -61,7 +57,7 @@ fn save_to_entities(file_name: &str, text:&str)
 {
     // The file path where we want to save the text
     let mut path = Path::new("entities").join(file_name);
-    path.add_extension("json");
+    path.set_extension("json");
 
     save_to_file(path.to_str().unwrap(), text);
 }
@@ -103,80 +99,25 @@ async fn run_demonstration(client: &HAClient) -> Result<()> {
     let lock_id = "lock.test_lock";
 
 
-    get_state(&client, sensor_id).await;
-    get_state(&client, binary_sensor).await;
-    get_state(&client, input_number_id).await;
-    get_state(&client, input_select_id).await;
-    get_state(&client, climate_id).await;
-    //return Ok(());
-    // --- Core HAClient Methods ---
+    get_state(client, sensor_id).await;
+    get_state(client, binary_sensor).await;
+    get_state(client, input_number_id).await;
+    get_state(client, input_select_id).await;
+    get_state(client, climate_id).await;
 
     info!("1. Core Methods");
-/**
-    // get_states
-    info!("Calling get_states...");
-    match client.get_states().await {
-        Ok(states) => {
-            info!(" -> Success: got {} states", states.len());
-
-            for state in states.iter() {
-                let file_name = state.entity_id.clone() + "_allStates";
-                match serde_json::to_string_pretty(&state) {
-                    Ok(json_string) => {
-                        save_to_entities(file_name.as_str(), &json_string);
-                    },
-                    Err(e) => {
-                        error!("Failed to serialize state to JSON: {}", e);
-                    }
-                }
-
-                get_state(&client, state.entity_id.as_str()).await;
-                info!(" -> Success: got {} state", state.entity_id);
-            }
-        },
-        Err(e) => error!(" -> Failed: {}", e),
-    }
-
-
-    //return Ok(());
-    // get_history
-    info!("Calling get_history for '{}'...", sensor_id);
-    let end_time = Utc::now();
-    let start_time = end_time - Duration::minutes(10);
-    match client.get_history(sensor_id, start_time, end_time, Some(true)).await {
-        Ok(history) => {
-            info!(" -> Success: got {} state(s)", history.len());
-            match serde_json::to_string_pretty(&history) {
-                Ok(json_string) => {
-                    let file_name = format!("{}.history.json", sensor_id);
-                    info!(" -> Success: save history to {file_name}, {} state(s)", history.len());
-                    let text = format!("{start_time} - {end_time}\n\n{json_string}");
-                    save_to_file(file_name.as_str(), &text);
-                },
-                Err(e) => {
-                    error!("Failed to serialize state to JSON: {}", e);
-                }
-            }
-        },
-        Err(e) => error!(" -> Failed: {}", e),
-    }**/
 
     // get_state_at_time
     info!("Calling get_state_at_time for '{}'...", sensor_id);
     let date_str = "2026-01-04 18:50:00";
 
-    // 1. Парсимо рядок у NaiveDateTime (час без зони)
     let format = "%Y-%m-%d %H:%M:%S";
     let naive_dt = NaiveDateTime::parse_from_str(date_str, format)
         .expect("Некоректний формат дати");
 
-    // 2. Прив'язуємо до системної локальної часової зони
-    // Метод and_local_timezone повертає LocalResult, оскільки перехід на літній/зимовий час
-    // може зробити час неіснуючим або дубльованим.
     let local_dt = Local.from_local_datetime(&naive_dt)
-        .unwrap(); // Повертає DateTime<Local>
+        .unwrap(); 
 
-    // 3. Перетворюємо в UTC
     let target_time: DateTime<Utc> = DateTime::from(local_dt);
 
     match client.get_state_at_time(sensor_id, target_time, Duration::minutes(5)).await {
@@ -212,7 +153,7 @@ async fn run_demonstration(client: &HAClient) -> Result<()> {
 
     // subscribe_state_trigger
     info!("Calling subscribe_state_trigger for '{}' to 'on'...", switch_id);
-    let trigger_state_subscription = match client.subscribe_state_trigger(switch_id, Some(client::state::HaState::On), None, Some(StdDuration::from_secs(5)), handle_trigger_fired_event).await {
+    let trigger_state_subscription = match client.subscribe_state_trigger(switch_id, Some(ha_core_client::state::HaState::On), None, Some(StdDuration::from_secs(5)), handle_trigger_fired_event).await {
         Ok(sub) => {
             info!(" -> Success: subscribed to state trigger.");
             Some(sub)
@@ -290,7 +231,7 @@ async fn run_demonstration(client: &HAClient) -> Result<()> {
 
     // subscribe_zone_trigger (entity entering 'zone.home')
     info!("Calling subscribe_zone_trigger for entity entering 'zone.home'...");
-    let trigger_zone_subscription = match client.subscribe_zone_trigger("person.test_person", "zone.home", client::triggers::ZoneEvent::Enter, handle_trigger_fired_event).await {
+    let trigger_zone_subscription = match client.subscribe_zone_trigger("person.test_person", "zone.home", ha_core_client::triggers::ZoneEvent::Enter, handle_trigger_fired_event).await {
         Ok(sub) => {
             info!(" -> Success: subscribed to zone trigger.");
             Some(sub)
@@ -401,7 +342,7 @@ async fn main() -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
-    let cfg = config::read_config();
+    let cfg = read_config();
     let mut client = HAClient::new();
 
     // --- Main Logic ---
@@ -422,4 +363,33 @@ async fn main() -> Result<()> {
     info!("Client has been stopped.");
 
     Ok(())
+}
+use serde_json::Value;
+use std::fs;
+
+pub struct Config {
+    pub url: String,
+    pub token: String,
+}
+
+fn config_read_key<'a>(config: &'a Value, key: &'a str) -> &'a str {
+    match &config[key] {
+        Value::String(s) => return s.as_str(),
+        _default => panic!("Failed to read '{}' in the config file", key),
+    }
+}
+
+pub fn read_config() -> Config {
+    let file_path = "config.json";
+    let file_content = fs::read_to_string(file_path).expect("Failed to read the config file");
+    let config: Value =
+        serde_json::from_str(&file_content).expect("Failed to parse the config file");
+
+    let url = config_read_key(&config, "HA_URL");
+    let token = config_read_key(&config, "HA_TOKEN");
+
+    Config {
+        url: url.to_string(),
+        token: token.to_string(),
+    }
 }

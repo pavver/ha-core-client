@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use chrono::{DateTime, Utc};
-use crate::client::triggers::Trigger;
+use crate::triggers::Trigger;
 
 // Outgoing Messages
 

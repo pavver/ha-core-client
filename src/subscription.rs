@@ -69,7 +69,7 @@ pub struct Subscription {
 // Now uses the type-safe `events::Event` enum and returns a Result
 pub type EventCallback = Arc<
     dyn Fn(
-            crate::client::HAClient, // The first argument is now the client handle
+            crate::HAClient, // The first argument is now the client handle
             events::Event,
         ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>
         + Send

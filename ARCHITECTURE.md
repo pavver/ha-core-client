@@ -1,106 +1,35 @@
-# Огляд архітектури
+# ha-core-client Architecture
 
-Цей документ описує архітектуру клієнта Home Assistant (`ha_client`), висвітлює її сильні сторони, а також визначає наявні недоліки та потенційні можливості для покращення.
+This library is designed with type safety, asynchronicity, and resilience to network failures as core principles.
 
-Поточна архітектура побудована на **моделі акторів**, що є чудовим вибором для асинхронної програми, яка інтенсивно працює з мережевими взаємодіями та керуванням станом. Це дозволяє уникнути умов гонитви (race conditions) та значно спрощує управління конкурентністю.
+## Core Components
 
-Архітектуру можна розділити на три основні компоненти:
+### 1. Handle/Runner Pattern (Actor Model)
+The architecture decouples the user-facing interface from the network state management:
+*   **`HAClient` (Handle)**: A lightweight structure containing only the communication channels (`mpsc::Sender`) to the background process. It implements `Clone`, allowing it to be easily passed into different async tasks or callbacks.
+*   **`ClientRunner` (Runner/Actor)**: The central hub running in its own background task. It sequentially processes:
+    *   Incoming commands from `HAClient`.
+    *   Incoming WebSocket messages (events, API results).
+    *   Shutdown signals.
+    This design eliminates the need for complex locking mechanisms (`Mutex`/`RwLock`) for the client's shared state.
 
-1.  **Публічний API (`HAClient` у `src/client/mod.rs`)**
-    *   Це легковажна, клонована "ручка" (handle) для взаємодії з клієнтом.
-    *   Надає простий та зрозумілий інтерфейс для відправлення команд до основного циклу програми.
-    *   Повністю приховує внутрішню реалізацію, розділяючи публічний інтерфейс від внутрішньої логіки.
+### 2. Connection Management (`WsConnection`)
+A dedicated module manages the WebSocket lifecycle:
+*   **Auto-Reconnection**: Upon connection loss, `WsConnection` attempts to reconnect with an exponential backoff strategy.
+*   **Authentication State**: Handles the initial handshake and authentication using Long-Lived Access Tokens.
+*   **Subscription Recovery**: On successful reconnection, the `ClientRunner` automatically resubscribes to all previously registered event handlers and triggers.
 
-2.  **Ядро-актор (`ClientRunner` у `src/client/runner.rs`)**
-    *   Центральна задача (task), яка виконує роль "актора". Вона послідовно обробляє всі вхідні команди та повідомлення від WebSocket, що гарантує безпеку при роботі з спільним станом без необхідності використання складних блокувань (locks).
-    *   Зв'язок з `HAClient` та `WsConnection` відбувається через асинхронні канали (MPSC - multi-producer, single-consumer).
-    *   **Делегує обробку вхідних команд та повідомлень WebSocket спеціалізованому модулю `handler`.**
+### 3. Type-Safe Protocol
+*   **`protocol.rs`**: Defines strongly-typed structures for all Home Assistant WebSocket API messages. No raw JSON manipulation is used for core logic—everything is serialized and deserialized through these structures.
+*   **`state/`**: Contains enums for domains, services, and entity states. Leveraging the `strum` crate, these enums are seamlessly converted to strings for the HA API.
+*   **`events/`**: Implements intelligent deserialization for events, where attribute structures are automatically determined based on the entity's domain.
 
-3.  **Менеджер з'єднань (`WsConnection` у `src/client/connection.rs`)**
-    *   Це відокремлена фонова задача, відповідальна виключно за управління WebSocket-з'єднанням.
-    *   Її ключові функції — це встановлення з'єднання, автентифікація та, що найважливіше, **автоматичне перепідключення** у разі втрати зв'язку. Це робить клієнт надзвичайно стійким до мережевих збоїв.
-    *   Інформує `ClientRunner` про зміни статусу з'єднання через канал.
+### 4. Subscription & Callback System
+The library utilizes generalized async callbacks:
+*   Users can provide any closure or function that returns a `Future`.
+*   Callbacks receive their own clone of `HAClient`, enabling "reaction" logic (e.g., turning on a light in response to a motion sensor) without creating circular dependencies or deadlocks.
 
-4.  **Модуль обробки повідомлень (`handler` у `src/client/handler/`)**
-    *   Новий модуль, відповідальний за централізацію логіки обробки вхідних та вихідних повідомлень.
-    *   Розділений на:
-        *   `command.rs`: Обробляє вихідні команди (`HandlerCommand`) від `HAClient`, перетворюючи їх на повідомлення WebSocket.
-        *   `incoming.rs`: Обробляє всі вхідні повідомлення від Home Assistant (події, результати API-викликів), десеріалізує їх та направляє до відповідних обробників чи сповіщувачів.
-
-## Сильні сторони
-
-*   **Ергономічний API для підписок (подій та тригерів):** Методи для підписки на події (`subscribe_entity`, `subscribe_service_calls`) та на тригери (`subscribe_state_trigger`, `subscribe_numeric_state_trigger` тощо) є узагальненими (generic), що дозволяє користувачам передавати асинхронні функції (`async fn`) або замикання напряму, без необхідності вручну створювати складні конструкції `Arc<Box<dyn...>>`. Це значно спрощує API та покращує досвід розробки.
-*   **Безпечна та ідіоматична обробка рядків для `enum`-ів**: Використання бібліотеки `strum` для перетворення `enum`-ів у рядки та навпаки значно зменшує кількість шаблонного коду (boilerplate) та забезпечує валідацію під час компіляції для всіх строкових конвертацій. Це робить роботу з перерахуваннями, такими як `Domain`, `Service`, `HaState`, `HvacMode`, `FanMode` тощо, більш безпечною, зручною та менш схильною до помилок.
-*   **Надійність:** Модель акторів та автоматичне перепідключення роблять клієнт стійким до помилок.
-*   **Модульність:** Чітке розділення відповідальності між API, ядром та менеджером з'єднань.
-*   **Безпека потоків:** Послідовна обробка команд та подій в одному місці усуває цілий клас проблем, пов'язаних з конкурентністю.
-
-# Виявлені проблеми та недоліки
-
-1.  **Крихка та негнучка конфігурація**
-    *   **Проблема:** Модуль `src/config.rs` для читання файлу `config.json` є нестійким до помилок і негнучким.
-    *   **Деталі:**
-        *   Він використовує `panic!` для будь-якої помилки (файл не знайдено, помилка парсингу JSON). Це призводить до аварійного завершення всієї програми, замість того, щоб дозволити обробити помилку витончено.
-        *   Шлях до файлу `config.json` жорстко закодований, що ускладнює розгортання та тестування.
-    *   **Вплив:** Робить програму менш надійною та складною у використанні в різних середовищах.
-
-# Можливості для оптимізації та покращення
-
-1.  **Покращення обробки конфігурації**
-    *   Функція `read_config` повинна повертати `Result<Config, Error>`, а не `Config`.
-    *   Виклики, що можуть зазнати невдачі (`fs::read_to_string`, `serde_json::from_str`), повинні поширювати помилку вгору за допомогою оператора `?`.
-    *   Шлях до конфігураційного файлу слід зробити параметром функції або отримувати його з аргументів командного рядка чи змінних середовища.
-
-
-
-### Вдалі патерни
-
-1.  **Централізовані `Domain` та `Service`:** У файлі `src/client/state/mod.rs` визначено глобальні `enum`-и `Domain` та `Service`. Завдяки використанню бібліотеки `strum` ці `enum`-и тепер мають автоматично згенеровані реалізації для перетворення в рядки та зі рядків, що значно спрощує їх використання та підтримує консистентність. Це створює єдине джерело правди для всіх доменів та сервісів, з якими працює клієнт, що запобігає помилкам та робить код значно чистішим.
-
-2.  **Допоміжні функції (`context_helpers`):** Модулі в `context_helpers` (наприклад, `climate.rs`) розширюють `HAClient` специфічними для домену функціями. Цей патерн є дуже вдалим, оскільки він інкапсулює логіку виклику сервісів (формування `service_data`, імена доменів/сервісів) і надає користувачам клієнта високорівневий та зручний API.
-
-### Рекомендації для майбутніх `enum`-ів
-
-*   **Використання `strum`:** При створенні нових `enum`-ів для представлення станів, доменів, класів пристроїв, класів стану або будь-яких інших фіксованих наборів значень, завжди слід розглядати можливість використання бібліотеки `strum`. Вона забезпечує легке виведення трейтів `EnumString`, `Display` та `AsRefStr`, що значно зменшує кількість шаблонного коду та покращує безпеку типів та зручність використання. Якщо `enum` також потребує десеріалізації з JSON, слід поєднати `strum` з `serde::Deserialize`, використовуючи `#[serde(rename_all = "snake_case")]` або `#[serde(untagged)]` разом з `#[strum(serialize_all = "snake_case", ascii_case_insensitive)]` для забезпечення коректної обробки.
-
-### Архітектура стану: Модульний підхід через `HaState`
-
-Для представлення стану сутностей в клієнті використовується гібридний підхід, реалізований в `enum`-і `HaState`. Ця структура поєднує обробку загальних станів з модульною, строго типізованою обробкою станів, специфічних для конкретних доменів.
-
-Початково, `HaState` містив велику кількість варіантів, що представляли стани з різних доменів, що призводило до дублювання коду та слабкої типізації. Цю проблему було вирішено шляхом рефакторингу `HaState` до модульної структури.
-
-**Поточна реалізація `HaState`:**
-
-```rust
-// У файлі src/client/state/mod.rs
-pub enum HaState {
-    // Загальні стани
-    On,
-    Off,
-    Unavailable,
-    Unknown,
-    Home,
-    NotHome,
-
-    // Специфічні для домену стани, що делегують до окремих enum-ів
-    Alarm(AlarmState),
-    Climate(HvacMode),
-    Cover(CoverState),
-    Lock(LockState),
-
-    // Резервні варіанти для невідомих або числових станів
-    Number(f64),
-    String(String),
-}
-```
-
-Кожен домен, що має чітко визначений набір станів (наприклад, `lock`, `climate`, `cover`), тепер має власний `enum` (`LockState`, `HvacMode`, `CoverState`) у відповідному файлі модуля (напр., `src/client/state/lock.rs`). `HaState` діє як "обгортка", що делегує до цих строго типізованих `enum`-ів.
-
-**Переваги поточної архітектури:**
-
-*   **Усунення дублювання:** Визначення станів для кожного домену тепер знаходиться в одному місці.
-*   **Сильна типізація:** Система типів гарантує, що стан сутності відповідає її домену (наприклад, неможливо помилково порівняти стан `climate` з `LockState::Jammed`).
-*   **Модульність та розширюваність:** Додавання підтримки нового домену зводиться до створення нового модуля зі своїм `enum`-ом стану та додавання одного варіанта в `HaState`, не роздуваючи основний `enum`.
-
-Ця архітектура забезпечує надійність, чистоту коду та легкість його подальшої підтримки та розширення.
-
+## Architectural Benefits
+*   **Resilience**: The client automatically recovers even if the Home Assistant instance restarts.
+*   **Ease of Use**: A high-level API hides the complexity of the underlying WebSocket protocol.
+*   **Safety**: Rust's ownership model and the actor pattern guarantee the absence of memory errors and race conditions.

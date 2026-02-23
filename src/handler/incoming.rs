@@ -9,15 +9,15 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use chrono::{DateTime, Utc};
 
-use crate::client::events::{self, attributes::AttributeSet, state::{HistoricalStateWire, StateChangedData}, helpers::de_helpers};
-use crate::client::pending::PendingCall;
-use crate::client::protocol::{
+use crate::events::{self, attributes::AttributeSet, state::{HistoricalStateWire, StateChangedData}, helpers::de_helpers};
+use crate::pending::PendingCall;
+use crate::protocol::{
     BaseMessage, EventMessage, IncomingMsgType, OutgoingMsgType, ResultMessage, UnsubscribeMessage,
 };
-use crate::client::runner::ClientRunner;
-use crate::client::subscription;
-use crate::client::HAClient;
-use crate::client::handler::command::to_command_message_str;
+use crate::runner::ClientRunner;
+use crate::subscription;
+use crate::HAClient;
+use crate::handler::command::to_command_message_str;
 
 
 // Temporary struct for parsing the one-shot state event

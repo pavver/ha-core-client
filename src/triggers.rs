@@ -1,4 +1,4 @@
-use crate::client::state::HaState;
+use crate::state::HaState;
 use serde::Serialize;
 use std::time::Duration;
 

@@ -2,11 +2,11 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::{
-    client::state::{
+    state::{
         climate::{FanMode, HvacMode, PresetMode, SwingMode},
         Domain, Service,
     },
-    client::HAClient,
+    HAClient,
 };
 
 impl HAClient {

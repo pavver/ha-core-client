@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
-use crate::client::state::climate::{FanMode, HvacMode, PresetMode, SwingMode};
-use crate::client::state::common::UnitOfMeasurement;
-use crate::client::state::device_class::DeviceClass;
-use crate::client::state::state_class::StateClass;
+use crate::state::climate::{FanMode, HvacMode, PresetMode, SwingMode};
+use crate::state::common::UnitOfMeasurement;
+use crate::state::device_class::DeviceClass;
+use crate::state::state_class::StateClass;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ClimateAttributes {

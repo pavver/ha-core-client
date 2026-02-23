@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use crate::client::events::attributes::{AttributeSet, ClimateAttributes, GenericAttributes, HistoricalAttributeSet};
-use crate::client::events::helpers::de_helpers;
+use crate::events::attributes::{AttributeSet, ClimateAttributes, GenericAttributes, HistoricalAttributeSet};
+use crate::events::helpers::de_helpers;
 
 /// Represents the detailed state of a Home Assistant entity from a live event.
 #[derive(Debug, Clone, Deserialize, Serialize)]

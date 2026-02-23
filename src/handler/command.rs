@@ -5,16 +5,16 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::client::pending::{
+use crate::pending::{
     PendingCall, PendingGetHistoryCall, PendingGetStatesCall, PendingServiceCall,
     PendingUnsubscribeCall,
 };
-use crate::client::protocol::{
+use crate::protocol::{
     CallServiceMessage, CommandMessage, GetHistoryMessage, OutgoingMsgType,
     SubscribeEntitiesMessage, SubscribeEventsMessage, UnsubscribeMessage,
 };
-use crate::client::runner::ClientRunner;
-use crate::client::subscription::{HandlerCommand, HaEventSubscription, Subscription};
+use crate::runner::ClientRunner;
+use crate::subscription::{HandlerCommand, HaEventSubscription, Subscription};
 
 #[derive(Serialize)]
 struct GetStatesPayload {
@@ -42,15 +42,15 @@ pub(crate) async fn handle_command(
             let _ = responder.send(Ok(Subscription { id: call_id as u32 }));
 
             let msg = match details {
-                crate::client::subscription::InternalSubscriptionDetails::Event { event_type, .. } => {
+                crate::subscription::InternalSubscriptionDetails::Event { event_type, .. } => {
                     let payload = SubscribeEventsMessage {
                         msg_type: OutgoingMsgType::SubscribeEvents,
                         event_type,
                     };
                     to_command_message_str(call_id, payload)?
                 }
-                crate::client::subscription::InternalSubscriptionDetails::Trigger { trigger } => {
-                    let payload = crate::client::protocol::SubscribeTriggerMessage {
+                crate::subscription::InternalSubscriptionDetails::Trigger { trigger } => {
+                    let payload = crate::protocol::SubscribeTriggerMessage {
                         msg_type: OutgoingMsgType::SubscribeTriggers,
                         trigger,
                     };
