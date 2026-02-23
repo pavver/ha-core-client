@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
 }
 ```
 
-## Features
+## Implemented Features
 
 -   **Authentication**: Securely authenticates with Home Assistant using a long-lived access token.
 -   **Get All States**: Fetch the current state of every entity (`get_states`).
@@ -121,6 +121,47 @@ async fn main() -> Result<()> {
     -   And more!
 -   **Event Subscriptions**: Subscribe to the global event bus for state changes (`subscribe_entity`) or service calls (`subscribe_service_calls`).
 -   **Trigger Subscriptions**: Subscribe to a wide variety of Home Assistant's automation triggers, including `state`, `numeric_state`, `sun`, `time`, `template`, and `zone` triggers.
+
+## Planned Features
+
+The goal is to eventually implement type-safe support for all existing Home Assistant WebSocket API calls. Below is a list of features that are currently planned for future development.
+
+**Note: Do not begin implementation of these features without a specific command to do so.**
+
+### Core Commands
+*   `fire_event`: Fire a custom event on the event bus.
+*   `ping`: A command that can be sent by the client, to which the server should respond with a `pong`.
+
+### Configuration & Information Commands
+*   `get_config`: Retrieve the current configuration of the Home Assistant instance.
+*   `get_services`: Retrieve a detailed list of all available services.
+*   `get_panels`: Retrieve a list of all panels available in the UI.
+*   `validate_config`: Validate a piece of configuration.
+
+### Media Commands
+*   `media_player_thumbnail`: Get the thumbnail for a `media_player` entity.
+*   `camera_thumbnail`: Get the thumbnail for a `camera` entity.
+
+### Advanced Commands & Registry Management
+*   **Target-related Commands**: A group of commands (`extract_from_target`, `get_triggers_for_target`, etc.) for working with advanced templates and targets.
+*   **Entity Registry**:
+    *   `config/entity_registry/list`: List all entities.
+    *   `config/entity_registry/get`: Get a single entity's settings.
+    *   `config/entity_registry/update`: Update an entity's settings.
+    *   `config/entity_registry/delete`: Remove an entity.
+*   **Device Registry**:
+    *   `config/device_registry/list`: List all devices.
+    *   `config/device_registry/get`: Get a single device's settings.
+    *   `config/device_registry/update`: Update a device's settings.
+*   **Area Registry**:
+    *   `config/area_registry/list`: List all areas.
+    *   `config/area_registry/create`: Create a new area.
+    *   `config/area_registry/update`: Update an area's settings.
+    *   `config/area_registry/delete`: Delete an area.
+*   **Diagnostics**:
+    *   `diagnostics/get`: Get diagnostic information about a device or integration.
+*   **Feature Support**:
+    *   `supported_features`: Inform the server about the specific features the client supports.
 
 ## API Examples
 
@@ -196,7 +237,7 @@ async fn adjust_climate(client: &HAClient) -> Result<()> {
 ```
 
 ## License
-
+[Cargo.toml](../ha-controller/Cargo.toml)
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
 
 ## Contributing
