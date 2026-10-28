@@ -978,11 +978,10 @@ fn backoff(config: &ClientConfig, attempt: u32) -> Duration {
         .reconnect_min_delay
         .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1).min(16)))
         .min(config.reconnect_max_delay);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let jitter = 0.8 + 0.4 * (nanos % 1000) as f64 / 1000.0;
+    // `RandomState` is randomly seeded per instance: a dependency-free random number,
+    // unlike the clock, whose resolution can be as coarse as 100ns or 1µs.
+    let random = std::hash::BuildHasher::hash_one(&std::hash::RandomState::new(), attempt);
+    let jitter = 0.8 + 0.4 * (random % 1000) as f64 / 1000.0;
     base.mul_f64(jitter)
 }
 
@@ -998,6 +997,9 @@ mod tests {
         assert!(within(backoff(&cfg, 1), 1.0));
         assert!(within(backoff(&cfg, 3), 4.0));
         assert!(within(backoff(&cfg, 30), 60.0));
+        // Jittered: repeated delays for the same attempt differ.
+        let delays: std::collections::HashSet<Duration> = (0..20).map(|_| backoff(&cfg, 3)).collect();
+        assert!(delays.len() > 1);
     }
 
     #[test]
