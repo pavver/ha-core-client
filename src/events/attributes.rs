@@ -1,26 +1,43 @@
-use std::collections::HashMap;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
-use crate::state::climate::{FanMode, HvacMode, PresetMode, SwingMode};
+use crate::state::Domain;
+use crate::state::climate::{FanMode, HvacAction, HvacMode, PresetMode, SwingMode};
 use crate::state::common::UnitOfMeasurement;
 use crate::state::device_class::DeviceClass;
 use crate::state::state_class::StateClass;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Attributes of a `climate` entity. The current HVAC mode is the entity's state.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct ClimateAttributes {
+    pub friendly_name: Option<String>,
+    /// Modes the entity supports. Values this library does not know are left out.
+    #[serde(default, deserialize_with = "known_values")]
     pub hvac_modes: Option<Vec<HvacMode>>,
+    pub hvac_action: Option<HvacAction>,
+    pub current_temperature: Option<f64>,
+    pub current_humidity: Option<f64>,
+    /// Target temperature; `None` in `heat_cool` mode, which uses the range below.
+    pub temperature: Option<f64>,
+    pub target_temp_low: Option<f64>,
+    pub target_temp_high: Option<f64>,
+    pub target_temp_step: Option<f64>,
     pub min_temp: Option<f64>,
     pub max_temp: Option<f64>,
-    pub current_temperature: Option<f64>,
-    pub temperature: Option<f64>,
+    pub fan_mode: Option<FanMode>,
     pub fan_modes: Option<Vec<FanMode>>,
-    pub swing_modes: Option<Vec<SwingMode>>,
+    pub preset_mode: Option<PresetMode>,
     pub preset_modes: Option<Vec<PresetMode>>,
+    pub swing_mode: Option<SwingMode>,
+    pub swing_modes: Option<Vec<SwingMode>>,
+    /// Every other attribute (`supported_features`, integration-specific keys, …).
     #[serde(flatten)]
-    pub rest: HashMap<String, Value>,
+    pub rest: Map<String, Value>,
 }
 
+/// Attributes of any entity without a dedicated type.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct GenericAttributes {
     pub friendly_name: Option<String>,
     pub unit_of_measurement: Option<UnitOfMeasurement>,
@@ -30,38 +47,77 @@ pub struct GenericAttributes {
     pub rest: Map<String, Value>,
 }
 
-/// Entity attributes. `Climate` is chosen when climate-specific keys are present
-/// and they parse; everything else (including malformed climate attributes) is `Generic`.
+/// Entity attributes, typed by the entity's domain: `Climate` for `climate.*` entities
+/// whose attributes parse, `Generic` for everything else (including malformed climate
+/// attributes). Deserialized on its own, without an entity id, `Climate` is chosen when
+/// climate-specific keys are present.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub enum AttributeSet {
-    Climate(ClimateAttributes),
+    /// Boxed: much larger than the generic attributes most entities have.
+    Climate(Box<ClimateAttributes>),
     Generic(GenericAttributes),
 }
 
 impl AttributeSet {
+    /// Types `value` by the domain of `entity_id`. Never fails.
+    pub(crate) fn for_entity(entity_id: &str, value: Value) -> Self {
+        match Domain::of_entity(entity_id) {
+            Some(Domain::Climate) => match ClimateAttributes::deserialize(&value) {
+                Ok(attrs) => AttributeSet::Climate(Box::new(attrs)),
+                Err(_) => Self::generic(value),
+            },
+            Some(_) => Self::generic(value),
+            None => Self::deserialize(value).unwrap_or_default(),
+        }
+    }
+
+    fn generic(value: Value) -> Self {
+        AttributeSet::Generic(lenient_generic(value))
+    }
+
     /// The entity's `friendly_name`, if set.
     pub fn friendly_name(&self) -> Option<&str> {
         match self {
-            AttributeSet::Climate(a) => a.rest.get("friendly_name").and_then(Value::as_str),
+            AttributeSet::Climate(a) => a.friendly_name.as_deref(),
             AttributeSet::Generic(a) => a.friendly_name.as_deref(),
         }
+    }
+
+    /// An attribute by its Home Assistant key, as raw JSON, whichever variant holds it.
+    pub fn get(&self, key: &str) -> Option<Value> {
+        let value = match self {
+            AttributeSet::Climate(a) => serde_json::to_value(a),
+            AttributeSet::Generic(a) => serde_json::to_value(a),
+        };
+        value.ok()?.get_mut(key).map(Value::take).filter(|v| !v.is_null())
     }
 }
 
 /// Parses `GenericAttributes`, never failing: if a known key has an unexpected type,
 /// the typed fields are left empty and every key is kept in `rest`.
-fn lenient_generic<T: for<'de> Deserialize<'de> + Default>(value: Value, rest: impl FnOnce(&mut T, Map<String, Value>)) -> T {
-    match T::deserialize(&value) {
+fn lenient_generic(value: Value) -> GenericAttributes {
+    match GenericAttributes::deserialize(&value) {
         Ok(attrs) => attrs,
         Err(e) => {
             log::debug!("Attributes did not match the typed schema ({e}); keeping them untyped.");
-            let mut attrs = T::default();
+            let mut attrs = GenericAttributes::default();
             if let Value::Object(map) = value {
-                rest(&mut attrs, map);
+                attrs.rest = map;
             }
             attrs
         }
     }
+}
+
+/// A list of a closed enum, skipping values it does not know (a newer Home Assistant).
+fn known_values<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: for<'a> Deserialize<'a>,
+{
+    let values = Option::<Vec<Value>>::deserialize(deserializer)?;
+    Ok(values.map(|values| values.into_iter().filter_map(|v| T::deserialize(v).ok()).collect()))
 }
 
 impl<'de> Deserialize<'de> for AttributeSet {
@@ -74,71 +130,18 @@ impl<'de> Deserialize<'de> for AttributeSet {
         if let Value::Object(map) = &value {
             if map.contains_key("hvac_modes") || map.contains_key("current_temperature") {
                 if let Ok(climate_attrs) = ClimateAttributes::deserialize(&value) {
-                    return Ok(AttributeSet::Climate(climate_attrs));
+                    return Ok(AttributeSet::Climate(Box::new(climate_attrs)));
                 }
             }
         }
 
-        Ok(AttributeSet::Generic(lenient_generic(value, |a: &mut GenericAttributes, m| a.rest = m)))
+        Ok(Self::generic(value))
     }
 }
 
 impl Default for AttributeSet {
     fn default() -> Self {
         AttributeSet::Generic(GenericAttributes::default())
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct HistoricalClimateAttributes {
-    pub friendly_name: Option<String>,
-    pub current_temperature: Option<f64>,
-    pub temperature: Option<f64>,
-    #[serde(flatten)]
-    pub rest: HashMap<String, Value>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct HistoricalGenericAttributes {
-    pub friendly_name: Option<String>,
-    pub unit_of_measurement: Option<UnitOfMeasurement>,
-    pub device_class: Option<DeviceClass>,
-    pub state_class: Option<StateClass>,
-    #[serde(flatten)]
-    pub rest: Map<String, Value>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub enum HistoricalAttributeSet {
-    Climate(HistoricalClimateAttributes),
-    Generic(HistoricalGenericAttributes),
-}
-
-impl<'de> Deserialize<'de> for HistoricalAttributeSet {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = Value::deserialize(deserializer)?;
-
-        if let Value::Object(map) = &value {
-            if map.contains_key("current_temperature") {
-                if let Ok(climate_attrs) = HistoricalClimateAttributes::deserialize(&value) {
-                    return Ok(HistoricalAttributeSet::Climate(climate_attrs));
-                }
-            }
-        }
-
-        Ok(HistoricalAttributeSet::Generic(lenient_generic(
-            value,
-            |a: &mut HistoricalGenericAttributes, m| a.rest = m,
-        )))
-    }
-}
-
-impl Default for HistoricalAttributeSet {
-    fn default() -> Self {
-        HistoricalAttributeSet::Generic(HistoricalGenericAttributes::default())
     }
 }
 
@@ -163,6 +166,25 @@ mod tests {
         let a: AttributeSet = serde_json::from_value(json!({"device_class": "wind_direction"})).unwrap();
         let AttributeSet::Generic(g) = a else { panic!() };
         assert_eq!(g.device_class, Some(DeviceClass::Other("wind_direction".into())));
+    }
+
+    // Shape captured from a live ESPHome thermostat (name anonymised).
+    #[test]
+    fn climate_attributes_are_typed() {
+        let a = AttributeSet::for_entity("climate.heater", json!({
+            "hvac_modes": ["off", "heat", "future_mode"], "min_temp": 10.0, "max_temp": 50.0,
+            "target_temp_step": 0.5, "current_temperature": 21.5, "temperature": 23.0,
+            "hvac_action": "heating", "friendly_name": "Heater", "supported_features": 385
+        }));
+        let AttributeSet::Climate(c) = &a else { panic!("expected climate: {a:?}") };
+        assert_eq!(c.hvac_modes, Some(vec![HvacMode::Off, HvacMode::Heat]));
+        assert_eq!(c.hvac_action, Some(HvacAction::Heating));
+        assert_eq!(c.friendly_name.as_deref(), Some("Heater"));
+        assert_eq!(c.target_temp_step, Some(0.5));
+        assert_eq!(a.get("supported_features"), Some(json!(385)));
+        assert_eq!(a.get("temperature"), Some(json!(23.0)));
+        assert_eq!(a.get("target_temp_low"), None);
+        assert!(!c.rest.contains_key("friendly_name"));
     }
 
     #[test]

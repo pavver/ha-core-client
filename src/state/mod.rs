@@ -103,11 +103,11 @@ impl HaState {
                     return HaState::Climate(state);
                 }
 
-                // Fallback to generic types
-                if let Ok(num) = s.parse::<f64>() {
-                    HaState::Number(num)
-                } else {
-                    HaState::String(s.to_string())
+                // Fallback to generic types. `Number` only if it prints back as the same
+                // string, since states are compared as strings (`"21.0"` stays a `String`).
+                match s.parse::<f64>() {
+                    Ok(num) if num.is_finite() && num.to_string() == s => HaState::Number(num),
+                    _ => HaState::String(s.to_string()),
                 }
             }
         }
@@ -243,6 +243,11 @@ mod tests {
         assert_eq!(Domain::of_entity("fan.bedroom"), Some(Domain::Fan));
         assert_eq!(Domain::of_entity("nodot"), None);
         assert_eq!(Domain::of_entity(".x"), None);
+        // `Other` holding a known value equals the known variant.
+        assert_eq!(Domain::Other("light".into()), Domain::Light);
+        use std::hash::BuildHasher;
+        let state = std::hash::RandomState::new();
+        assert_eq!(state.hash_one(Domain::Other("light".into())), state.hash_one(Domain::Light));
     }
 
     #[test]
@@ -277,7 +282,17 @@ mod tests {
         assert_eq!(HaState::from_string("Locked"), HaState::Lock(LockState::Locked));
         assert_eq!(HaState::from_string("open"), HaState::Cover(CoverState::Open));
         assert_eq!(HaState::from_string("12.5"), HaState::Number(12.5));
+        assert_eq!(HaState::from_string("-3"), HaState::Number(-3.0));
         assert_eq!(HaState::from_string("Mixed"), HaState::String("Mixed".into()));
+    }
+
+    #[test]
+    fn ha_state_keeps_the_state_string() {
+        for s in ["21.0", "1e3", "007", "nan", "inf", "21", "21.5", "unavailable", "Custom"] {
+            assert_eq!(HaState::from_string(s).to_string().to_lowercase(), s.to_lowercase(), "{s}");
+        }
+        assert_eq!(HaState::from_string("21.0"), HaState::String("21.0".into()));
+        assert_eq!(HaState::from_string("nan"), HaState::String("nan".into()));
     }
 
     #[test]

@@ -9,8 +9,12 @@ A strongly-typed, ergonomic, and resilient asynchronous Rust client for the Home
 *   **Strongly typed, but tolerant**: enums for domains, services, states and attributes, each with an `Other(String)` fallback so values added by integrations or newer Home Assistant versions never break parsing.
 *   **Server-side filtering**: `subscribe_entity` receives only that entity's changes, not every state change in the house.
 *   **Ordered callbacks**: callbacks of one subscription run one after another, in event order; each receives an `HAClient` handle to make further calls.
-*   **Triggers**: State, Numeric State, Sun (with negative offsets), Time, Time Pattern, Template, Zone, plus raw JSON for any other platform.
+*   **Triggers**: State, Numeric State, Sun (with negative offsets), Time, Time Pattern, Template, Zone (with builders), plus raw JSON for any other platform.
 *   **History**: entity history and the state at a past point in time.
+
+## Supported Home Assistant versions
+
+Home Assistant **2024.10 or newer**: triggers are sent with the `trigger` key (older versions only accept `platform`).
 
 ## Quick Start
 
@@ -49,6 +53,8 @@ async fn main() -> anyhow::Result<()> {
 
 Keep at least one `HAClient` handle alive: when every handle is dropped, the client shuts down.
 
+Callbacks return `ha_core_client::CallbackResult` (`Result<(), Box<dyn Error + Send + Sync>>`): end with `Ok(())`, and `?` works on any error type, including `anyhow::Error`. Returned errors are logged.
+
 ## Configuration
 
 `HAClient::connect_with(ClientConfig)` tunes timeouts:
@@ -63,7 +69,8 @@ let config = ClientConfig::new("wss://ha.example.com/api/websocket", "TOKEN")
     .pong_timeout(Duration::from_secs(10))      // default 10s
     .reconnect_delay(Duration::from_secs(1), Duration::from_secs(60)) // backoff bounds
     .subscription_queue_size(1024)              // events waiting per subscription
-    .slow_callback_warning(Duration::from_secs(5)); // log callbacks that run this long
+    .slow_callback_warning(Duration::from_secs(5)) // log callbacks that run this long
+    .max_message_size(64 << 20);                // largest accepted message, default 64 MiB
 let client = HAClient::connect_with(config).await?;
 ```
 
@@ -106,7 +113,9 @@ client.subscribe_entity("sensor.power", |client, event| async move {
 
 Callbacks of one subscription run one after another. If a callback falls behind, `subscribe_entity` merges the waiting state changes into one (from the last delivered state to the newest), and other subscriptions drop their oldest events beyond `subscription_queue_size`; the callback is told with `SubscriptionStatus::Lagged { dropped }`. To process events concurrently, `tokio::spawn` inside the callback.
 
-After a reconnect, `subscribe_entity` re-reads the entity: if it changed while disconnected, one `StateChanged` (last known → current state) arrives right before `Restored`. A handler can also `client.unsubscribe(subscription)` on `Interrupted`, which works while offline.
+After a reconnect, `subscribe_entity` re-reads the entity: if it changed while disconnected, one `StateChanged` (last known → current state) arrives right before `Restored`, and live changes follow only after it. A handler can also `client.unsubscribe(subscription)` on `Interrupted`, which works while offline.
+
+`unsubscribe` ends with `SubscriptionStatus::Unsubscribed`; `stop()` waits (up to 5s) for callbacks to handle what is queued, ending with `Closed`.
 
 While reconnecting, requests fail fast with `Error::NotConnected`, but new subscriptions are accepted: they start as `Interrupted` and are sent once the connection is back. After a reconnect, triggers are re-created in Home Assistant, so a pending `for` countdown starts over. If Home Assistant rejects the token during a reconnect, the client stops with `ConnectionState::AuthFailed` instead of retrying (repeated failed logins can get the client's IP banned).
 
@@ -125,19 +134,22 @@ While reconnecting, requests fail fast with `Error::NotConnected`, but new subsc
 ### Subscriptions
 
 *   `subscribe_entity(entity_id, callback)`: state/attribute changes of one entity, as `Event::StateChanged`.
+*   `subscribe_entity_with(entity_id, EntityChanges::State, callback)`: only changes of the state itself, skipping attribute-only updates. (A sensor re-reporting an unchanged value is never delivered: Home Assistant does not send such reports over the WebSocket API.)
+*   `watch_silence("sensor.outdoor", Duration::from_secs(1800), callback)`: `Event::Silence { silent }` when a sensor has not reported (even an unchanged value) for longer than the given time, and when it reports again. Checked in Home Assistant, with no polling.
+*   `subscribe_template("{{ states('sensor.x') | float * 2 }}", callback)`: `Event::TemplateRendered { result }` with the current result and on every change.
 *   `subscribe_events(event_type, callback)`, `subscribe_service_calls(callback)`: bus events.
-*   `subscribe_trigger(Trigger, callback)`, `subscribe_trigger_raw(json, callback)`: any trigger, as `Event::TriggerFired`.
-*   Helpers: `subscribe_state_trigger`, `subscribe_numeric_state_trigger`, `subscribe_sun_trigger`, `subscribe_time_trigger`, `subscribe_time_pattern_trigger`, `subscribe_template_trigger`, `subscribe_zone_trigger`.
-*   `unsubscribe(subscription)`.
+*   `subscribe_trigger(trigger, callback)`, `subscribe_trigger_raw(json, callback)`: any trigger, as `Event::TriggerFired`. Builders: `StateTrigger::new("binary_sensor.door").to(HaState::On).for_duration(..)`, `NumericStateTrigger::new(..).above(..)`, `TimePatternTrigger::new().minutes("/5")`, …
+*   Builders for every typed platform: `StateTrigger`, `NumericStateTrigger`, `SunTrigger`, `TimeTrigger`, `TimePatternTrigger`, `TemplateTrigger`, `ZoneTrigger`.
+*   `unsubscribe(subscription)`, or `subscription.guard(&client)` to unsubscribe on drop.
 
 ### Domain Helpers
 
 *   **General**: `turn_on`, `turn_off`, `toggle` (any domain).
-*   **Climate**: `set_hvac_mode`, `set_temperature`, `set_fan_mode`, `set_preset_mode`, `set_swing_mode`.
+*   **Climate**: `set_hvac_mode`, `set_temperature`, `set_temperature_range`, `set_fan_mode`, `set_preset_mode`, `set_swing_mode`.
 *   **Alarm**: `alarm_disarm`, `alarm_arm_home`, `alarm_arm_away`, `alarm_arm_night`, `alarm_arm_vacation`.
 *   **Cover**: `open_cover`, `close_cover`, `stop_cover`, `set_cover_position`, `set_cover_tilt_position`.
 *   **Lock**: `lock`, `unlock`.
-*   **Input**: `set_number`, `set_text`, `select_option`.
+*   **Input**: `set_number`, `set_text`, `select_option` (`input_*` or `number`/`text`/`select` entities).
 
 ## Development
 
@@ -148,7 +160,7 @@ cargo run --example demo         # read-only tour against a real instance
 
 The demo reads `HA_URL`, `HA_TOKEN` and optionally `DEMO_ENTITY` from `config.json` (copy `config.example.json`; `config.json` is git-ignored).
 
-See [CHANGELOG.md](CHANGELOG.md) for the migration guide from 0.1.
+See [CHANGELOG.md](CHANGELOG.md) for the migration guides from 0.1 and 0.2.
 
 ## License
 

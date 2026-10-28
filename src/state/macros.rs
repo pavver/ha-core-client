@@ -3,6 +3,7 @@
 /// Generates `Display`, `FromStr` (infallible), `From<&str>`, `From<String>`,
 /// `as_str()`, `Serialize` and `Deserialize`. Unknown strings round-trip through
 /// `Other`, so values Home Assistant adds later never break deserialization.
+/// Equality and hashing use `as_str()`, so `Other("light")` equals `Light`.
 macro_rules! string_enum {
     (
         $(#[$meta:meta])*
@@ -11,7 +12,7 @@ macro_rules! string_enum {
         }
     ) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        #[derive(Debug, Clone)]
         #[non_exhaustive]
         pub enum $name {
             $( $(#[$vmeta])* $variant, )*
@@ -26,6 +27,20 @@ macro_rules! string_enum {
                     $( Self::$variant => $s, )*
                     Self::Other(s) => s.as_str(),
                 }
+            }
+        }
+
+        impl PartialEq for $name {
+            fn eq(&self, other: &Self) -> bool {
+                self.as_str() == other.as_str()
+            }
+        }
+
+        impl Eq for $name {}
+
+        impl std::hash::Hash for $name {
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                self.as_str().hash(state);
             }
         }
 

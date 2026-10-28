@@ -3,10 +3,7 @@ pub(crate) mod helpers;
 pub mod state;
 pub mod service;
 
-pub use attributes::{
-    AttributeSet, ClimateAttributes, GenericAttributes, HistoricalAttributeSet,
-    HistoricalClimateAttributes, HistoricalGenericAttributes,
-};
+pub use attributes::{AttributeSet, ClimateAttributes, GenericAttributes};
 pub use state::{HistoricalState, State};
 pub use service::ServiceCalledEvent;
 
@@ -98,6 +95,19 @@ pub enum Event {
     /// Corresponds to a trigger firing from a `subscribe_trigger` subscription.
     TriggerFired(TriggerFiredEvent),
 
+    /// The current result of a [`subscribe_template`](crate::HAClient::subscribe_template)
+    /// template: right after subscribing (and after every reconnect), then each time it changes.
+    TemplateRendered { result: Value },
+
+    /// Home Assistant failed to render a subscribed template. The subscription stays active.
+    /// `level` is `ERROR` or `WARNING`.
+    TemplateError { message: String, level: String },
+
+    /// From [`watch_silence`](crate::HAClient::watch_silence): whether the entity has not
+    /// reported for longer than the given time. Right after subscribing (and after every
+    /// reconnect), then each time it changes.
+    Silence { entity_id: String, silent: bool },
+
     /// A generic fallback for any event that doesn't have a specific
     /// type-safe variant in this enum. It provides the raw `event_type`
     /// string and the JSON `data` payload.
@@ -138,6 +148,9 @@ pub enum SubscriptionStatus {
     /// The client stopped (`stop()`, all handles dropped, or the token was rejected).
     /// No further events.
     Closed,
+    /// The subscription was cancelled with [`HAClient::unsubscribe`](crate::HAClient::unsubscribe)
+    /// (or by dropping its [`SubscriptionGuard`](crate::SubscriptionGuard)). No further events.
+    Unsubscribed,
 }
 
 impl Event {
@@ -169,6 +182,31 @@ impl Event {
                 log::warn!("Failed to deserialize entity state change: {e}. Falling back to TriggerFired.");
                 Event::TriggerFired(fired)
             }
+        }
+    }
+
+    /// Converts a `render_template` event: `{"result": ..., "listeners": ...}` or
+    /// `{"error": ..., "level": ...}`.
+    pub(crate) fn from_template(mut payload: Value) -> Event {
+        if let Some(message) = payload.get("error") {
+            let message = message.as_str().map_or_else(|| message.to_string(), str::to_string);
+            let level = payload.get("level").and_then(Value::as_str).unwrap_or("ERROR").to_string();
+            return Event::TemplateError { message, level };
+        }
+        Event::TemplateRendered { result: payload.get_mut("result").map(Value::take).unwrap_or(Value::Null) }
+    }
+
+    /// Converts the `render_template` event of `watch_silence`, whose template renders a boolean.
+    pub(crate) fn from_silence(entity_id: &str, payload: Value) -> Event {
+        match Event::from_template(payload) {
+            Event::TemplateRendered { result } => match result.as_bool() {
+                Some(silent) => Event::Silence { entity_id: entity_id.to_string(), silent },
+                None => {
+                    log::warn!("Unexpected silence template result for {entity_id}: {result}");
+                    Event::TemplateRendered { result }
+                }
+            },
+            other => other,
         }
     }
 

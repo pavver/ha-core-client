@@ -1,8 +1,9 @@
 use futures_util::{SinkExt, StreamExt};
-use log::{debug, info};
+use log::{debug, info, warn};
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
 
 use crate::config::ClientConfig;
 use crate::error::{Error, Result};
@@ -19,7 +20,10 @@ pub(crate) async fn connect_and_auth(config: &ClientConfig) -> Result<WsStream> 
 
 async fn handshake(config: &ClientConfig) -> Result<WsStream> {
     debug!("Connecting to {}", config.url);
-    let (mut ws, _) = connect_async(config.url.as_str())
+    // Answers arrive as one frame each, so frames may be as large as messages.
+    let limit = Some(config.max_message_size);
+    let ws_config = WebSocketConfig::default().max_message_size(limit).max_frame_size(limit);
+    let (mut ws, _) = connect_async_with_config(config.url.as_str(), Some(ws_config), false)
         .await
         .map_err(|e| Error::Connection(format!("failed to connect to {}: {e}", config.url)))?;
 
@@ -37,10 +41,29 @@ async fn handshake(config: &ClientConfig) -> Result<WsStream> {
     match reply.msg_type.as_str() {
         "auth_ok" => {
             info!("Connected and authenticated to {}", config.url);
+            if let Some(version) = reply.ha_version.as_deref().filter(|v| !is_supported(v)) {
+                warn!(
+                    "Home Assistant {version} is older than {}.{}; trigger subscriptions will be rejected.",
+                    MIN_HA_VERSION.0, MIN_HA_VERSION.1
+                );
+            }
             Ok(ws)
         }
         "auth_invalid" => Err(Error::Auth(reply.message.unwrap_or_else(|| "invalid access token".into()))),
         other => Err(Error::Protocol(format!("expected 'auth_ok' or 'auth_invalid', got '{other}'"))),
+    }
+}
+
+/// Oldest supported Home Assistant release: triggers use the `trigger` key (2024.10).
+const MIN_HA_VERSION: (u32, u32) = (2024, 10);
+
+/// Whether a version like `2026.9.4` (or `2024.10.0b1`) is supported. Unparsable
+/// versions (dev builds) are assumed to be.
+fn is_supported(version: &str) -> bool {
+    let mut parts = version.split('.').map(|p| p.parse::<u32>());
+    match (parts.next(), parts.next()) {
+        (Some(Ok(year)), Some(Ok(month))) => (year, month) >= MIN_HA_VERSION,
+        _ => true,
     }
 }
 
@@ -58,5 +81,19 @@ async fn next_json(ws: &mut WsStream) -> Result<Incoming> {
             Some(Err(e)) => return Err(Error::Connection(format!("handshake read error: {e}"))),
             None => return Err(Error::Connection("connection closed during handshake".into())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_check() {
+        assert!(is_supported("2026.9.4"));
+        assert!(is_supported("2024.10.0"));
+        assert!(!is_supported("2024.9.3"));
+        assert!(!is_supported("2023.12.1"));
+        assert!(is_supported("dev"));
     }
 }

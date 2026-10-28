@@ -3,6 +3,7 @@
 //! Bounded for data events; status events are never dropped. When the callback falls
 //! behind, entity subscriptions merge consecutive state changes and other subscriptions
 //! drop their oldest events. Either way the callback is told with `SubscriptionStatus::Lagged`.
+//! `Filter::StateChanges` also drops state changes that keep the state string.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -25,7 +26,18 @@ struct Inner {
     state: Mutex<State>,
     notify: Notify,
     capacity: usize,
-    coalesce: bool,
+    filter: Filter,
+}
+
+/// What the queue does with `StateChanged` events.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Filter {
+    /// Nothing special: the oldest events are dropped when full.
+    None,
+    /// Consecutive changes of the same entity are merged.
+    Merge,
+    /// Merged, and changes that keep the state string are dropped.
+    StateChanges,
 }
 
 impl Inner {
@@ -44,14 +56,13 @@ pub(crate) struct QueueRx {
     sub_id: u64,
 }
 
-/// `capacity` bounds data events; `coalesce` merges consecutive `StateChanged`
-/// events of the same entity instead of dropping them.
-pub(crate) fn channel(sub_id: u64, capacity: usize, coalesce: bool) -> (QueueTx, QueueRx) {
+/// `capacity` bounds data events; see [`Filter`] for how state changes are handled.
+pub(crate) fn channel(sub_id: u64, capacity: usize, filter: Filter) -> (QueueTx, QueueRx) {
     let inner = Arc::new(Inner {
         state: Mutex::new(State { items: VecDeque::new(), data_len: 0, lagged: 0, closed: false }),
         notify: Notify::new(),
         capacity: capacity.max(1),
-        coalesce,
+        filter,
     });
     (QueueTx(inner.clone()), QueueRx { inner, sub_id })
 }
@@ -60,17 +71,37 @@ impl QueueTx {
     pub(crate) fn push(&self, event: Event) {
         let inner = &self.0;
         let mut st = inner.lock();
+        let state_changes = inner.filter == Filter::StateChanges;
         if matches!(event, Event::Status { .. }) {
             st.items.push_back(event);
+        } else if state_changes && keeps_state(&event) {
+            // Not a change of the state; filtered, not lost.
         } else {
-            let unmerged = if inner.coalesce { merge_into_last(&mut st.items, event) } else { Some(event) };
+            let unmerged =
+                if inner.filter == Filter::None { Some(event) } else { merge_into_last(&mut st.items, event) };
             match unmerged {
                 Some(event) => push_data(&mut st, event, inner.capacity),
-                None => st.lagged += 1,
+                None => {
+                    st.lagged += 1;
+                    if state_changes && st.items.back().is_some_and(keeps_state) {
+                        // The merged changes cancel out (`A → B`, `B → A`): nothing to deliver.
+                        st.items.pop_back();
+                        st.data_len -= 1;
+                        st.lagged += 1;
+                    }
+                }
             }
         }
         drop(st);
         inner.notify.notify_one();
+    }
+
+    /// Drops everything queued, for a subscription whose callback must not run.
+    pub(crate) fn discard(&self) {
+        let mut st = self.0.lock();
+        st.items.clear();
+        st.data_len = 0;
+        st.lagged = 0;
     }
 }
 
@@ -91,6 +122,11 @@ fn push_data(st: &mut State, event: Event, capacity: usize) {
     }
     st.items.push_back(event);
     st.data_len += 1;
+}
+
+/// A state change whose state string stays the same (an attribute-only update).
+fn keeps_state(event: &Event) -> bool {
+    matches!(event, Event::StateChanged { old_state: Some(old), new_state: Some(new), .. } if old.state == new.state)
 }
 
 /// Merges `event` into the last queued event if both are state changes of the same
@@ -186,7 +222,7 @@ mod tests {
 
     #[tokio::test]
     async fn merges_consecutive_changes_of_one_entity() {
-        let (tx, rx) = channel(1, 10, true);
+        let (tx, rx) = channel(1, 10, Filter::Merge);
         tx.push(change("a", "1", "2"));
         tx.push(change("a", "2", "3"));
         tx.push(change("a", "3", "4"));
@@ -197,7 +233,7 @@ mod tests {
 
     #[tokio::test]
     async fn different_entities_are_not_merged() {
-        let (tx, rx) = channel(1, 10, true);
+        let (tx, rx) = channel(1, 10, Filter::Merge);
         tx.push(change("a", "1", "2"));
         tx.push(change("b", "1", "2"));
         assert_eq!(drain(&rx).await, ["a:1->2", "b:1->2"]);
@@ -205,7 +241,7 @@ mod tests {
 
     #[tokio::test]
     async fn drops_oldest_data_but_keeps_statuses() {
-        let (tx, rx) = channel(1, 2, false);
+        let (tx, rx) = channel(1, 2, Filter::None);
         tx.push(generic(1));
         tx.push(status(SubscriptionStatus::Interrupted));
         tx.push(generic(2));
@@ -215,8 +251,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn state_filter_skips_kept_states_and_cancelled_changes() {
+        let (tx, rx) = channel(1, 10, Filter::StateChanges);
+        tx.push(change("a", "1", "1"));
+        tx.push(change("a", "1", "2"));
+        tx.push(change("a", "2", "1"));
+        tx.push(change("a", "1", "3"));
+        // `1 -> 2 -> 1` cancels out; `1 -> 1` is not a change at all.
+        assert_eq!(drain(&rx).await, ["Lagged { dropped: 2 }", "a:1->3"]);
+    }
+
+    #[tokio::test]
     async fn closes_after_draining() {
-        let (tx, rx) = channel(1, 2, false);
+        let (tx, rx) = channel(1, 2, Filter::None);
         tx.push(generic(1));
         drop(tx);
         assert_eq!(describe(&rx.recv().await.unwrap()), "e1");
@@ -225,7 +272,7 @@ mod tests {
 
     #[tokio::test]
     async fn wakes_a_waiting_receiver() {
-        let (tx, rx) = channel(1, 2, false);
+        let (tx, rx) = channel(1, 2, Filter::None);
         let waiter = tokio::spawn(async move { rx.recv().await.map(|e| describe(&e)) });
         tokio::task::yield_now().await;
         tx.push(generic(7));

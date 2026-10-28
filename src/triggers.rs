@@ -5,7 +5,7 @@ use std::time::Duration;
 
 #[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
-#[serde(tag = "platform")]
+#[serde(tag = "trigger")]
 pub enum Trigger {
     State(StateTrigger),
     NumericState(NumericStateTrigger),
@@ -101,6 +101,140 @@ pub enum ZoneEvent {
     Leave,
 }
 
+macro_rules! into_trigger {
+    ($($platform:ident => $variant:ident),* $(,)?) => {
+        $(impl From<$platform> for Trigger {
+            fn from(t: $platform) -> Self {
+                Trigger::$variant(t)
+            }
+        })*
+    };
+}
+
+into_trigger! {
+    StateTrigger => State,
+    NumericStateTrigger => NumericState,
+    SunTrigger => Sun,
+    TimeTrigger => Time,
+    TimePatternTrigger => TimePattern,
+    TemplateTrigger => Template,
+    ZoneTrigger => Zone,
+}
+
+impl StateTrigger {
+    /// Fires on every change of `entity_id` (state or attributes) until narrowed down.
+    pub fn new(entity_id: impl Into<String>) -> Self {
+        Self { entity_id: entity_id.into(), to: None, from: None, r#for: None, attribute: None }
+    }
+
+    pub fn to(mut self, state: impl Into<HaState>) -> Self {
+        self.to = Some(state.into());
+        self
+    }
+
+    pub fn from(mut self, state: impl Into<HaState>) -> Self {
+        self.from = Some(state.into());
+        self
+    }
+
+    /// Fires only after the new state has held for `duration`.
+    pub fn for_duration(mut self, duration: Duration) -> Self {
+        self.r#for = Some(duration);
+        self
+    }
+
+    /// Watches this attribute instead of the state.
+    pub fn attribute(mut self, attribute: impl Into<String>) -> Self {
+        self.attribute = Some(attribute.into());
+        self
+    }
+}
+
+impl NumericStateTrigger {
+    /// Needs [`above`](Self::above) and/or [`below`](Self::below).
+    pub fn new(entity_id: impl Into<String>) -> Self {
+        Self { entity_id: entity_id.into(), above: None, below: None, r#for: None, attribute: None }
+    }
+
+    pub fn above(mut self, value: f64) -> Self {
+        self.above = Some(value);
+        self
+    }
+
+    pub fn below(mut self, value: f64) -> Self {
+        self.below = Some(value);
+        self
+    }
+
+    pub fn for_duration(mut self, duration: Duration) -> Self {
+        self.r#for = Some(duration);
+        self
+    }
+
+    pub fn attribute(mut self, attribute: impl Into<String>) -> Self {
+        self.attribute = Some(attribute.into());
+        self
+    }
+}
+
+impl SunTrigger {
+    pub fn new(event: SunEvent) -> Self {
+        Self { event, offset: None }
+    }
+
+    /// Negative values fire before the sun event.
+    pub fn offset(mut self, offset: TimeDelta) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+}
+
+impl TimeTrigger {
+    /// `at` is a time like `"07:30:00"` or an `input_datetime` entity id.
+    pub fn new(at: impl Into<String>) -> Self {
+        Self { at: at.into() }
+    }
+}
+
+impl TimePatternTrigger {
+    /// Starts empty; set at least one of hours, minutes, seconds (e.g. `minutes("/5")`).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn hours(mut self, pattern: impl Into<String>) -> Self {
+        self.hours = Some(pattern.into());
+        self
+    }
+
+    pub fn minutes(mut self, pattern: impl Into<String>) -> Self {
+        self.minutes = Some(pattern.into());
+        self
+    }
+
+    pub fn seconds(mut self, pattern: impl Into<String>) -> Self {
+        self.seconds = Some(pattern.into());
+        self
+    }
+}
+
+impl TemplateTrigger {
+    pub fn new(value_template: impl Into<String>) -> Self {
+        Self { value_template: value_template.into(), r#for: None }
+    }
+
+    pub fn for_duration(mut self, duration: Duration) -> Self {
+        self.r#for = Some(duration);
+        self
+    }
+}
+
+impl ZoneTrigger {
+    pub fn new(entity_id: impl Into<String>, zone: impl Into<String>, event: ZoneEvent) -> Self {
+        Self { entity_id: entity_id.into(), zone: zone.into(), event }
+    }
+}
+
 /// Home Assistant time periods: `HH:MM:SS` or `HH:MM:SS.ffffff`, optionally negative.
 mod ha_duration {
     use super::*;
@@ -152,8 +286,28 @@ mod tests {
         });
         assert_eq!(
             serde_json::to_value(t).unwrap(),
-            json!({"platform": "state", "entity_id": "lock.front", "to": "on", "from": "locked", "for": "00:01:30"})
+            json!({"trigger": "state", "entity_id": "lock.front", "to": "on", "from": "locked", "for": "00:01:30"})
         );
+    }
+
+    #[test]
+    fn builders_match_struct_literals() {
+        let built: Trigger = StateTrigger::new("lock.front")
+            .to(HaState::On)
+            .from(HaState::Lock(LockState::Locked))
+            .for_duration(Duration::from_secs(90))
+            .into();
+        assert_eq!(
+            serde_json::to_value(built).unwrap(),
+            json!({"trigger": "state", "entity_id": "lock.front", "to": "on", "from": "locked", "for": "00:01:30"})
+        );
+        let t: Trigger = NumericStateTrigger::new("sensor.t").above(20.5).attribute("temperature").into();
+        assert_eq!(
+            serde_json::to_value(t).unwrap(),
+            json!({"trigger": "numeric_state", "entity_id": "sensor.t", "above": 20.5, "attribute": "temperature"})
+        );
+        let t: Trigger = TimePatternTrigger::new().minutes("/5").into();
+        assert_eq!(serde_json::to_value(t).unwrap(), json!({"trigger": "time_pattern", "minutes": "/5"}));
     }
 
     #[test]

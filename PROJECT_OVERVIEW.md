@@ -42,6 +42,20 @@ Below is a list of Home Assistant WebSocket API features that are not yet implem
 
 ## Current Development State
 
+### October 28, 2026 (0.3.0: Review Fixes)
+
+**Goal:** Fix the issues found in a code review of the runner and the typed model.
+
+**Summary of Changes:**
+*   Runner: subscriptions abandoned by their caller are cancelled; `orphans` no longer grows until reconnect; entity events are held during the post-reconnect re-read; an in-flight subscribe survives a disconnect; unbiased session `select!`; `SubscriptionStatus::Unsubscribed`; `stop()` waits for queued callbacks.
+*   API: callbacks return `CallbackResult` (no `anyhow` dependency), `SubscriptionGuard`, trigger builders, `max_message_size`, `set_temperature_range`, `subscribe_entity_with(.., EntityChanges::State | Any, ..)`, `subscribe_template` and `watch_silence` (a `render_template` with `now()` evaluated by Home Assistant every minute, checked on 2026.9.4: it reads `last_reported` and flips without any polling), `State::last_seen()`. Fixed along the way: Home Assistant can send a template's first render before the `result`, which the runner treated as an unknown subscription and cancelled; such events are now buffered until the ack.
+*   Triggers use the `trigger` key; Home Assistant 2024.10+ is required. Checked against 2026.9.4: `trigger` and `to: null` are accepted, `subscribe_events("state_reported")` is refused ("Event filter is required"), compressed states carry no `last_reported`.
+*   Model: `HaState::Number` only when lossless, attributes typed by entity domain, `string_enum!` equality by wire string, input helpers use the entity's domain.
+*   Legacy removed (breaking, agreed): positional `subscribe_*_trigger` helpers (builders + `subscribe_trigger` instead); `Historical*Attributes` (history carries full attributes, checked on 2026.9.4, so `HistoricalState` uses `AttributeSet`). `ClimateAttributes` gained `friendly_name`, `hvac_action`, target range and current modes, `rest` is a `Map`, unknown `hvac_modes` are skipped; attribute types are `#[non_exhaustive]`.
+*   New scenarios in `tests/client.rs` for each runner change.
+
+See [CHANGELOG.md](CHANGELOG.md) for the migration guide from 0.2.
+
 ### October 28, 2026 (0.2.0: Production Hardening)
 
 **Goal:** Make the library reliable enough for production use, based on a code review and on tests against a live Home Assistant 2026.9 instance.

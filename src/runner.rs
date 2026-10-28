@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::events::{Event, State, SubscriptionStatus};
 use crate::protocol::{self, Incoming, Request};
 use crate::queue::{self, QueueRx, QueueTx};
-use crate::subscription::{Command, EventCallback, SubKind, Subscription};
+use crate::subscription::{Command, EntityChanges, EventCallback, SubKind, Subscription};
 use crate::{ConnectionState, HAClient};
 
 /// State shared between the runner and every [`HAClient`] handle.
@@ -23,6 +23,19 @@ pub(crate) struct Shared {
     pub(crate) config: ClientConfig,
     pub(crate) shutdown_tx: watch::Sender<bool>,
     pub(crate) state_tx: watch::Sender<ConnectionState>,
+    /// Number of subscription workers still running, so `stop()` can wait for them.
+    pub(crate) workers: watch::Sender<usize>,
+}
+
+tokio::task_local! {
+    /// Set while a subscription callback runs, so that `stop()` called from one
+    /// does not wait for the callback itself to finish.
+    static IN_CALLBACK: ();
+}
+
+/// Whether the current task is a subscription callback.
+pub(crate) fn in_callback() -> bool {
+    IN_CALLBACK.try_with(|_| ()).is_ok()
 }
 
 struct SubEntry {
@@ -36,6 +49,12 @@ struct SubEntry {
     interrupted: bool,
     /// Last state seen by an entity subscription, to detect changes missed while disconnected.
     last_state: Option<State>,
+    /// Events of an entity subscription that arrive while its state is re-read after a
+    /// reconnect. Delivered after `Restored`, without those the re-read already covers.
+    held: Option<Vec<Event>>,
+    /// Events that arrived before Home Assistant acknowledged the subscription (it sends a
+    /// template's first render this way). Delivered once the subscription is confirmed.
+    early: Vec<Event>,
 }
 
 enum PendingKind {
@@ -58,8 +77,11 @@ enum PendingKind {
         restoring: bool,
         responder: Option<oneshot::Sender<Result<Subscription>>>,
     },
-    /// Fire-and-forget (internal unsubscribes).
-    Ignore,
+    /// `unsubscribe_events` of `ha_id`; `responder` is `None` for internal cleanups.
+    Unsubscribe {
+        ha_id: u64,
+        responder: Option<oneshot::Sender<Result<Value>>>,
+    },
 }
 
 struct Pending {
@@ -170,10 +192,9 @@ impl Runner {
     fn finish(&mut self, state: ConnectionState) {
         let ids: Vec<u64> = self.subs.keys().copied().collect();
         for sub_id in ids {
-            self.deliver_status(sub_id, SubscriptionStatus::Closed);
+            // Dropping the entry ends its worker task once queued events are handled.
+            self.close_subscription(sub_id, SubscriptionStatus::Closed);
         }
-        // Dropping the entries ends their worker tasks once queued events are handled.
-        self.subs.clear();
         self.set_state(state);
         log::info!("Home Assistant client stopped.");
     }
@@ -182,21 +203,13 @@ impl Runner {
         self.shared.state_tx.send_replace(state);
     }
 
-    /// Queues `event` for the subscription's callback.
-    fn deliver(&self, sub_id: u64, event: Event) {
-        if let Some(entry) = self.subs.get(&sub_id) {
-            entry.events.push(event);
-        }
-    }
-
-    fn deliver_status(&self, sub_id: u64, status: SubscriptionStatus) {
-        self.deliver(sub_id, Event::Status { subscription: Subscription { id: sub_id }, status });
-    }
-
+    /// Delivers `Restored`, followed by the events held during the state re-read.
     fn restored(&mut self, sub_id: u64) {
-        if let Some(entry) = self.subs.get_mut(&sub_id) {
-            entry.interrupted = false;
-            self.deliver_status(sub_id, SubscriptionStatus::Restored);
+        let Some(entry) = self.subs.get_mut(&sub_id) else { return };
+        entry.interrupted = false;
+        entry.events.push(status_event(sub_id, SubscriptionStatus::Restored));
+        for event in entry.held.take().unwrap_or_default() {
+            entry.push_entity_event(event, true);
         }
     }
 
@@ -204,13 +217,48 @@ impl Runner {
     fn add_subscription(&mut self, kind: SubKind, request: Request, callback: EventCallback) -> u64 {
         let sub_id = self.next_sub_id;
         self.next_sub_id += 1;
-        let coalesce = matches!(kind, SubKind::EntityState { .. });
-        let (events, rx) = queue::channel(sub_id, self.shared.config.subscription_queue_size, coalesce);
-        let worker = Worker { rx, callback, weak_tx: self.weak_tx.clone(), shared: self.shared.clone() };
-        tokio::spawn(worker.run());
-        let entry = SubEntry { kind, request, events, ha_id: None, interrupted: false, last_state: None };
+        let filter = match kind {
+            SubKind::EntityState { changes: EntityChanges::State, .. } => queue::Filter::StateChanges,
+            SubKind::EntityState { .. } => queue::Filter::Merge,
+            _ => queue::Filter::None,
+        };
+        let (events, rx) = queue::channel(sub_id, self.shared.config.subscription_queue_size, filter);
+        tokio::spawn(Worker::new(rx, callback, self.weak_tx.clone(), self.shared.clone()).run());
+        let entry =
+            SubEntry { kind, request, events, ha_id: None, interrupted: false, last_state: None, held: None, early: Vec::new() };
         self.subs.insert(sub_id, entry);
         sub_id
+    }
+
+    /// Hands the subscription to its caller. If the caller stopped waiting (timed out or
+    /// dropped the future), nobody could ever unsubscribe it, so it is removed; the
+    /// returned Home Assistant id, if any, must then be unsubscribed.
+    fn confirm(&mut self, sub_id: u64, responder: oneshot::Sender<Result<Subscription>>) -> Option<u64> {
+        if responder.send(Ok(Subscription { id: sub_id })).is_ok() {
+            return None;
+        }
+        log::debug!("Subscription {sub_id} was abandoned by its caller; removing it");
+        self.remove_subscription(sub_id)
+    }
+
+    /// Removes a subscription that was never handed out: queued events are discarded and
+    /// the callback is not told. Returns its Home Assistant id.
+    fn remove_subscription(&mut self, sub_id: u64) -> Option<u64> {
+        let entry = self.subs.remove(&sub_id)?;
+        entry.events.discard();
+        let ha_id = entry.ha_id?;
+        self.routes.remove(&ha_id);
+        Some(ha_id)
+    }
+
+    /// Removes a subscription after queueing `status` as its last event.
+    /// Returns its Home Assistant id.
+    fn close_subscription(&mut self, sub_id: u64, status: SubscriptionStatus) -> Option<u64> {
+        let entry = self.subs.remove(&sub_id)?;
+        entry.events.push(status_event(sub_id, status));
+        let ha_id = entry.ha_id?;
+        self.routes.remove(&ha_id);
+        Some(ha_id)
     }
 
     // --- Disconnected phase ---
@@ -244,14 +292,14 @@ impl Runner {
             // Kept and sent with the others once reconnected; starts out `Interrupted`.
             Command::Subscribe { kind, request, callback, responder } => {
                 let sub_id = self.add_subscription(kind, request, callback);
+                self.confirm(sub_id, responder);
                 if let Some(entry) = self.subs.get_mut(&sub_id) {
                     entry.interrupted = true;
+                    entry.events.push(status_event(sub_id, SubscriptionStatus::Interrupted));
                 }
-                self.deliver_status(sub_id, SubscriptionStatus::Interrupted);
-                let _ = responder.send(Ok(Subscription { id: sub_id }));
             }
             Command::Unsubscribe { id, responder } => {
-                self.subs.remove(&id);
+                self.close_subscription(id, SubscriptionStatus::Unsubscribed);
                 let _ = responder.send(Ok(Value::Null));
             }
         }
@@ -269,8 +317,8 @@ impl Runner {
         self.last_rx = Instant::now();
         self.ping = None;
 
-        if let Err(reason) = self.resubscribe(ws).await {
-            return SessionEnd::Lost(reason);
+        if let Some(end) = self.resubscribe(ws, shutdown_rx).await {
+            return end;
         }
         self.set_state(ConnectionState::Connected);
 
@@ -278,8 +326,8 @@ impl Runner {
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         loop {
+            // Not `biased`: a steady stream of frames must not starve commands and housekeeping.
             let step = tokio::select! {
-                biased;
                 _ = stopped(shutdown_rx) => return SessionEnd::Stop,
                 msg = ws.next() => match msg {
                     Some(Ok(Message::Text(text))) => {
@@ -321,26 +369,34 @@ impl Runner {
                 PendingKind::StateOnce { responder, .. } => drop(responder.send(Err(error()))),
                 PendingKind::Subscribe { sub_id, responder: Some(r) }
                 | PendingKind::Resync { sub_id, responder: Some(r), .. } => {
-                    self.subs.remove(&sub_id);
-                    let _ = r.send(Err(error()));
+                    if interrupt {
+                        // As if it had been made while disconnected: restored on the next connection.
+                        self.confirm(sub_id, r);
+                    } else {
+                        self.remove_subscription(sub_id);
+                        let _ = r.send(Err(Error::Stopped));
+                    }
                 }
-                PendingKind::Subscribe { responder: None, .. } | PendingKind::Resync { .. } | PendingKind::Ignore => {}
+                // The server-side subscription ended with the connection.
+                PendingKind::Unsubscribe { responder: Some(r), .. } => drop(r.send(Ok(Value::Null))),
+                PendingKind::Subscribe { responder: None, .. }
+                | PendingKind::Resync { .. }
+                | PendingKind::Unsubscribe { .. } => {}
             }
         }
         self.routes.clear();
         self.orphans.clear();
         self.ping = None;
 
-        let mut newly_interrupted = Vec::new();
         for (sub_id, entry) in self.subs.iter_mut() {
             entry.ha_id = None;
+            // The next re-read reports everything that changed since `last_state`.
+            entry.held = None;
+            entry.early.clear();
             if interrupt && !entry.interrupted {
                 entry.interrupted = true;
-                newly_interrupted.push(*sub_id);
+                entry.events.push(status_event(*sub_id, SubscriptionStatus::Interrupted));
             }
-        }
-        for sub_id in newly_interrupted {
-            self.deliver_status(sub_id, SubscriptionStatus::Interrupted);
         }
     }
 
@@ -371,20 +427,36 @@ impl Runner {
 
     /// Unsubscribes from a server-side subscription we no longer route.
     async fn unsubscribe_orphan(&mut self, ws: &mut WsStream, ha_id: u64) -> Result<(), String> {
+        self.unsubscribe(ws, ha_id, None).await
+    }
+
+    async fn unsubscribe(
+        &mut self,
+        ws: &mut WsStream,
+        ha_id: u64,
+        responder: Option<oneshot::Sender<Result<Value>>>,
+    ) -> Result<(), String> {
+        // Events already in flight for it are ignored until Home Assistant confirms.
         self.orphans.insert(ha_id);
-        self.send(ws, protocol::unsubscribe(ha_id), PendingKind::Ignore).await.map(drop)
+        self.send(ws, protocol::unsubscribe(ha_id), PendingKind::Unsubscribe { ha_id, responder }).await.map(drop)
     }
 
     /// Re-sends every subscription, in creation order, with fresh ids.
-    async fn resubscribe(&mut self, ws: &mut WsStream) -> Result<(), String> {
+    /// Returns how the session ended if it could not finish.
+    async fn resubscribe(&mut self, ws: &mut WsStream, shutdown_rx: &watch::Receiver<bool>) -> Option<SessionEnd> {
         let subs: Vec<(u64, Request)> = self.subs.iter().map(|(id, s)| (*id, s.request.clone())).collect();
         if !subs.is_empty() {
             log::info!("Restoring {} subscription(s)...", subs.len());
         }
         for (sub_id, request) in subs {
-            self.send(ws, request, PendingKind::Subscribe { sub_id, responder: None }).await?;
+            if *shutdown_rx.borrow() {
+                return Some(SessionEnd::Stop);
+            }
+            if let Err(reason) = self.send(ws, request, PendingKind::Subscribe { sub_id, responder: None }).await {
+                return Some(SessionEnd::Lost(reason));
+            }
         }
-        Ok(())
+        None
     }
 
     async fn handle_command(&mut self, ws: &mut WsStream, cmd: Command) -> Result<(), String> {
@@ -396,20 +468,19 @@ impl Runner {
                 let request = protocol::subscribe_entities(&[&entity_id]);
                 self.send(ws, request, PendingKind::StateOnce { entity_id, responder }).await?;
             }
+            // The caller gave up while the command was queued.
+            Command::Subscribe { responder, .. } if responder.is_closed() => {}
             Command::Subscribe { kind, request, callback, responder } => {
                 let sub_id = self.add_subscription(kind, request.clone(), callback);
                 self.send(ws, request, PendingKind::Subscribe { sub_id, responder: Some(responder) }).await?;
             }
-            Command::Unsubscribe { id, responder } => match self.subs.remove(&id).and_then(|s| s.ha_id) {
-                Some(ha_id) => {
-                    self.routes.remove(&ha_id);
-                    // Events already in flight for it are expected; don't unsubscribe twice.
-                    self.orphans.insert(ha_id);
-                    self.send(ws, protocol::unsubscribe(ha_id), PendingKind::Request(responder)).await?;
+            Command::Unsubscribe { id, responder } => {
+                match self.close_subscription(id, SubscriptionStatus::Unsubscribed) {
+                    Some(ha_id) => self.unsubscribe(ws, ha_id, Some(responder)).await?,
+                    // Not yet acknowledged: `handle_result` unsubscribes once the ack arrives.
+                    None => drop(responder.send(Ok(Value::Null))),
                 }
-                // Not yet acknowledged: `handle_result` unsubscribes once the ack arrives.
-                None => drop(responder.send(Ok(Value::Null))),
-            },
+            }
         }
         Ok(())
     }
@@ -459,11 +530,20 @@ impl Runner {
         };
         match pending.kind {
             PendingKind::Request(r) => drop(r.send(outcome)),
+            PendingKind::Unsubscribe { ha_id, responder } => {
+                // Home Assistant sends nothing more for it after this answer.
+                self.orphans.remove(&ha_id);
+                match (responder, outcome) {
+                    (Some(r), outcome) => drop(r.send(outcome)),
+                    (None, Err(e)) => log::debug!("Unsubscribing {ha_id} failed: {e}"),
+                    (None, Ok(_)) => {}
+                }
+            }
             PendingKind::Subscribe { sub_id, responder } => match outcome {
                 Ok(_) => self.subscription_acknowledged(ws, id, sub_id, responder).await?,
                 Err(e) => match responder {
                     Some(r) => {
-                        self.subs.remove(&sub_id);
+                        self.remove_subscription(sub_id);
                         let _ = r.send(Err(e));
                     }
                     None => {
@@ -472,8 +552,7 @@ impl Runner {
                             Error::Ha { code, message } => (code, message),
                             other => ("error".to_string(), other.to_string()),
                         };
-                        self.deliver_status(sub_id, SubscriptionStatus::Rejected { code, message });
-                        self.subs.remove(&sub_id);
+                        self.close_subscription(sub_id, SubscriptionStatus::Rejected { code, message });
                     }
                 },
             },
@@ -490,21 +569,27 @@ impl Runner {
                 if let Err(e) = outcome {
                     log::warn!("Could not read the state of subscription {sub_id}: {e}");
                 }
-                // The subscription itself is active; only the baseline is unknown.
-                if let Some(r) = responder {
-                    let _ = r.send(Ok(Subscription { id: sub_id }));
-                }
-                if restoring {
-                    self.restored(sub_id);
-                }
-            }
-            PendingKind::Ignore => {
-                if let Err(e) = outcome {
-                    log::debug!("Internal request {id} failed: {e}");
+                if let Some(ha_id) = self.resync_failed(sub_id, restoring, responder) {
+                    self.unsubscribe_orphan(ws, ha_id).await?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Completes a state read that produced no usable state. The subscription itself
+    /// is active; only the baseline is unknown. Returns a Home Assistant id to unsubscribe.
+    fn resync_failed(
+        &mut self,
+        sub_id: u64,
+        restoring: bool,
+        responder: Option<oneshot::Sender<Result<Subscription>>>,
+    ) -> Option<u64> {
+        let abandoned = responder.and_then(|r| self.confirm(sub_id, r));
+        if restoring {
+            self.restored(sub_id);
+        }
+        abandoned
     }
 
     async fn subscription_acknowledged(
@@ -520,23 +605,36 @@ impl Runner {
             return self.unsubscribe_orphan(ws, ha_id).await;
         };
         entry.ha_id = Some(ha_id);
-        let entity_id = match &entry.kind {
-            SubKind::EntityState { entity_id } => Some(entity_id.clone()),
+        let read = match &entry.kind {
+            SubKind::EntityState { entity_id, .. } => Some(protocol::subscribe_entities(&[entity_id])),
             _ => None,
         };
+        let early = std::mem::take(&mut entry.early);
+        if read.is_some() && restoring {
+            // Live events wait until the re-read tells what was missed meanwhile.
+            entry.held = Some(early);
+        } else if read.is_some() {
+            // The baseline read that follows already includes them.
+        } else {
+            entry.early = early;
+        }
         self.routes.insert(ha_id, sub_id);
-        match entity_id {
+        match read {
             // Read the entity's state: the baseline now, or what changed while disconnected.
-            Some(entity_id) => {
-                let request = protocol::subscribe_entities(&[&entity_id]);
+            Some(request) => {
                 self.send(ws, request, PendingKind::Resync { sub_id, restoring, responder }).await?;
             }
             None => {
-                if let Some(r) = responder {
-                    let _ = r.send(Ok(Subscription { id: sub_id }));
+                if let Some(ha_id) = responder.and_then(|r| self.confirm(sub_id, r)) {
+                    self.unsubscribe_orphan(ws, ha_id).await?;
                 }
                 if restoring {
                     self.restored(sub_id);
+                }
+                if let Some(entry) = self.subs.get_mut(&sub_id) {
+                    for event in std::mem::take(&mut entry.early) {
+                        entry.events.push(event);
+                    }
                 }
             }
         }
@@ -565,10 +663,17 @@ impl Runner {
                 else {
                     unreachable!()
                 };
-                if let Some(rejected) = self.apply_resync(sub_id, restoring, responder, &payload) {
-                    self.unsubscribe_orphan(ws, rejected).await?;
+                if let Some(dropped) = self.apply_resync(sub_id, restoring, responder, &payload) {
+                    self.unsubscribe_orphan(ws, dropped).await?;
                 }
                 return self.unsubscribe_orphan(ws, id).await;
+            }
+            Some(&PendingKind::Subscribe { sub_id, .. }) => {
+                if let Some(entry) = self.subs.get_mut(&sub_id) {
+                    let event = entry.kind.convert(payload);
+                    entry.early.push(event);
+                }
+                return Ok(());
             }
             _ => {}
         }
@@ -584,18 +689,20 @@ impl Runner {
         };
         let Some(entry) = self.subs.get_mut(&sub_id) else { return Ok(()) };
         let event = entry.kind.convert(payload);
-        if let (SubKind::EntityState { .. }, Event::StateChanged { new_state, .. }) = (&entry.kind, &event) {
-            entry.last_state = new_state.clone();
+        if let Some(held) = &mut entry.held {
+            held.push(event);
+        } else {
+            entry.push_entity_event(event, false);
         }
-        self.deliver(sub_id, event);
         Ok(())
     }
 
     /// Handles the state read for an entity subscription: records the baseline, and after
     /// a reconnect reports a change that happened while disconnected, then `Restored`.
     ///
-    /// On the initial subscribe (`responder` set), a missing entity fails the subscription;
-    /// the returned Home Assistant subscription id must then be unsubscribed.
+    /// On the initial subscribe (`responder` set), a missing entity fails the subscription.
+    /// A returned Home Assistant subscription id (of a failed or abandoned subscription)
+    /// must be unsubscribed.
     fn apply_resync(
         &mut self,
         sub_id: u64,
@@ -604,39 +711,29 @@ impl Runner {
         payload: &Value,
     ) -> Option<u64> {
         let entry = self.subs.get_mut(&sub_id)?;
-        let SubKind::EntityState { entity_id } = &entry.kind else { return None };
+        let SubKind::EntityState { entity_id, .. } = &entry.kind else { return None };
         let entity_id = entity_id.clone();
         let current = match read_compressed(payload, &entity_id) {
             Ok(state) => state,
             Err(e) => {
                 log::warn!("Could not parse the state of {entity_id}: {e}");
-                if let Some(r) = responder {
-                    let _ = r.send(Ok(Subscription { id: sub_id }));
-                }
-                if restoring {
-                    self.restored(sub_id);
-                }
-                return None;
+                return self.resync_failed(sub_id, restoring, responder);
             }
         };
         if let Some(r) = responder {
             if current.is_none() {
-                let ha_id = self.subs.remove(&sub_id).and_then(|e| e.ha_id);
-                if let Some(ha_id) = ha_id {
-                    self.routes.remove(&ha_id);
-                }
+                let ha_id = self.remove_subscription(sub_id);
                 let message = format!("Entity '{entity_id}' not found");
                 let _ = r.send(Err(Error::Ha { code: "not_found".into(), message }));
                 return ha_id;
             }
             entry.last_state = current;
-            let _ = r.send(Ok(Subscription { id: sub_id }));
-            return None;
+            return self.confirm(sub_id, r);
         }
         let missed = restoring && changed(entry.last_state.as_ref(), current.as_ref());
         let old_state = std::mem::replace(&mut entry.last_state, current.clone());
         if missed {
-            self.deliver(sub_id, Event::StateChanged { entity_id, old_state, new_state: current });
+            entry.events.push(Event::StateChanged { entity_id, old_state, new_state: current });
         }
         if restoring {
             self.restored(sub_id);
@@ -656,16 +753,13 @@ impl Runner {
                 PendingKind::Request(r) => drop(r.send(Err(Error::Timeout))),
                 PendingKind::StateOnce { responder, .. } => drop(responder.send(Err(Error::Timeout))),
                 PendingKind::Subscribe { sub_id, responder: Some(r) } => {
-                    self.subs.remove(&sub_id);
+                    self.remove_subscription(sub_id);
                     let _ = r.send(Err(Error::Timeout));
                 }
                 // Keep the subscription: a reconnect will retry it.
                 PendingKind::Subscribe { responder: None, .. } => resubscribe_timed_out = true,
                 PendingKind::Resync { sub_id, responder: Some(r), .. } => {
-                    if let Some(ha_id) = self.subs.remove(&sub_id).and_then(|e| e.ha_id) {
-                        self.routes.remove(&ha_id);
-                        abandoned.push(ha_id);
-                    }
+                    abandoned.extend(self.remove_subscription(sub_id));
                     let _ = r.send(Err(Error::Timeout));
                 }
                 PendingKind::Resync { sub_id, restoring, responder: None } => {
@@ -673,7 +767,11 @@ impl Runner {
                         self.restored(sub_id);
                     }
                 }
-                PendingKind::Ignore => {}
+                PendingKind::Unsubscribe { responder, .. } => {
+                    if let Some(r) = responder {
+                        let _ = r.send(Err(Error::Timeout));
+                    }
+                }
             }
         }
         for ha_id in abandoned {
@@ -709,17 +807,43 @@ fn read_compressed(payload: &Value, entity_id: &str) -> serde_json::Result<Optio
         .transpose()
 }
 
-/// Whether the entity differs from the last known state. Without a baseline nothing is
-/// reported. Timestamps are compared with 1ms tolerance because `subscribe_entities`
-/// sends them as floats.
-fn changed(last: Option<&State>, current: Option<&State>) -> bool {
-    match (last, current) {
-        (None, _) => false,
-        (Some(_), None) => true,
-        (Some(a), Some(b)) => {
-            a.state != b.state || (a.last_updated - b.last_updated).abs() > chrono::TimeDelta::milliseconds(1)
+impl SubEntry {
+    /// Queues an event, tracking `last_state` for entity subscriptions. A state change
+    /// that `last_state` already includes is skipped: the same update (seen by both the
+    /// state re-read and the trigger) or, with `or_older`, an earlier one.
+    fn push_entity_event(&mut self, event: Event, or_older: bool) {
+        if let (SubKind::EntityState { .. }, Event::StateChanged { new_state, .. }) = (&self.kind, &event) {
+            if covered(self.last_state.as_ref(), new_state.as_ref(), or_older) {
+                return;
+            }
+            self.last_state = new_state.clone();
         }
+        self.events.push(event);
     }
+}
+
+fn status_event(sub_id: u64, status: SubscriptionStatus) -> Event {
+    Event::Status { subscription: Subscription { id: sub_id }, status }
+}
+
+/// Timestamps are compared with 1ms tolerance because `subscribe_entities` sends them as floats.
+const TIMESTAMP_TOLERANCE: chrono::TimeDelta = chrono::TimeDelta::milliseconds(1);
+
+/// Whether `last` already reflects the update to `new`: the same update or, with
+/// `or_older`, any update not newer than `last`.
+fn covered(last: Option<&State>, new: Option<&State>, or_older: bool) -> bool {
+    let (Some(last), Some(new)) = (last, new) else { return false };
+    let newer_by = new.last_updated - last.last_updated;
+    if or_older {
+        newer_by <= TIMESTAMP_TOLERANCE
+    } else {
+        last.state == new.state && newer_by.abs() <= TIMESTAMP_TOLERANCE
+    }
+}
+
+/// Whether the entity differs from the last known state. Without a baseline nothing is reported.
+fn changed(last: Option<&State>, current: Option<&State>) -> bool {
+    last.is_some() && !covered(last, current, false)
 }
 
 /// Resolves once shutdown is requested. Returns `()` so no (non-`Send`) watch guard
@@ -738,6 +862,12 @@ struct Worker {
 }
 
 impl Worker {
+    /// Counted in `Shared::workers` until dropped.
+    fn new(rx: QueueRx, callback: EventCallback, weak_tx: mpsc::WeakSender<Command>, shared: Arc<Shared>) -> Self {
+        shared.workers.send_modify(|n| *n += 1);
+        Self { rx, callback, weak_tx, shared }
+    }
+
     async fn run(self) {
         let sub_id = self.rx.sub_id();
         while let Some(event) = self.rx.recv().await {
@@ -745,10 +875,10 @@ impl Worker {
             let Some(cmd_tx) = self.weak_tx.upgrade() else { continue };
             let client = HAClient { cmd_tx, shared: self.shared.clone() };
             // Each callback runs in its own task, so a panic is contained and logged.
-            let task = tokio::spawn((self.callback)(client, event));
+            let task = tokio::spawn(IN_CALLBACK.scope((), (self.callback)(client, event)));
             match self.watch_slow(sub_id, task).await {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => log::error!("Callback of subscription {sub_id} failed: {e:#}"),
+                Ok(Err(e)) => log::error!("Callback of subscription {sub_id} failed: {}", error_chain(&*e)),
                 Err(e) => log::error!("Callback of subscription {sub_id} panicked: {e}"),
             }
         }
@@ -776,6 +906,24 @@ impl Worker {
         log::warn!("Slow callback of subscription {sub_id} finished after {:?}", started.elapsed());
         result
     }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.shared.workers.send_modify(|n| *n -= 1);
+    }
+}
+
+/// The error followed by its sources, like anyhow's `{:#}`.
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = error.to_string();
+    let mut source = error.source();
+    while let Some(e) = source {
+        out.push_str(": ");
+        out.push_str(&e.to_string());
+        source = e.source();
+    }
+    out
 }
 
 /// Housekeeping granularity: fine enough for the configured timeouts, at most 1s.
@@ -835,5 +983,18 @@ mod tests {
         assert!(changed(Some(&s("1", 1.0)), Some(&s("2", 1.0))));
         assert!(changed(Some(&s("1", 1.0)), Some(&s("1", 2.0))));
         assert!(!changed(Some(&s("1", 1.0000004)), Some(&s("1", 1.0))));
+    }
+
+    #[test]
+    fn coverage_of_held_and_duplicate_changes() {
+        let s = |state: &str, lu: f64| State::from_compressed("sensor.x", &json!({"s": state, "lc": lu, "lu": lu})).unwrap();
+        // Same update seen twice.
+        assert!(covered(Some(&s("2", 5.0)), Some(&s("2", 5.0)), false));
+        // A newer update with the same state (e.g. attributes changed) is not a duplicate.
+        assert!(!covered(Some(&s("2", 5.0)), Some(&s("2", 6.0)), false));
+        // Held events older than the re-read are covered by it; newer ones are not.
+        assert!(covered(Some(&s("3", 5.0)), Some(&s("2", 4.0)), true));
+        assert!(!covered(Some(&s("3", 5.0)), Some(&s("4", 6.0)), true));
+        assert!(!covered(None, Some(&s("1", 1.0)), true));
     }
 }

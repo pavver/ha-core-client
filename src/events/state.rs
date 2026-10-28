@@ -1,27 +1,53 @@
-use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use crate::events::attributes::{AttributeSet, ClimateAttributes, GenericAttributes, HistoricalAttributeSet};
+use crate::events::attributes::AttributeSet;
 use crate::events::helpers::de_helpers;
 use crate::state::{Domain, HaState};
 
 /// Represents the detailed state of a Home Assistant entity from a live event.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(from = "StateWire")]
 pub struct State {
     pub entity_id: String,
     pub state: String,
-    #[serde(default)]
+    /// Typed by the entity's domain, see [`AttributeSet`].
     pub attributes: AttributeSet,
-    #[serde(deserialize_with = "de_helpers::deserialize_rfc3339_string")]
     pub last_changed: DateTime<Utc>,
-    #[serde(deserialize_with = "de_helpers::deserialize_rfc3339_string")]
     pub last_updated: DateTime<Utc>,
-    #[serde(default, deserialize_with = "de_helpers::deserialize_optional_rfc3339_string")]
     pub last_reported: Option<DateTime<Utc>>,
     /// `{"id": ..., "parent_id": ..., "user_id": ...}`
-    #[serde(default)]
     pub context: Value,
+}
+
+#[derive(Deserialize)]
+struct StateWire {
+    entity_id: String,
+    state: String,
+    #[serde(default)]
+    attributes: Value,
+    #[serde(deserialize_with = "de_helpers::deserialize_rfc3339_string")]
+    last_changed: DateTime<Utc>,
+    #[serde(deserialize_with = "de_helpers::deserialize_rfc3339_string")]
+    last_updated: DateTime<Utc>,
+    #[serde(default, deserialize_with = "de_helpers::deserialize_optional_rfc3339_string")]
+    last_reported: Option<DateTime<Utc>>,
+    #[serde(default)]
+    context: Value,
+}
+
+impl From<StateWire> for State {
+    fn from(w: StateWire) -> Self {
+        State {
+            attributes: AttributeSet::for_entity(&w.entity_id, w.attributes),
+            entity_id: w.entity_id,
+            state: w.state,
+            last_changed: w.last_changed,
+            last_updated: w.last_updated,
+            last_reported: w.last_reported,
+            context: w.context,
+        }
+    }
 }
 
 impl State {
@@ -39,6 +65,12 @@ impl State {
         Domain::of_entity(&self.entity_id)
     }
 
+    /// When the entity last reported, even an unchanged value: `last_reported`, falling
+    /// back to `last_updated` where Home Assistant does not send it (`get_state`, history).
+    pub fn last_seen(&self) -> DateTime<Utc> {
+        self.last_reported.map_or(self.last_updated, |reported| reported.max(self.last_updated))
+    }
+
     /// Builds a `State` from the compressed format used by `subscribe_entities`
     /// (`{"s": ..., "a": ..., "c": ..., "lc": ..., "lu": ...}`).
     pub(crate) fn from_compressed(entity_id: &str, value: &Value) -> serde_json::Result<State> {
@@ -51,7 +83,7 @@ impl State {
         Ok(State {
             entity_id: entity_id.to_string(),
             state: wire.state,
-            attributes: wire.attributes,
+            attributes: AttributeSet::for_entity(entity_id, wire.attributes),
             last_changed: wire.last_changed,
             last_updated: wire.last_updated.unwrap_or(wire.last_changed),
             last_reported: None,
@@ -65,7 +97,7 @@ struct CompressedStateWire {
     #[serde(rename = "s")]
     state: String,
     #[serde(rename = "a", default)]
-    attributes: AttributeSet,
+    attributes: Value,
     #[serde(rename = "c", default)]
     context: Value,
     #[serde(rename = "lc", deserialize_with = "de_helpers::deserialize_f64_unix_timestamp")]
@@ -80,7 +112,8 @@ struct CompressedStateWire {
 pub struct HistoricalState {
     pub entity_id: String,
     pub state: String,
-    pub attributes: HistoricalAttributeSet,
+    /// Typed by the entity's domain, see [`AttributeSet`].
+    pub attributes: AttributeSet,
     pub last_changed: DateTime<Utc>,
     pub last_updated: DateTime<Utc>,
 }
@@ -91,7 +124,7 @@ pub(crate) struct HistoricalStateWire {
     #[serde(rename = "s")]
     pub state: String,
     #[serde(rename = "a", default)]
-    pub attributes: HistoricalAttributeSet,
+    pub attributes: Value,
     #[serde(rename = "lu")]
     #[serde(deserialize_with = "de_helpers::deserialize_f64_unix_timestamp")]
     pub last_updated: DateTime<Utc>,
@@ -105,7 +138,7 @@ impl HistoricalStateWire {
         HistoricalState {
             entity_id: entity_id.to_string(),
             state: self.state,
-            attributes: self.attributes,
+            attributes: AttributeSet::for_entity(entity_id, self.attributes),
             last_changed: self.last_changed.unwrap_or(self.last_updated),
             last_updated: self.last_updated,
         }
@@ -114,44 +147,10 @@ impl HistoricalStateWire {
 
 impl From<HistoricalState> for State {
     fn from(historical: HistoricalState) -> Self {
-        let attributes = match historical.attributes {
-            HistoricalAttributeSet::Climate(hist_attrs) => {
-                let mut rest_map = HashMap::new();
-                if let Some(friendly_name) = hist_attrs.friendly_name {
-                    rest_map.insert(
-                        "friendly_name".to_string(),
-                        Value::String(friendly_name),
-                    );
-                }
-                rest_map.extend(hist_attrs.rest);
-
-                AttributeSet::Climate(ClimateAttributes {
-                    hvac_modes: None,
-                    min_temp: None,
-                    max_temp: None,
-                    current_temperature: hist_attrs.current_temperature,
-                    temperature: hist_attrs.temperature,
-                    fan_modes: None,
-                    swing_modes: None,
-                    preset_modes: None,
-                    rest: rest_map,
-                })
-            }
-            HistoricalAttributeSet::Generic(hist_attrs) => {
-                AttributeSet::Generic(GenericAttributes {
-                    friendly_name: hist_attrs.friendly_name,
-                    unit_of_measurement: hist_attrs.unit_of_measurement,
-                    device_class: hist_attrs.device_class,
-                    state_class: hist_attrs.state_class,
-                    rest: hist_attrs.rest,
-                })
-            }
-        };
-
         Self {
             entity_id: historical.entity_id,
             state: historical.state,
-            attributes,
+            attributes: historical.attributes,
             last_changed: historical.last_changed,
             last_updated: historical.last_updated,
             last_reported: None,
@@ -175,6 +174,15 @@ pub(crate) struct StateChangedData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn last_seen_prefers_last_reported() {
+        let mut s = State::from_compressed("sensor.t", &json!({"s": "1", "a": {}, "c": "x", "lc": 100.0})).unwrap();
+        assert_eq!(s.last_seen(), s.last_updated);
+        let reported = s.last_updated + chrono::TimeDelta::seconds(30);
+        s.last_reported = Some(reported);
+        assert_eq!(s.last_seen(), reported);
+    }
 
     // Shape captured from a live `subscribe_entities` event (names anonymised).
     #[test]
@@ -201,6 +209,27 @@ mod tests {
             serde_json::from_value(json!({"s": "unavailable", "a": {"friendly_name": "T"}, "lu": 1793187541.0})).unwrap();
         let h = w.into_state("climate.t");
         assert_eq!(h.last_changed, h.last_updated);
+    }
+
+    #[test]
+    fn attributes_are_typed_by_domain() {
+        let attrs = json!({"current_temperature": 48, "temperature": 55, "friendly_name": "Boiler"});
+        let full = |entity_id: &str| -> State {
+            serde_json::from_value(json!({
+                "entity_id": entity_id, "state": "eco", "attributes": attrs,
+                "last_changed": "2026-10-28T14:45:09.185007+00:00",
+                "last_updated": "2026-10-28T14:45:09.185007+00:00"
+            }))
+            .unwrap()
+        };
+        // A water heater has climate-like keys but is not a climate entity.
+        assert!(matches!(full("water_heater.boiler").attributes, AttributeSet::Generic(_)));
+        assert!(matches!(full("climate.boiler").attributes, AttributeSet::Climate(_)));
+
+        let compressed = State::from_compressed("water_heater.boiler", &json!({"s": "eco", "a": attrs, "lc": 1.0})).unwrap();
+        assert!(matches!(compressed.attributes, AttributeSet::Generic(_)));
+        let w: HistoricalStateWire = serde_json::from_value(json!({"s": "heat", "a": attrs, "lu": 1.0})).unwrap();
+        assert!(matches!(w.into_state("climate.t").attributes, AttributeSet::Climate(_)));
     }
 
     #[test]

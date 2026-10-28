@@ -26,6 +26,7 @@ pub struct ClientConfig {
     pub(crate) reconnect_max_delay: Duration,
     pub(crate) subscription_queue_size: usize,
     pub(crate) slow_callback_warning: Duration,
+    pub(crate) max_message_size: usize,
 }
 
 impl ClientConfig {
@@ -45,6 +46,7 @@ impl ClientConfig {
             reconnect_max_delay: Duration::from_secs(60),
             subscription_queue_size: 1024,
             slow_callback_warning: Duration::from_secs(5),
+            max_message_size: 64 << 20,
         }
     }
 
@@ -99,6 +101,15 @@ impl ClientConfig {
         self.slow_callback_warning = threshold.min(MAX_DURATION);
         self
     }
+
+    /// Largest message accepted from Home Assistant, in bytes. Default: 64 MiB.
+    ///
+    /// Home Assistant sends each answer as a single WebSocket frame, so this also bounds
+    /// frames. Raise it if `get_states` fails on a very large installation.
+    pub fn max_message_size(mut self, bytes: usize) -> Self {
+        self.max_message_size = bytes.max(1024);
+        self
+    }
 }
 
 impl fmt::Debug for ClientConfig {
@@ -114,6 +125,7 @@ impl fmt::Debug for ClientConfig {
             .field("reconnect_max_delay", &self.reconnect_max_delay)
             .field("subscription_queue_size", &self.subscription_queue_size)
             .field("slow_callback_warning", &self.slow_callback_warning)
+            .field("max_message_size", &self.max_message_size)
             .finish()
     }
 }

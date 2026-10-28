@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.3.0
+
+Fixes from a code review of the runner and the typed model, and removal of legacy API. Breaking: the callback result type, the positional trigger helpers, the attribute types (see the migration table).
+
+### Fixed
+
+*   A subscription whose caller stopped waiting (its own timeout, a dropped future, or the client-side timeout firing first, e.g. `subscribe_entity` with its two round trips and a short `request_timeout`) stayed active forever: its callback kept running and it could never be unsubscribed. It is now removed and unsubscribed in Home Assistant, and its callback never runs.
+*   The set of ignored server-side subscription ids grew with every `get_state`, `subscribe_entity` and `unsubscribe` until the next reconnect (a slow memory leak in long-running processes). Ids are now forgotten once Home Assistant confirms the unsubscribe.
+*   `HaState::Number` lost the original string (`"21.0"` became `"21"`), so a trigger built from a parsed state never fired. A state is now `Number` only if it prints back unchanged; otherwise it stays `String`. `"nan"`/`"inf"` are no longer numbers.
+*   `set_number`, `set_text` and `select_option` called the `input_*` service even for `number.*`, `text.*` and `select.*` entities. The domain now comes from the entity id; a bare object id still means `input_*`.
+*   After a reconnect, live events of `subscribe_entity` could arrive before `Restored`, and a change could be missed (`B→C` delivered without `A→B`). Live events are now held until the state re-read: the callback gets one `StateChanged` from the last known state, then `Restored`, then any newer events. The same update seen by both the re-read and the trigger is delivered only once.
+*   A subscribe that was in flight when the connection dropped failed with `ConnectionLost`, while one made a moment later (offline) succeeded. Both now succeed: the subscription starts as `Interrupted` and is restored on reconnect.
+*   A steady stream of frames could starve commands and the housekeeping tick (timeouts, ping) in the connection loop; the loop no longer prefers incoming frames.
+*   Attribute typing used a key heuristic: a `water_heater` with `current_temperature` got `ClimateAttributes`. In `State` and `HistoricalState` the entity's domain now decides (`Climate` only for `climate.*`).
+*   `Domain::Other("light".into())` was not equal to `Domain::Light` (same for every `string_enum!` type). Equality and hashing now use the wire string.
+*   `stop()` during the re-subscription of many subscriptions waited until all were sent.
+*   An event that Home Assistant sent before the subscription's `result` was taken for an unknown subscription, which was then cancelled. It is now delivered after the confirmation.
+*   Messages larger than 16 MiB (e.g. `get_states` on very large installations) were rejected by the WebSocket frame limit.
+
+### Added
+
+*   `subscribe_entity_with(entity_id, EntityChanges, cb)`: `EntityChanges::State` delivers only changes of the state (attribute-only updates are filtered in Home Assistant with `to: null`, and on the client, including queued changes that cancel out); `EntityChanges::Any` is the `subscribe_entity` behaviour. A sensor re-reporting an unchanged value is not observable over the WebSocket API (Home Assistant refuses `state_reported` subscriptions without a server-side filter), so neither mode sees it.
+*   `subscribe_template(template, cb)`: a `render_template` subscription, `Event::TemplateRendered { result }` / `Event::TemplateError { message, level }`.
+*   `watch_silence(entity_id, max_silence, cb)`: `Event::Silence { entity_id, silent }` when an entity stops reporting (unchanged reports count, via `last_reported`) and when it resumes. Evaluated in Home Assistant every minute, so no `get_states` polling.
+*   `State::last_seen()`: `last_reported`, or `last_updated` where it is missing.
+*   `SubscriptionStatus::Unsubscribed`, delivered after `unsubscribe()` as the last event.
+*   `SubscriptionGuard`: `subscription.guard(&client)` unsubscribes on drop; `unsubscribe()` and `into_inner()`.
+*   Trigger builders: `StateTrigger::new(id).to(..).from(..).for_duration(..).attribute(..)`, `NumericStateTrigger::new(id).above(..).below(..)`, `SunTrigger::new(event).offset(..)`, `TimeTrigger::new(at)`, `TimePatternTrigger::new().minutes("/5")`, `TemplateTrigger::new(t)`, `ZoneTrigger::new(..)`; `subscribe_trigger` accepts any of them (`impl Into<Trigger>`).
+*   `ClientConfig::max_message_size` (default 64 MiB, applies to frames too).
+*   `set_temperature_range(id, low, high)` for `heat_cool` mode.
+*   Callback errors are logged with their source chain.
+
+### Changed
+
+*   **Home Assistant 2024.10 or newer is required.** Triggers are sent with the `trigger` key instead of the deprecated `platform`. `connect` logs a warning for older versions.
+*   Callbacks return `ha_core_client::CallbackResult` = `Result<(), BoxError>` (`Box<dyn std::error::Error + Send + Sync>`) instead of `anyhow::Result<()>`. The library no longer depends on `anyhow`.
+*   `stop()` also waits (up to 5s) for callbacks to handle the events already queued, ending with `Closed`. Called from inside a callback it does not wait for callbacks.
+*   Removed the positional trigger helpers (`subscribe_state_trigger`, `subscribe_numeric_state_trigger`, `subscribe_sun_trigger`, `subscribe_time_trigger`, `subscribe_time_pattern_trigger`, `subscribe_template_trigger`, `subscribe_zone_trigger`): use `subscribe_trigger` with a builder.
+*   `ClimateAttributes`: `friendly_name` is a field (it was only in `rest`), new `hvac_action` (`HvacAction`), `current_humidity`, `target_temp_low`/`high`/`step`, `fan_mode`, `preset_mode`, `swing_mode`; `rest` is a `serde_json::Map`. An unknown value in `hvac_modes` is skipped instead of turning the whole set into `Generic`. `AttributeSet::Climate` holds a `Box`. `AttributeSet::get(key)` reads any attribute as JSON.
+*   History entries use `AttributeSet` too (they carry the same attributes as live states): `HistoricalAttributeSet`, `HistoricalClimateAttributes` and `HistoricalGenericAttributes` are removed.
+*   `AttributeSet`, `ClimateAttributes` and `GenericAttributes` are `#[non_exhaustive]`, so attributes can be added later without a breaking release.
+*   `unsubscribe()` of a request in flight when the connection drops succeeds (the server-side subscription ended with the connection) instead of failing with `ConnectionLost`.
+
+### Migration from 0.2
+
+| 0.2 | 0.3 |
+|---|---|
+| callback `-> anyhow::Result<()>` (named `async fn`) | `-> ha_core_client::CallbackResult`. Closures ending in `Ok(())` compile unchanged; `?` works on any `std::error::Error` and on `anyhow::Error`. |
+| `anyhow::bail!(..)` / `Err(anyhow!(..))` in a callback | `return Err("..".into())`, or `Err(anyhow!(..))?` |
+| `HaState::Number(21.0)` from `"21.0"` | `HaState::String("21.0")`; parse `state.state` as `f64` for numeric comparisons |
+| `match` on `SubscriptionStatus` | handle (or wildcard) the new `Unsubscribed` |
+| `AttributeSet::Climate` for non-`climate` entities with `current_temperature` | `AttributeSet::Generic` |
+| Home Assistant older than 2024.10 | not supported (triggers use the `trigger` key) |
+| `subscribe_trigger_raw(json!({"platform": ..}))` | still works; prefer `"trigger"` |
+| `subscribe_state_trigger(id, to, from, for, cb)` | `subscribe_trigger(StateTrigger::new(id).to(..).from(..).for_duration(..), cb)` |
+| `subscribe_numeric_state_trigger(id, above, below, for, cb)` | `subscribe_trigger(NumericStateTrigger::new(id).above(..).below(..).for_duration(..), cb)` |
+| `subscribe_sun_trigger(event, offset, cb)` | `subscribe_trigger(SunTrigger::new(event).offset(..), cb)` |
+| `subscribe_time_trigger(at, cb)` | `subscribe_trigger(TimeTrigger::new(at), cb)` |
+| `subscribe_time_pattern_trigger(h, m, s, cb)` | `subscribe_trigger(TimePatternTrigger::new().hours(..).minutes(..).seconds(..), cb)` |
+| `subscribe_template_trigger(t, for, cb)` | `subscribe_trigger(TemplateTrigger::new(t).for_duration(..), cb)` |
+| `subscribe_zone_trigger(id, zone, event, cb)` | `subscribe_trigger(ZoneTrigger::new(id, zone, event), cb)` |
+| `climate.rest.get("friendly_name")` | `climate.friendly_name` (or `attributes.friendly_name()`) |
+| `ClimateAttributes.rest: HashMap<String, Value>` | `serde_json::Map<String, Value>` |
+| `AttributeSet::Climate(c)` holds `ClimateAttributes` | holds `Box<ClimateAttributes>` (field access is unchanged) |
+| `HistoricalState.attributes: HistoricalAttributeSet` | `AttributeSet` |
+| building `ClimateAttributes { .. }` / `GenericAttributes { .. }` literals | not possible (`#[non_exhaustive]`): deserialize, or use `Default` and set fields |
+| `match` on `AttributeSet` | add a wildcard arm |
+
 ## 0.2.0
 
 A production-hardening release. The public API changed; see the migration guide below.

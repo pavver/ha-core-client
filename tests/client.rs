@@ -5,7 +5,8 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use ha_core_client::events::Event;
 use ha_core_client::state::{Domain, Service};
-use ha_core_client::{ClientConfig, ConnectionState, Error, HAClient, SubscriptionStatus};
+use ha_core_client::triggers::{TemplateTrigger, TimePatternTrigger};
+use ha_core_client::{CallbackResult, ClientConfig, ConnectionState, EntityChanges, Error, HAClient, SubscriptionStatus};
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -144,7 +145,7 @@ fn describe(event: &Event) -> String {
 
 /// A callback forwarding `describe(event)` to a channel.
 fn collector() -> (
-    impl Fn(HAClient, Event) -> std::future::Ready<anyhow::Result<()>> + Send + Sync + 'static,
+    impl Fn(HAClient, Event) -> std::future::Ready<CallbackResult> + Send + Sync + 'static,
     mpsc::UnboundedReceiver<String>,
 ) {
     let (tx, rx) = mpsc::unbounded_channel();
@@ -186,7 +187,7 @@ async fn subscribe_collecting(client: &HAClient, conn: &mut Conn, entity_id: &st
         tokio::spawn(async move { client.subscribe_entity(&entity_id, callback).await })
     };
     let msg = conn.recv_type("subscribe_trigger").await;
-    assert_eq!(msg["trigger"], json!({"platform": "state", "entity_id": entity_id}));
+    assert_eq!(msg["trigger"], json!({"trigger": "state", "entity_id": entity_id}));
     conn.ok(&msg["id"], Value::Null).await;
     // `subscribe_entity` completes only once the entity is known to exist.
     answer_state_read(conn, entity_id, "1", 100.0).await;
@@ -199,7 +200,7 @@ async fn subscribe_trigger_collecting(client: &HAClient, conn: &mut Conn) -> mps
     let (callback, rx) = collector();
     let sub = {
         let client = client.clone();
-        tokio::spawn(async move { client.subscribe_time_pattern_trigger(None, None, Some("/5".into()), callback).await })
+        tokio::spawn(async move { client.subscribe_trigger(TimePatternTrigger::new().seconds("/5"), callback).await })
     };
     let msg = conn.recv_type("subscribe_trigger").await;
     conn.ok(&msg["id"], Value::Null).await;
@@ -250,11 +251,11 @@ async fn trigger_events_are_delivered_in_order() {
         let client = client.clone();
         tokio::spawn(async move {
             client
-                .subscribe_time_pattern_trigger(None, None, Some("/5".into()), move |_, event| {
+                .subscribe_trigger(TimePatternTrigger::new().seconds("/5"), move |_, event| {
                     let tx = tx.clone();
                     async move {
                         let Event::TriggerFired(t) = event else {
-                            anyhow::bail!("unexpected event {event:?}");
+                            return Err(format!("unexpected event {event:?}").into());
                         };
                         let n = t.trigger["n"].as_u64().unwrap();
                         tokio::time::sleep(Duration::from_millis(30 / n)).await;
@@ -285,11 +286,11 @@ async fn rejected_subscription_returns_ha_error() {
     let sub = {
         let client = client.clone();
         tokio::spawn(async move {
-            client.subscribe_template_trigger("{{ invalid", None, |_, _| async { Ok(()) }).await
+            client.subscribe_trigger(TemplateTrigger::new("{{ invalid"), |_, _| async { Ok(()) }).await
         })
     };
     let msg = conn.recv_type("subscribe_trigger").await;
-    assert_eq!(msg["trigger"]["platform"], "template");
+    assert_eq!(msg["trigger"]["trigger"], "template");
     conn.send(json!({"id": msg["id"], "type": "result", "success": false,
         "error": {"code": "invalid_format", "message": "invalid template"}}))
         .await;
@@ -410,7 +411,7 @@ async fn handler_can_unsubscribe_while_interrupted() {
         let client = client.clone();
         tokio::spawn(async move {
             client
-                .subscribe_time_pattern_trigger(None, None, Some("/5".into()), move |client, event| {
+                .subscribe_trigger(TimePatternTrigger::new().seconds("/5"), move |client, event| {
                     let tx = tx.clone();
                     async move {
                         if let Event::Status { subscription, status: SubscriptionStatus::Interrupted } = event {
@@ -509,6 +510,73 @@ async fn unanswered_request_times_out() {
     conn.recv_type("get_states").await;
     let result = tokio::time::timeout(WAIT, req).await.unwrap().unwrap();
     assert!(matches!(result, Err(Error::Timeout)), "{result:?}");
+}
+
+/// A `render_template` event as Home Assistant sends it (captured from 2026.9).
+fn rendered(result: Value) -> Value {
+    json!({"result": result, "listeners": {"all": false, "entities": ["sensor.outdoor"], "domains": [], "time": true}})
+}
+
+#[tokio::test]
+async fn template_render_before_the_ack_is_delivered() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let (callback, mut rx) = collector();
+    let sub = tokio::spawn({
+        let client = client.clone();
+        async move { client.subscribe_template("{{ 1 + 1 }}", callback).await }
+    });
+    let msg = conn.recv_type("render_template").await;
+    assert_eq!(msg["template"], "{{ 1 + 1 }}");
+    assert_eq!(msg["report_errors"], true);
+    // Home Assistant may send the first render ahead of the result.
+    conn.event(&msg["id"], rendered(json!(2))).await;
+    conn.ok(&msg["id"], Value::Null).await;
+    sub.await.unwrap().unwrap();
+    assert_eq!(recv_within(&mut rx).await, "TemplateRendered { result: Number(2) }");
+    // It was not mistaken for an unknown subscription and cancelled.
+    round_trip(&client, &mut conn).await;
+
+    conn.event(&msg["id"], json!({"error": "ZeroDivisionError: division by zero", "level": "ERROR"})).await;
+    assert_eq!(
+        recv_within(&mut rx).await,
+        r#"TemplateError { message: "ZeroDivisionError: division by zero", level: "ERROR" }"#
+    );
+
+    // After a reconnect the current result follows `Restored`.
+    let mut conn = reconnect(&ha, &client, conn).await;
+    let msg = conn.recv_type("render_template").await;
+    conn.event(&msg["id"], rendered(json!(2))).await;
+    conn.ok(&msg["id"], Value::Null).await;
+    assert_eq!(recv_within(&mut rx).await, "Interrupted");
+    assert_eq!(recv_within(&mut rx).await, "Restored");
+    assert_eq!(recv_within(&mut rx).await, "TemplateRendered { result: Number(2) }");
+}
+
+#[tokio::test]
+async fn watch_silence_reports_silent_and_back() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let invalid = client.watch_silence("sensor.x }}{{ 1", Duration::from_secs(60), collector().0).await;
+    assert!(matches!(invalid, Err(Error::InvalidInput(_))), "{invalid:?}");
+
+    let (callback, mut rx) = collector();
+    let sub = tokio::spawn({
+        let client = client.clone();
+        async move { client.watch_silence("sensor.outdoor", Duration::from_secs(1800), callback).await }
+    });
+    let msg = conn.recv_type("render_template").await;
+    let template = msg["template"].as_str().unwrap();
+    assert!(template.contains("states.sensor.outdoor"), "{template}");
+    assert!(template.contains("last_reported).total_seconds() > 1800"), "{template}");
+    conn.ok(&msg["id"], Value::Null).await;
+    conn.event(&msg["id"], rendered(json!(false))).await;
+    sub.await.unwrap().unwrap();
+    conn.event(&msg["id"], rendered(json!(true))).await;
+    conn.event(&msg["id"], rendered(json!(false))).await;
+    for silent in [false, true, false] {
+        assert_eq!(recv_within(&mut rx).await, format!(r#"Silence {{ entity_id: "sensor.outdoor", silent: {silent} }}"#));
+    }
 }
 
 #[tokio::test]
@@ -667,7 +735,7 @@ async fn late_events_of_expired_get_state_are_unsubscribed() {
     assert!(req.await.unwrap().unwrap().is_empty());
 }
 
-type BoxedFuture = std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>;
+type BoxedFuture = std::pin::Pin<Box<dyn std::future::Future<Output = CallbackResult> + Send>>;
 
 /// A callback that records each event as soon as it starts, then waits for a permit,
 /// so the test controls when the subscription catches up.
@@ -731,7 +799,7 @@ async fn slow_trigger_callback_drops_oldest_events_but_not_statuses() {
     let (callback, mut rx, gate) = gated_collector();
     let sub = tokio::spawn({
         let client = client.clone();
-        async move { client.subscribe_time_pattern_trigger(None, None, Some("/5".into()), callback).await }
+        async move { client.subscribe_trigger(TimePatternTrigger::new().seconds("/5"), callback).await }
     });
     let msg = conn.recv_type("subscribe_trigger").await;
     conn.ok(&msg["id"], Value::Null).await;
@@ -786,7 +854,7 @@ mod slow_callback_log {
         let (callback, mut rx, gate) = gated_collector();
         let sub = tokio::spawn({
             let client = client.clone();
-            async move { client.subscribe_time_pattern_trigger(None, None, Some("/5".into()), callback).await }
+            async move { client.subscribe_trigger(TimePatternTrigger::new().seconds("/5"), callback).await }
         });
         let msg = conn.recv_type("subscribe_trigger").await;
         conn.ok(&msg["id"], Value::Null).await;
@@ -841,7 +909,7 @@ async fn subscribing_while_disconnected_waits_for_the_connection() {
     wait_state(&client, |s| matches!(s, ConnectionState::Reconnecting { .. })).await;
 
     let (callback, mut rx) = collector();
-    let sub = client.subscribe_time_pattern_trigger(None, None, Some("/5".into()), callback).await;
+    let sub = client.subscribe_trigger(TimePatternTrigger::new().seconds("/5"), callback).await;
     assert!(sub.is_ok(), "{sub:?}");
     assert_eq!(recv_within(&mut rx).await, "Interrupted");
     // Requests still fail fast.
@@ -849,7 +917,7 @@ async fn subscribing_while_disconnected_waits_for_the_connection() {
 
     let mut conn = ha.accept().await;
     let msg = conn.recv_type("subscribe_trigger").await;
-    assert_eq!(msg["trigger"]["platform"], "time_pattern");
+    assert_eq!(msg["trigger"]["trigger"], "time_pattern");
     conn.ok(&msg["id"], Value::Null).await;
     assert_eq!(recv_within(&mut rx).await, "Restored");
     conn.event(&msg["id"], time_pattern_event(1)).await;
@@ -867,4 +935,263 @@ async fn stop_fails_in_flight_requests_with_stopped() {
     conn.recv_type("get_states").await;
     client.stop().await;
     assert!(matches!(req.await.unwrap(), Err(Error::Stopped)));
+}
+
+/// `last_updated` of [`state`], as `subscribe_entities` sends it.
+fn state_timestamp() -> f64 {
+    let t = chrono::DateTime::parse_from_rfc3339("2026-10-28T14:45:09.185007+00:00").unwrap();
+    t.timestamp_micros() as f64 / 1e6
+}
+
+#[tokio::test]
+async fn abandoned_subscribe_is_cancelled() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let (callback, mut rx) = collector();
+    let sub = {
+        let client = client.clone();
+        tokio::spawn(async move { client.subscribe_trigger(TimePatternTrigger::new().seconds("/5"), callback).await })
+    };
+    let msg = conn.recv_type("subscribe_trigger").await;
+    // The caller gives up (e.g. its own timeout) before Home Assistant answers.
+    sub.abort();
+    assert!(sub.await.unwrap_err().is_cancelled());
+
+    conn.ok(&msg["id"], Value::Null).await;
+    let unsub = conn.recv_type("unsubscribe_events").await;
+    assert_eq!(unsub["subscription"], msg["id"]);
+    conn.ok(&unsub["id"], Value::Null).await;
+    // The callback never runs and nothing is restored after a reconnect.
+    conn.event(&msg["id"], time_pattern_event(1)).await;
+    let mut conn = reconnect(&ha, &client, conn).await;
+    round_trip(&client, &mut conn).await;
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn orphan_ids_are_forgotten_once_unsubscribed() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let req = tokio::spawn({
+        let client = client.clone();
+        async move { client.get_state("switch.pump").await }
+    });
+    let msg = conn.recv_type("subscribe_entities").await;
+    answer_read(&mut conn, &msg, "switch.pump", "on", 100.0).await;
+    req.await.unwrap().unwrap();
+    let unsub = conn.recv_type("unsubscribe_events").await;
+    // An event still in flight is ignored...
+    conn.event(&msg["id"], json!({"c": {}})).await;
+    conn.ok(&unsub["id"], Value::Null).await;
+    round_trip(&client, &mut conn).await;
+    // ...but once Home Assistant confirmed, the id is no longer tracked: an (impossible)
+    // later event is treated as unknown and cancelled again.
+    conn.event(&msg["id"], json!({"c": {}})).await;
+    let again = conn.recv_type("unsubscribe_events").await;
+    assert_eq!(again["subscription"], msg["id"]);
+}
+
+#[tokio::test]
+async fn events_during_restore_wait_for_the_state_read() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let (mut rx, _) = subscribe_collecting(&client, &mut conn, "sensor.a").await;
+    conn.ws.close(None).await.unwrap();
+    assert_eq!(recv_within(&mut rx).await, "Interrupted");
+
+    let mut conn = ha.accept().await;
+    let sub = conn.recv_type("subscribe_trigger").await;
+    conn.ok(&sub["id"], Value::Null).await;
+    let read = conn.recv_type("subscribe_entities").await;
+    // A live change arrives before the re-read: it changed 1 -> 2 while disconnected, then 2 -> 3.
+    conn.event(&sub["id"], entity_trigger_event("sensor.a", "2", "3")).await;
+    answer_read(&mut conn, &read, "sensor.a", "3", state_timestamp()).await;
+    // One change spanning what was missed, then `Restored`; the held 2 -> 3 is covered by it.
+    assert_eq!(recv_within(&mut rx).await, "1->3");
+    assert_eq!(recv_within(&mut rx).await, "Restored");
+
+    // The same update again (re-read and trigger raced) is not repeated.
+    conn.event(&sub["id"], entity_trigger_event("sensor.a", "2", "3")).await;
+    let mut later = entity_trigger_event("sensor.a", "3", "4");
+    later["variables"]["trigger"]["to_state"]["last_updated"] = "2026-10-28T14:46:00+00:00".into();
+    conn.event(&sub["id"], later).await;
+    assert_eq!(recv_within(&mut rx).await, "3->4");
+}
+
+#[tokio::test]
+async fn subscribe_in_flight_during_disconnect_is_kept() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let (callback, mut rx) = collector();
+    let sub = {
+        let client = client.clone();
+        tokio::spawn(async move { client.subscribe_trigger(TimePatternTrigger::new().seconds("/5"), callback).await })
+    };
+    conn.recv_type("subscribe_trigger").await;
+    conn.ws.close(None).await.unwrap();
+    // Same as subscribing while disconnected.
+    assert!(sub.await.unwrap().is_ok());
+    assert_eq!(recv_within(&mut rx).await, "Interrupted");
+
+    let mut conn = ha.accept().await;
+    let msg = conn.recv_type("subscribe_trigger").await;
+    conn.ok(&msg["id"], Value::Null).await;
+    assert_eq!(recv_within(&mut rx).await, "Restored");
+}
+
+#[tokio::test]
+async fn unsubscribe_is_reported_to_the_callback() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let (callback, mut rx) = collector();
+    let sub = tokio::spawn({
+        let client = client.clone();
+        async move { client.subscribe_trigger(TimePatternTrigger::new().seconds("/5"), callback).await }
+    });
+    let msg = conn.recv_type("subscribe_trigger").await;
+    conn.ok(&msg["id"], Value::Null).await;
+    let sub = sub.await.unwrap().unwrap();
+
+    let unsubscribe = tokio::spawn({
+        let client = client.clone();
+        async move { client.unsubscribe(sub).await }
+    });
+    let unsub = conn.recv_type("unsubscribe_events").await;
+    assert_eq!(unsub["subscription"], msg["id"]);
+    conn.ok(&unsub["id"], Value::Null).await;
+    unsubscribe.await.unwrap().unwrap();
+    assert_eq!(recv_within(&mut rx).await, "Unsubscribed");
+}
+
+#[tokio::test]
+async fn dropping_a_guard_unsubscribes() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let sub = tokio::spawn({
+        let client = client.clone();
+        async move { client.subscribe_trigger(TimePatternTrigger::new().seconds("/5"), |_, _| async { Ok(()) }).await }
+    });
+    let msg = conn.recv_type("subscribe_trigger").await;
+    conn.ok(&msg["id"], Value::Null).await;
+    let guard = sub.await.unwrap().unwrap().guard(&client);
+    drop(guard);
+    let unsub = conn.recv_type("unsubscribe_events").await;
+    assert_eq!(unsub["subscription"], msg["id"]);
+}
+
+#[tokio::test]
+async fn stop_waits_for_queued_callbacks() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let sub = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .subscribe_trigger(TimePatternTrigger::new().seconds("/5"), move |_, event| {
+                    let tx = tx.clone();
+                    async move {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        tx.send(describe(&event))?;
+                        Ok(())
+                    }
+                })
+                .await
+        }
+    });
+    let msg = conn.recv_type("subscribe_trigger").await;
+    conn.ok(&msg["id"], Value::Null).await;
+    sub.await.unwrap().unwrap();
+    conn.event(&msg["id"], time_pattern_event(1)).await;
+    round_trip(&client, &mut conn).await;
+
+    tokio::time::timeout(WAIT, client.stop()).await.unwrap();
+    assert_eq!(rx.try_recv().unwrap(), "trigger 1");
+    assert_eq!(rx.try_recv().unwrap(), "Closed");
+}
+
+#[tokio::test]
+async fn stop_from_a_callback_does_not_wait_for_itself() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let sub = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .subscribe_trigger(TimePatternTrigger::new().seconds("/5"), move |client, event| {
+                    let tx = tx.clone();
+                    async move {
+                        if let Event::TriggerFired(_) = event {
+                            client.stop().await;
+                            tx.send(())?;
+                        }
+                        Ok(())
+                    }
+                })
+                .await
+        }
+    });
+    let msg = conn.recv_type("subscribe_trigger").await;
+    conn.ok(&msg["id"], Value::Null).await;
+    sub.await.unwrap().unwrap();
+    conn.event(&msg["id"], time_pattern_event(1)).await;
+    // Well within the 5s `stop()` would otherwise wait.
+    tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn callbacks_accept_std_and_anyhow_errors() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let sub = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .subscribe_trigger(TimePatternTrigger::new().seconds("/5"), |client, _| async move {
+                    use anyhow::Context;
+                    client.turn_on("light.a").await?;
+                    let n: u32 = "x".parse().context("parsing")?;
+                    let _: u32 = "y".parse()?;
+                    let _ = n;
+                    Ok(())
+                })
+                .await
+        }
+    });
+    let msg = conn.recv_type("subscribe_trigger").await;
+    conn.ok(&msg["id"], Value::Null).await;
+    sub.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn state_only_entity_subscription_skips_attribute_updates() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let (callback, mut rx) = collector();
+    let sub = tokio::spawn({
+        let client = client.clone();
+        async move { client.subscribe_entity_with("sensor.a", EntityChanges::State, callback).await }
+    });
+    let msg = conn.recv_type("subscribe_trigger").await;
+    // Home Assistant filters attribute-only changes itself...
+    assert_eq!(msg["trigger"], json!({"trigger": "state", "entity_id": "sensor.a", "to": null}));
+    conn.ok(&msg["id"], Value::Null).await;
+    answer_state_read(&mut conn, "sensor.a", "1", 100.0).await;
+    sub.await.unwrap().unwrap();
+
+    // ...and the client does too, for whatever still keeps the state.
+    conn.event(&msg["id"], entity_trigger_event("sensor.a", "1", "1")).await;
+    conn.event(&msg["id"], entity_trigger_event("sensor.a", "1", "2")).await;
+    assert_eq!(recv_within(&mut rx).await, "1->2");
+
+    // Only an attribute changed while disconnected: no `StateChanged` before `Restored`.
+    conn.ws.close(None).await.unwrap();
+    assert_eq!(recv_within(&mut rx).await, "Interrupted");
+    let mut conn = ha.accept().await;
+    let sub = conn.recv_type("subscribe_trigger").await;
+    conn.ok(&sub["id"], Value::Null).await;
+    let read = conn.recv_type("subscribe_entities").await;
+    answer_read(&mut conn, &read, "sensor.a", "2", 500.0).await;
+    assert_eq!(recv_within(&mut rx).await, "Restored");
 }

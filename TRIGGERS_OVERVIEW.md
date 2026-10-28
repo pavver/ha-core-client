@@ -2,7 +2,7 @@
 
 This document provides a comprehensive overview of all available triggers in Home Assistant automations. This list can be used as a reference for implementing type-safe trigger subscription helpers in the client.
 
-> **Using these platforms:** the typed helpers cover `state`, `numeric_state`, `sun`, `time`, `time_pattern`, `template` and `zone`. Every platform below can be used through `HAClient::subscribe_trigger_raw`, e.g. `subscribe_trigger_raw(json!({"platform": "event", "event_type": "my_event"}), cb)`. Durations and offsets use the `HH:MM:SS` format.
+> **Using these platforms:** the typed helpers cover `state`, `numeric_state`, `sun`, `time`, `time_pattern`, `template` and `zone`. Every platform below can be used through `HAClient::subscribe_trigger_raw`, e.g. `subscribe_trigger_raw(json!({"trigger": "event", "event_type": "my_event"}), cb)`. The platform goes in the `trigger` key (Home Assistant 2024.10+; older releases used `platform`, which current ones still accept). Durations and offsets use the `HH:MM:SS` format.
 
 > **Note on WebSocket API Compatibility:**
 > According to the official Home Assistant developer documentation, the `subscribe_trigger` command in the WebSocket API supports the same trigger platforms and syntax as defined here for automations. This list is therefore considered accurate and complete for the purpose of creating WebSocket-based trigger subscriptions.
@@ -15,7 +15,7 @@ This document provides a comprehensive overview of all available triggers in Hom
 
 Fires when a specific event is fired on the event bus.
 
-**Platform:** `event`
+**Trigger:** `event`
 
 ### Parameters
 
@@ -31,7 +31,7 @@ Fires when a specific event is fired on the event bus.
 
 Fires on Home Assistant start or shutdown events.
 
-**Platform:** `homeassistant`
+**Trigger:** `homeassistant`
 
 ### Parameters
 
@@ -49,7 +49,7 @@ Fires on Home Assistant start or shutdown events.
 
 Fires when an entity is in proximity to a location.
 
-**Platform:** `geo_location`
+**Trigger:** `geo_location`
 
 ### Parameters
 
@@ -65,7 +65,7 @@ Fires when an entity is in proximity to a location.
 
 Fires when a message is received on an MQTT topic.
 
-**Platform:** `mqtt`
+**Trigger:** `mqtt`
 
 ### Parameters
 
@@ -83,7 +83,7 @@ Fires when a message is received on an MQTT topic.
 
 Fires when a device-specific event occurs. This is highly dependent on the device and integration.
 
-**Platform:** `device`
+**Trigger:** `device`
 
 ### Parameters
 
@@ -102,7 +102,7 @@ Fires when a device-specific event occurs. This is highly dependent on the devic
 
 Fires when a Home Assistant tag is scanned.
 
-**Platform:** `tag`
+**Trigger:** `tag`
 
 ### Parameters
 
@@ -117,7 +117,7 @@ Fires when a Home Assistant tag is scanned.
 
 Fires when an HTTP request is made to a specific webhook endpoint.
 
-**Platform:** `webhook`
+**Trigger:** `webhook`
 
 ### Parameters
 
@@ -133,7 +133,7 @@ Fires when an HTTP request is made to a specific webhook endpoint.
 
 Fires based on an event in a calendar entity.
 
-**Platform:** `calendar`
+**Trigger:** `calendar`
 
 ### Parameters
 
@@ -149,7 +149,7 @@ Fires based on an event in a calendar entity.
 
 Fires when a persistent notification is updated.
 
-**Platform:** `persistent_notification`
+**Trigger:** `persistent_notification`
 
 ### Parameters
 
@@ -164,7 +164,7 @@ Fires when a persistent notification is updated.
 
 Fires when a command with a specific sentence is processed. Requires a conversation integration.
 
-**Platform:** `sentence`
+**Trigger:** `sentence`
 
 ### Parameters
 

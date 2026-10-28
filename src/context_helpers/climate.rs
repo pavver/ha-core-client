@@ -36,6 +36,18 @@ impl HAClient {
         .await
     }
 
+    /// Sets the target temperature range of a `climate` entity, for `heat_cool` mode.
+    pub async fn set_temperature_range(&self, entity_id: &str, low: f64, high: f64) -> Result<()> {
+        let service_data = json!({ "target_temp_low": low, "target_temp_high": high });
+        self.call_service(
+            Domain::Climate,
+            Service::SetTemperature,
+            Some(entity_id),
+            Some(service_data),
+        )
+        .await
+    }
+
     /// Sets the fan mode of a `climate` entity.
     pub async fn set_fan_mode(&self, entity_id: &str, fan_mode: FanMode) -> Result<()> {
         let service_data = json!({ "fan_mode": fan_mode.to_string() });

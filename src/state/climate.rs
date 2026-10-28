@@ -18,6 +18,20 @@ pub enum HvacMode {
 }
 
 string_enum! {
+    /// What a climate entity is currently doing (`hvac_action` attribute).
+    pub enum HvacAction {
+        Off => "off",
+        Heating => "heating",
+        Cooling => "cooling",
+        Drying => "drying",
+        Idle => "idle",
+        Fan => "fan",
+        Preheating => "preheating",
+        Defrosting => "defrosting",
+    }
+}
+
+string_enum! {
     /// Fan modes of a climate entity. Integrations often define their own
     /// (`quiet`, `turbo`, …), which end up in `Other`.
     pub enum FanMode {

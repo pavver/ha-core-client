@@ -10,9 +10,17 @@ use crate::events::{Event, State};
 use crate::protocol::Request;
 use crate::HAClient;
 
+/// The error type callbacks return. Any `std::error::Error + Send + Sync` (including
+/// [`Error`](crate::Error)) and `anyhow::Error` convert into it with `?`.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// What a subscription callback returns. Errors are logged, with their source chain.
+pub type CallbackResult = std::result::Result<(), BoxError>;
+
 /// A handle to an active subscription, used with [`HAClient::unsubscribe`].
 ///
 /// The id is assigned by the client and stays the same across reconnects.
+/// Dropping it does not unsubscribe; use [`guard`](Self::guard) for that.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Subscription {
     pub(crate) id: u64,
@@ -22,20 +30,73 @@ impl Subscription {
     pub fn id(&self) -> u64 {
         self.id
     }
+
+    /// Wraps the subscription in a guard that unsubscribes when dropped.
+    pub fn guard(self, client: &HAClient) -> SubscriptionGuard {
+        SubscriptionGuard { client: client.clone(), subscription: Some(self) }
+    }
 }
 
-pub(crate) type EventCallback = Arc<
-    dyn Fn(HAClient, Event) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>
-        + Send
-        + Sync,
->;
+/// Unsubscribes when dropped. Created by [`Subscription::guard`].
+///
+/// The guard holds an [`HAClient`] handle, so it keeps the client running.
+#[must_use = "dropping the guard unsubscribes immediately"]
+pub struct SubscriptionGuard {
+    client: HAClient,
+    subscription: Option<Subscription>,
+}
+
+impl SubscriptionGuard {
+    pub fn subscription(&self) -> &Subscription {
+        self.subscription.as_ref().expect("present until dropped")
+    }
+
+    /// Unsubscribes now and waits for Home Assistant to confirm.
+    pub async fn unsubscribe(mut self) -> Result<()> {
+        let subscription = self.subscription.take().expect("present until dropped");
+        self.client.unsubscribe(subscription).await
+    }
+
+    /// Releases the subscription without unsubscribing.
+    pub fn into_inner(mut self) -> Subscription {
+        self.subscription.take().expect("present until dropped")
+    }
+}
+
+impl Drop for SubscriptionGuard {
+    fn drop(&mut self) {
+        if let Some(subscription) = self.subscription.take() {
+            self.client.unsubscribe_detached(subscription);
+        }
+    }
+}
+
+pub(crate) type EventCallback =
+    Arc<dyn Fn(HAClient, Event) -> Pin<Box<dyn Future<Output = CallbackResult> + Send>> + Send + Sync>;
 
 pub(crate) fn boxed_callback<F, Fut>(callback: F) -> EventCallback
 where
     F: Fn(HAClient, Event) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+    Fut: Future<Output = CallbackResult> + Send + 'static,
 {
     Arc::new(move |client, event| Box::pin(callback(client, event)))
+}
+
+/// Which updates of an entity [`HAClient::subscribe_entity_with`] delivers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum EntityChanges {
+    /// Every update Home Assistant records: the state or any attribute changed.
+    /// `old_state.state` may equal `new_state.state`.
+    ///
+    /// A sensor reporting an unchanged value with unchanged attributes is not an update:
+    /// Home Assistant only refreshes `last_reported` and sends nothing to WebSocket clients;
+    /// use [`HAClient::watch_silence`] to detect a sensor that stopped reporting.
+    #[default]
+    Any,
+    /// Only changes of the state string (`on` → `off`, `21.5` → `22`); attribute-only
+    /// updates are skipped, also when queued changes cancel out (`A → B → A`).
+    State,
 }
 
 /// How the payloads of a subscription are turned into [`Event`]s.
@@ -45,9 +106,13 @@ pub(crate) enum SubKind {
     Events,
     /// `subscribe_trigger` with a `state` trigger, reported as `Event::StateChanged`.
     /// The entity's state is re-read after every reconnect.
-    EntityState { entity_id: String },
+    EntityState { entity_id: String, changes: EntityChanges },
     /// Any other `subscribe_trigger`, reported as `Event::TriggerFired`.
     Trigger,
+    /// `render_template`, reported as `Event::TemplateRendered`.
+    Template,
+    /// The `render_template` of `watch_silence`, reported as `Event::Silence`.
+    Silence { entity_id: String },
 }
 
 impl SubKind {
@@ -56,6 +121,8 @@ impl SubKind {
             SubKind::Events => Event::from_bus_event(payload),
             SubKind::EntityState { .. } => Event::from_entity_trigger(payload),
             SubKind::Trigger => Event::TriggerFired(crate::events::TriggerFiredEvent::from_payload(payload)),
+            SubKind::Template => Event::from_template(payload),
+            SubKind::Silence { entity_id } => Event::from_silence(entity_id, payload),
         }
     }
 }

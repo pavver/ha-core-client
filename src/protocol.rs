@@ -30,6 +30,10 @@ pub(crate) fn subscribe_trigger(trigger: &Value) -> Request {
     json!({ "type": "subscribe_trigger", "trigger": trigger })
 }
 
+pub(crate) fn render_template(template: &str) -> Request {
+    json!({ "type": "render_template", "template": template, "report_errors": true })
+}
+
 pub(crate) fn subscribe_entities(entity_ids: &[&str]) -> Request {
     json!({ "type": "subscribe_entities", "entity_ids": entity_ids })
 }
@@ -95,6 +99,9 @@ pub(crate) struct Incoming {
     /// Set on `auth_invalid`.
     #[serde(default)]
     pub message: Option<String>,
+    /// Set on `auth_required` and `auth_ok`.
+    #[serde(default)]
+    pub ha_version: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

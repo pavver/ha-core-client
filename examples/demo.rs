@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::{TimeDelta, Utc};
 use ha_core_client::events::Event;
-use ha_core_client::triggers::SunEvent;
+use ha_core_client::triggers::{SunEvent, SunTrigger, TemplateTrigger, TimePatternTrigger};
 use ha_core_client::{ClientConfig, HAClient};
 use log::{info, warn};
 use serde_json::Value;
@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
         .await?;
 
     client
-        .subscribe_time_pattern_trigger(None, None, Some("/30".into()), |_client, event| async move {
+        .subscribe_trigger(TimePatternTrigger::new().seconds("/30"), |_client, event| async move {
             if let Event::TriggerFired(t) = event {
                 info!("[trigger] {}", t.description().unwrap_or("time pattern"));
             }
@@ -77,14 +77,14 @@ async fn main() -> Result<()> {
         .await?;
 
     client
-        .subscribe_sun_trigger(SunEvent::Sunset, Some(TimeDelta::minutes(-30)), |_client, _event| async move {
+        .subscribe_trigger(SunTrigger::new(SunEvent::Sunset).offset(TimeDelta::minutes(-30)), |_client, _event| async move {
             info!("[trigger] 30 minutes before sunset");
             Ok(())
         })
         .await?;
 
     // Rejected configurations are reported immediately.
-    if let Err(e) = client.subscribe_template_trigger("{{ invalid", None, |_, _| async { Ok(()) }).await {
+    if let Err(e) = client.subscribe_trigger(TemplateTrigger::new("{{ invalid"), |_, _| async { Ok(()) }).await {
         info!("Invalid template rejected as expected: {e}");
     }
 
