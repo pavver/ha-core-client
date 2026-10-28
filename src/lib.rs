@@ -98,13 +98,15 @@ impl HAClient {
     ///
     /// The first connection is not retried: a wrong URL or token is reported here
     /// (as [`Error::Connection`] or [`Error::Auth`]). Later disconnects are retried
-    /// automatically.
+    /// automatically. A URL that is not `ws://` or `wss://` (e.g. `http://host:8123`)
+    /// fails with [`Error::InvalidInput`].
     pub async fn connect(url: impl Into<String>, token: impl Into<String>) -> Result<Self> {
         Self::connect_with(ClientConfig::new(url, token)).await
     }
 
     /// Connects and authenticates with custom settings. See [`connect`](Self::connect).
     pub async fn connect_with(config: ClientConfig) -> Result<Self> {
+        connection::check_url(&config.url)?;
         let ws = connection::connect_and_auth(&config).await?;
 
         let (cmd_tx, cmd_rx) = mpsc::channel(256);

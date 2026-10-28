@@ -40,7 +40,7 @@ All client methods return `ha_core_client::Result<T>` = `Result<T, ha_core_clien
 ## 4. Main API: `HAClient`
 
 ### Lifecycle
-*   `async fn connect(url: impl Into<String>, token: impl Into<String>) -> Result<HAClient>`: connects and authenticates; the first attempt is not retried.
+*   `async fn connect(url: impl Into<String>, token: impl Into<String>) -> Result<HAClient>`: connects and authenticates; the first attempt is not retried. The URL must be `ws://` or `wss://` (`.../api/websocket`); `http(s)://` fails with `Error::InvalidInput`.
 *   `async fn connect_with(config: ClientConfig) -> Result<HAClient>`.
 *   `ClientConfig::new(url, token)` with builder methods `.connect_timeout(Duration)` (10s), `.request_timeout(Duration)` (30s), `.ping_interval(Duration)` (30s), `.pong_timeout(Duration)` (10s, also bounds each write), `.reconnect_delay(min, max)` (1s, 60s), `.subscription_queue_size(usize)` (1024), `.slow_callback_warning(Duration)` (5s; `ZERO` disables), `.max_message_size(usize)` (64 MiB, also bounds frames). Durations are capped at one year (`Duration::MAX` is fine).
 *   `async fn stop(&self)`: stops the client for all handles. Subscriptions receive `SubscriptionStatus::Closed`. Waits up to 5s for callbacks to handle queued events (not when called from inside a callback).

@@ -12,6 +12,12 @@
 *   The request timeout did not cover waiting for room in the command queue, so a call could wait indefinitely while the client task was busy.
 *   `subscribe_entity` did not report an entity that was removed and then added back while disconnected: after a removal the last known state was lost, so the re-read had nothing to compare with. The callback now gets `StateChanged { old_state: None, new_state: Some(..) }` before `Restored`.
 *   A re-subscription that Home Assistant did not confirm within `request_timeout` ended the connection, interrupting every subscription; one that never got an answer kept the client reconnecting forever. It is now sent again on the same connection, and the others stay active.
+*   The reconnect jitter came from the clock's nanoseconds, which on platforms with a coarse clock gave only a few distinct delays. It now uses a random value.
+*   `AttributeSet::get` serialized all attributes on every call; it now looks up the one key.
+
+### Changed
+
+*   `connect`/`connect_with` fail with `Error::InvalidInput` for a URL that is not `ws://` or `wss://`, with a hint for the common `http://host:8123` mistake (was an opaque `Error::Connection`).
 
 ## 0.3.0
 

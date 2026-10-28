@@ -54,6 +54,19 @@ async fn handshake(config: &ClientConfig) -> Result<WsStream> {
     }
 }
 
+/// Rejects URLs that are not WebSocket URLs, with a hint for the common `http://` mistake.
+pub(crate) fn check_url(url: &str) -> Result<()> {
+    let scheme = url.split_once("://").map(|(scheme, _)| scheme.to_ascii_lowercase());
+    match scheme.as_deref() {
+        Some("ws" | "wss") => Ok(()),
+        Some(http @ ("http" | "https")) => Err(Error::InvalidInput(format!(
+            "{url} is not a WebSocket URL; use {}://<host>:8123/api/websocket",
+            if http == "https" { "wss" } else { "ws" }
+        ))),
+        _ => Err(Error::InvalidInput(format!("{url} is not a ws:// or wss:// URL"))),
+    }
+}
+
 /// Oldest supported Home Assistant release: triggers use the `trigger` key (2024.10).
 const MIN_HA_VERSION: (u32, u32) = (2024, 10);
 
@@ -87,6 +100,16 @@ async fn next_json(ws: &mut WsStream) -> Result<Incoming> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_check() {
+        assert!(check_url("ws://localhost:8123/api/websocket").is_ok());
+        assert!(check_url("WSS://ha.example/api/websocket").is_ok());
+        let err = check_url("http://localhost:8123").unwrap_err().to_string();
+        assert!(err.contains("use ws://"), "{err}");
+        assert!(check_url("https://ha.example").unwrap_err().to_string().contains("use wss://"));
+        assert!(matches!(check_url("localhost:8123"), Err(Error::InvalidInput(_))));
+    }
 
     #[test]
     fn version_check() {
