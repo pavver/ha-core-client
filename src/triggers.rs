@@ -306,6 +306,12 @@ mod tests {
             serde_json::to_value(t).unwrap(),
             json!({"trigger": "numeric_state", "entity_id": "sensor.t", "above": 20.5, "attribute": "temperature"})
         );
+        // Custom states keep their case (an `input_select` option `Home` is not `home`).
+        let t: Trigger = StateTrigger::new("input_select.mode").to("Home").from("Open").into();
+        assert_eq!(
+            serde_json::to_value(t).unwrap(),
+            json!({"trigger": "state", "entity_id": "input_select.mode", "to": "Home", "from": "Open"})
+        );
         let t: Trigger = TimePatternTrigger::new().minutes("/5").into();
         assert_eq!(serde_json::to_value(t).unwrap(), json!({"trigger": "time_pattern", "minutes": "/5"}));
     }

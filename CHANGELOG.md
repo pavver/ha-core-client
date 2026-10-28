@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+*   `HaState` parsing ignored case and printed the canonical form, so `StateTrigger::new("input_select.mode").to("Home")` was sent as `"to": "home"` and never fired (states are case-sensitive in Home Assistant). Parsing is now exact: `"on"` is `HaState::On`, `"On"` is `String("On")`, and every `HaState` prints back the string it was parsed from. Behaviour change: `HaState::from_string("ON")` (and `State::ha_state()` of a state `"ON"`) is no longer `HaState::On`.
+
 ## 0.3.0
 
 Fixes from a code review of the runner and the typed model, and removal of legacy API. Breaking: the callback result type, the positional trigger helpers, the attribute types (see the migration table).

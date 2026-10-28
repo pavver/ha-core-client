@@ -59,13 +59,15 @@ impl HaState {
     /// Parses a state using the entity's domain to resolve ambiguous values:
     /// `"open"` is `Lock(Open)` for `lock`, `Cover(Open)` for `cover`; `"heat"` is
     /// `Climate(Heat)` only for `climate`. Other domains fall back to [`from_string`](Self::from_string).
+    ///
+    /// Matching is exact, like in [`from_string`](Self::from_string). Note that a climate
+    /// entity's `"off"` is `Climate(HvacMode::Off)`, not [`HaState::Off`].
     pub fn parse_for_domain(domain: &Domain, s: &str) -> Self {
-        let s_lower = s.to_lowercase();
         let domain_specific = match domain {
-            Domain::Lock => LockState::from_str(&s_lower).ok().map(HaState::Lock),
-            Domain::Cover => CoverState::from_str(&s_lower).ok().map(HaState::Cover),
-            Domain::AlarmControlPanel => AlarmState::from_str(&s_lower).ok().map(HaState::Alarm),
-            Domain::Climate => HvacMode::from_str(&s_lower).ok().map(HaState::Climate),
+            Domain::Lock => exact(s, LockState::from_str(s).map(HaState::Lock)),
+            Domain::Cover => exact(s, CoverState::from_str(s).map(HaState::Cover)),
+            Domain::AlarmControlPanel => exact(s, AlarmState::from_str(s).map(HaState::Alarm)),
+            Domain::Climate => exact(s, HvacMode::from_str(s).map(HaState::Climate)),
             _ => None,
         };
         domain_specific.unwrap_or_else(|| Self::from_string(s))
@@ -75,9 +77,12 @@ impl HaState {
     /// Ambiguous values resolve to the first match in this order: cover, lock, alarm,
     /// climate. Prefer [`parse_for_domain`](Self::parse_for_domain) (or
     /// `State::ha_state`) when the domain is known.
+    ///
+    /// Matching is exact, since Home Assistant states are case-sensitive: `"on"` is
+    /// [`HaState::On`], `"On"` is `String("On")`. The result always prints back as `s`,
+    /// so it can be used in a trigger without changing what it matches.
     pub fn from_string(s: &str) -> Self {
-        let s_lower = s.to_lowercase();
-        match s_lower.as_str() {
+        match s {
             // General
             "on" => HaState::On,
             "off" => HaState::Off,
@@ -90,17 +95,12 @@ impl HaState {
 
             _ => {
                 // Check domain-specific states before falling back to generic types
-                if let Ok(state) = CoverState::from_str(&s_lower) {
-                    return HaState::Cover(state);
-                }
-                if let Ok(state) = LockState::from_str(&s_lower) {
-                    return HaState::Lock(state);
-                }
-                if let Ok(state) = AlarmState::from_str(&s_lower) {
-                    return HaState::Alarm(state);
-                }
-                if let Ok(state) = HvacMode::from_str(&s_lower) {
-                    return HaState::Climate(state);
+                let domain_specific = exact(s, CoverState::from_str(s).map(HaState::Cover))
+                    .or_else(|| exact(s, LockState::from_str(s).map(HaState::Lock)))
+                    .or_else(|| exact(s, AlarmState::from_str(s).map(HaState::Alarm)))
+                    .or_else(|| exact(s, HvacMode::from_str(s).map(HaState::Climate)));
+                if let Some(state) = domain_specific {
+                    return state;
                 }
 
                 // Fallback to generic types. `Number` only if it prints back as the same
@@ -112,6 +112,11 @@ impl HaState {
             }
         }
     }
+}
+
+/// The parsed state, if it prints back exactly as `s` (some strum parsers ignore case).
+fn exact<E>(s: &str, parsed: Result<HaState, E>) -> Option<HaState> {
+    parsed.ok().filter(|state| state.to_string() == s)
 }
 
 /// Allows the enum to be printed out nicely, which is useful for logging.
@@ -278,8 +283,8 @@ mod tests {
 
     #[test]
     fn ha_state_parsing() {
-        assert_eq!(HaState::from_string("ON"), HaState::On);
-        assert_eq!(HaState::from_string("Locked"), HaState::Lock(LockState::Locked));
+        assert_eq!(HaState::from_string("on"), HaState::On);
+        assert_eq!(HaState::from_string("locked"), HaState::Lock(LockState::Locked));
         assert_eq!(HaState::from_string("open"), HaState::Cover(CoverState::Open));
         assert_eq!(HaState::from_string("12.5"), HaState::Number(12.5));
         assert_eq!(HaState::from_string("-3"), HaState::Number(-3.0));
@@ -289,7 +294,12 @@ mod tests {
     #[test]
     fn ha_state_keeps_the_state_string() {
         for s in ["21.0", "1e3", "007", "nan", "inf", "21", "21.5", "unavailable", "Custom"] {
-            assert_eq!(HaState::from_string(s).to_string().to_lowercase(), s.to_lowercase(), "{s}");
+            assert_eq!(HaState::from_string(s).to_string(), s, "{s}");
+        }
+        // States are case-sensitive: a custom `Home` must not become `home`.
+        for s in ["ON", "Home", "Open", "Locked", "Heat", "HEAT", "Armed_Away"] {
+            assert_eq!(HaState::from_string(s), HaState::String(s.into()), "{s}");
+            assert_eq!(HaState::parse_for_domain(&Domain::Climate, s).to_string(), s, "{s}");
         }
         assert_eq!(HaState::from_string("21.0"), HaState::String("21.0".into()));
         assert_eq!(HaState::from_string("nan"), HaState::String("nan".into()));
