@@ -765,7 +765,7 @@ impl Runner {
     async fn housekeeping(&mut self, ws: &mut WsStream) -> Result<(), String> {
         let now = Instant::now();
         let expired: Vec<u64> = self.pending.iter().filter(|(_, p)| p.deadline <= now).map(|(id, _)| *id).collect();
-        let mut resubscribe_timed_out = false;
+        let mut retry = Vec::new();
         let mut abandoned = Vec::new();
         for id in expired {
             let Some(pending) = self.pending.remove(&id) else { continue };
@@ -776,8 +776,10 @@ impl Runner {
                     self.remove_subscription(sub_id);
                     let _ = r.send(Err(Error::Timeout));
                 }
-                // Keep the subscription: a reconnect will retry it.
-                PendingKind::Subscribe { responder: None, .. } => resubscribe_timed_out = true,
+                // Retried on this connection rather than by reconnecting, which would
+                // interrupt every other subscription too. Should Home Assistant still
+                // answer the old request, its events are unsubscribed as unknown.
+                PendingKind::Subscribe { sub_id, responder: None } => retry.push(sub_id),
                 PendingKind::Resync { sub_id, responder: Some(r), .. } => {
                     abandoned.extend(self.remove_subscription(sub_id));
                     let _ = r.send(Err(Error::Timeout));
@@ -797,8 +799,12 @@ impl Runner {
         for ha_id in abandoned {
             self.unsubscribe_orphan(ws, ha_id).await?;
         }
-        if resubscribe_timed_out {
-            return Err("Home Assistant did not confirm restored subscriptions in time".into());
+        for sub_id in retry {
+            let Some(entry) = self.subs.get_mut(&sub_id) else { continue };
+            log::warn!("Home Assistant did not confirm restored subscription {sub_id} in time; retrying");
+            entry.early.clear();
+            let request = entry.request.clone();
+            self.send(ws, request, PendingKind::Subscribe { sub_id, responder: None }).await?;
         }
 
         let config = &self.shared.config;

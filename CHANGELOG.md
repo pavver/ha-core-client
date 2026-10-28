@@ -11,6 +11,7 @@
 *   `subscribe_entity` (subscribe, then read the state) gave each step its own `request_timeout`, so it could take up to twice as long, and the caller's own timeout fired first with `Timeout` while the subscription was still being set up. Both steps now share one deadline.
 *   The request timeout did not cover waiting for room in the command queue, so a call could wait indefinitely while the client task was busy.
 *   `subscribe_entity` did not report an entity that was removed and then added back while disconnected: after a removal the last known state was lost, so the re-read had nothing to compare with. The callback now gets `StateChanged { old_state: None, new_state: Some(..) }` before `Restored`.
+*   A re-subscription that Home Assistant did not confirm within `request_timeout` ended the connection, interrupting every subscription; one that never got an answer kept the client reconnecting forever. It is now sent again on the same connection, and the others stay active.
 
 ## 0.3.0
 

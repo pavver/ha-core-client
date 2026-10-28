@@ -382,6 +382,42 @@ async fn entity_added_back_while_disconnected_is_reported() {
 }
 
 #[tokio::test]
+async fn unconfirmed_resubscription_is_retried_without_reconnecting() {
+    let ha = MockHa::start().await;
+    let config = ha.config().request_timeout(Duration::from_millis(300));
+    let (client, mut conn) = ha.connect(config).await;
+    let mut rx_a = subscribe_trigger_collecting(&client, &mut conn).await;
+    let mut rx_b = subscribe_trigger_collecting(&client, &mut conn).await;
+    conn.ws.close(None).await.unwrap();
+    assert_eq!(recv_within(&mut rx_a).await, "Interrupted");
+    assert_eq!(recv_within(&mut rx_b).await, "Interrupted");
+
+    let mut conn = ha.accept().await;
+    let first = conn.recv_type("subscribe_trigger").await;
+    let second = conn.recv_type("subscribe_trigger").await;
+    conn.ok(&second["id"], Value::Null).await;
+    assert_eq!(recv_within(&mut rx_b).await, "Restored");
+
+    // `first` is never confirmed: it is sent again on the same connection.
+    let retry = conn.recv_type("subscribe_trigger").await;
+    assert_eq!(retry["trigger"], first["trigger"]);
+    conn.ok(&retry["id"], Value::Null).await;
+    assert_eq!(recv_within(&mut rx_a).await, "Restored");
+    assert_eq!(client.connection_state(), ConnectionState::Connected);
+
+    // A late answer to the first request creates a duplicate in Home Assistant,
+    // which is cancelled on its first event.
+    conn.ok(&first["id"], Value::Null).await;
+    conn.event(&first["id"], time_pattern_event(1)).await;
+    let unsub = conn.recv_type("unsubscribe_events").await;
+    assert_eq!(unsub["subscription"], first["id"]);
+    conn.event(&retry["id"], time_pattern_event(2)).await;
+    conn.event(&second["id"], time_pattern_event(3)).await;
+    assert_eq!(recv_within(&mut rx_a).await, "trigger 2");
+    assert_eq!(recv_within(&mut rx_b).await, "trigger 3");
+}
+
+#[tokio::test]
 async fn trigger_subscriptions_get_interrupted_and_restored() {
     let ha = MockHa::start().await;
     let (client, mut conn) = ha.connect(ha.config()).await;
