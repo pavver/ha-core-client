@@ -299,6 +299,16 @@ async fn rejected_subscription_returns_ha_error() {
 }
 
 #[tokio::test]
+async fn raw_trigger_must_be_an_object() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let result = client.subscribe_trigger_raw(json!(["mqtt"]), |_, _| async { Ok(()) }).await;
+    assert!(matches!(result, Err(Error::InvalidInput(_))), "{result:?}");
+    // Nothing was sent.
+    round_trip(&client, &mut conn).await;
+}
+
+#[tokio::test]
 async fn reconnect_after_server_close_restores_subscriptions() {
     let ha = MockHa::start().await;
     let (client, mut conn) = ha.connect(ha.config()).await;

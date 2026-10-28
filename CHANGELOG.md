@@ -18,6 +18,7 @@
 ### Changed
 
 *   `connect`/`connect_with` fail with `Error::InvalidInput` for a URL that is not `ws://` or `wss://`, with a hint for the common `http://host:8123` mistake (was an opaque `Error::Connection`).
+*   `subscribe_trigger_raw` fails with `Error::InvalidInput` for a trigger that is not a JSON object, instead of sending it to Home Assistant.
 
 ## 0.3.0
 

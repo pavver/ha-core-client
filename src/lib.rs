@@ -392,11 +392,16 @@ impl HAClient {
 
     /// Subscribes to a trigger given as raw JSON, for trigger platforms and options
     /// not modelled by [`triggers::Trigger`].
+    ///
+    /// Fails with [`Error::InvalidInput`] if `trigger` is not a JSON object.
     pub async fn subscribe_trigger_raw<F, Fut>(&self, trigger: Value, callback: F) -> Result<Subscription>
     where
         F: Fn(HAClient, Event) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = CallbackResult> + Send + 'static,
     {
+        if !trigger.is_object() {
+            return Err(Error::InvalidInput(format!("a trigger must be a JSON object, got {trigger}")));
+        }
         self.subscribe_with(SubKind::Trigger, protocol::subscribe_trigger(&trigger), callback).await
     }
 
