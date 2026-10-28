@@ -7,6 +7,7 @@
 *   `HaState` parsing ignored case and printed the canonical form, so `StateTrigger::new("input_select.mode").to("Home")` was sent as `"to": "home"` and never fired (states are case-sensitive in Home Assistant). Parsing is now exact: `"on"` is `HaState::On`, `"On"` is `String("On")`, and every `HaState` prints back the string it was parsed from. Behaviour change: `HaState::from_string("ON")` (and `State::ha_state()` of a state `"ON"`) is no longer `HaState::On`.
 *   `watch_silence` failed with a template syntax error for entity ids whose object id starts with a digit (`sensor.1st_floor`). The template now uses `states.sensor['1st_floor']`.
 *   `get_history` failed as a whole when a single history entry could not be parsed. Such entries are now skipped with a warning, like in `get_states`.
+*   The reconnect backoff started over after every successful connect, so a connection that Home Assistant (or a proxy) dropped right after `auth_ok` was retried at the shortest delay forever. It now starts over only after a session that stayed up for the longest backoff delay (at most a minute); `ConnectionState::Reconnecting { attempt }` keeps counting until then.
 
 ## 0.3.0
 

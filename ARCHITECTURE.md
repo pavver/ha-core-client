@@ -12,7 +12,7 @@ This library is designed with type safety, asynchronicity, and resilience to net
 ### 2. Connection Lifecycle
 *   `HAClient::connect` performs the first connect and authentication itself (`src/connection.rs`), so a wrong URL or token is returned to the caller instead of being retried.
 *   A **session** runs while connected: `select!` over shutdown, incoming frames, commands and a housekeeping tick.
-*   A session ends on a `Close` frame, read/write error, or a missing `pong`. All in-flight requests then fail with `ConnectionLost`, and the runner enters the **offline** phase: exponential backoff with jitter, then reconnect. While offline, commands are answered immediately with `NotConnected`.
+*   A session ends on a `Close` frame, read/write error, or a missing `pong`. All in-flight requests then fail with `ConnectionLost`, and the runner enters the **offline** phase: exponential backoff with jitter, then reconnect. The backoff starts over only after a session that lasted at least `min(reconnect_max_delay, 60s)`, so a server that drops the connection right after `auth_ok` is not hammered. While offline, commands are answered immediately with `NotConnected`.
 *   `auth_invalid` during a reconnect is terminal (`ConnectionState::AuthFailed`), because retrying a revoked token only risks an IP ban.
 
 ### 3. Message Ids and Subscriptions

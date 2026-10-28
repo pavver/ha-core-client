@@ -465,6 +465,33 @@ async fn blocked_write_triggers_reconnect() {
 }
 
 #[tokio::test]
+async fn connection_dropped_right_after_auth_keeps_backing_off() {
+    let ha = MockHa::start().await;
+    // A session must last 5s (the longest delay) to count as stable.
+    let config = ha.config().reconnect_delay(Duration::from_millis(10), Duration::from_secs(5));
+    let (client, mut conn) = ha.connect(config).await;
+    for attempt in 1..=3 {
+        conn.ws.close(None).await.unwrap();
+        wait_state(&client, |s| *s == ConnectionState::Reconnecting { attempt }).await;
+        conn = ha.accept().await;
+        wait_state(&client, |s| *s == ConnectionState::Connected).await;
+    }
+
+    // After a session that stayed up (50ms here), the next reconnect starts over.
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    for (stay_up, attempt) in [(false, 1), (false, 2), (true, 1)] {
+        if stay_up {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        conn.ws.close(None).await.unwrap();
+        wait_state(&client, |s| *s == ConnectionState::Reconnecting { attempt }).await;
+        conn = ha.accept().await;
+        wait_state(&client, |s| *s == ConnectionState::Connected).await;
+    }
+}
+
+#[tokio::test]
 async fn unlimited_timeouts_are_accepted() {
     let ha = MockHa::start().await;
     let config = ha.config().request_timeout(Duration::MAX).ping_interval(Duration::MAX).pong_timeout(Duration::MAX);

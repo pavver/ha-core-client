@@ -63,6 +63,9 @@ pub enum ConnectionState {
     /// Connected and authenticated; subscriptions are active.
     Connected,
     /// The connection was lost; requests fail with [`Error::NotConnected`] until it is back.
+    /// `attempt` counts reconnects since the last session that stayed up (for the longest
+    /// backoff delay, at most a minute), so a connection that keeps dropping right after
+    /// connecting backs off instead of retrying at the shortest delay.
     Reconnecting { attempt: u32 },
     /// Home Assistant rejected the token while reconnecting. Terminal.
     AuthFailed(String),

@@ -148,7 +148,13 @@ impl Runner {
     ) {
         let mut attempt = 0u32;
         loop {
+            let started = Instant::now();
             let end = self.session(&mut ws, &mut cmd_rx, &mut shutdown_rx).await;
+            // The backoff starts over only after a session that stayed up, so a connection
+            // that Home Assistant drops right after `auth_ok` keeps backing off.
+            if started.elapsed() >= stable_session(&self.shared.config) {
+                attempt = 0;
+            }
             // A deliberate stop reports `Closed` (in `finish`), not `Interrupted`.
             self.end_session(matches!(end, SessionEnd::Lost(_)));
             match end {
@@ -174,7 +180,6 @@ impl Runner {
                     None => return self.finish(ConnectionState::Stopped),
                     Some(Ok(new_ws)) => {
                         ws = new_ws;
-                        attempt = 0;
                         break;
                     }
                     Some(Err(Error::Auth(message))) => {
@@ -933,6 +938,12 @@ fn tick_period(config: &ClientConfig) -> Duration {
         .map(|d| d / 4)
         .fold(Duration::from_secs(1), Duration::min)
         .max(Duration::from_millis(10))
+}
+
+/// How long a session must last for the reconnect backoff to start over: the longest
+/// backoff delay, at most a minute.
+fn stable_session(config: &ClientConfig) -> Duration {
+    config.reconnect_max_delay.min(Duration::from_secs(60))
 }
 
 /// Exponential backoff with ±20% jitter.
