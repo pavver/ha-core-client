@@ -87,12 +87,33 @@ impl AttributeSet {
     /// An attribute by its Home Assistant key, as raw JSON, whichever variant holds it.
     pub fn get(&self, key: &str) -> Option<Value> {
         let value = match self {
-            AttributeSet::Climate(a) => serde_json::to_value(a),
-            AttributeSet::Generic(a) => serde_json::to_value(a),
+            AttributeSet::Climate(a) => a.rest.get(key).cloned().or_else(|| a.typed(key)),
+            AttributeSet::Generic(a) => a.rest.get(key).cloned().or_else(|| a.typed(key)),
         };
-        value.ok()?.get_mut(key).map(Value::take).filter(|v| !v.is_null())
+        value.filter(|v| !v.is_null())
     }
 }
+
+/// Serializes one typed field by its Home Assistant key, without serializing the rest.
+macro_rules! typed_fields {
+    ($ty:ty { $($field:ident),* $(,)? }) => {
+        impl $ty {
+            fn typed(&self, key: &str) -> Option<Value> {
+                match key {
+                    $( stringify!($field) => serde_json::to_value(&self.$field).ok(), )*
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+typed_fields!(ClimateAttributes {
+    friendly_name, hvac_modes, hvac_action, current_temperature, current_humidity, temperature,
+    target_temp_low, target_temp_high, target_temp_step, min_temp, max_temp, fan_mode, fan_modes,
+    preset_mode, preset_modes, swing_mode, swing_modes,
+});
+typed_fields!(GenericAttributes { friendly_name, unit_of_measurement, device_class, state_class });
 
 /// Parses `GenericAttributes`, never failing: if a known key has an unexpected type,
 /// the typed fields are left empty and every key is kept in `rest`.
@@ -185,6 +206,26 @@ mod tests {
         assert_eq!(a.get("temperature"), Some(json!(23.0)));
         assert_eq!(a.get("target_temp_low"), None);
         assert!(!c.rest.contains_key("friendly_name"));
+    }
+
+    #[test]
+    fn get_covers_every_typed_field() {
+        let climate = ClimateAttributes { friendly_name: Some("x".into()), ..Default::default() };
+        let generic = GenericAttributes { friendly_name: Some("x".into()), ..Default::default() };
+        for set in [AttributeSet::Climate(Box::new(climate)), AttributeSet::Generic(generic)] {
+            let Value::Object(all) = serde_json::to_value(&set).unwrap()[match set {
+                AttributeSet::Climate(_) => "Climate",
+                AttributeSet::Generic(_) => "Generic",
+            }]
+            .take() else { panic!() };
+            for key in all.keys() {
+                let typed = match &set {
+                    AttributeSet::Climate(a) => a.typed(key),
+                    AttributeSet::Generic(a) => a.typed(key),
+                };
+                assert!(typed.is_some(), "typed_fields! misses `{key}`");
+            }
+        }
     }
 
     #[test]
