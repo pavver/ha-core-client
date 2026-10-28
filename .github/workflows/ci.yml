@@ -34,6 +34,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.85
+      # The version is an input, so Dependabot does not mistake it for the action's version.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --lib

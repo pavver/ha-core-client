@@ -77,8 +77,10 @@ async fn main() -> Result<()> {
         .await?;
 
     client
-        .subscribe_trigger(SunTrigger::new(SunEvent::Sunset).offset(TimeDelta::minutes(-30)), |_client, _event| async move {
-            info!("[trigger] 30 minutes before sunset");
+        .subscribe_trigger(SunTrigger::new(SunEvent::Sunset).offset(TimeDelta::minutes(-30)), |_client, event| async move {
+            if let Event::TriggerFired(_) = event {
+                info!("[trigger] 30 minutes before sunset");
+            }
             Ok(())
         })
         .await?;
