@@ -12,10 +12,10 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::config::ClientConfig;
 use crate::connection::{connect_and_auth, WsStream};
 use crate::error::{Error, HaErrorCode, Result};
-use crate::events::{Event, State, SubscriptionStatus};
+use crate::events::{State, StateChange, SubEvent, SubscriptionStatus};
 use crate::protocol::{self, Incoming, Request};
 use crate::queue::{self, QueueRx, QueueTx};
-use crate::subscription::{Command, EntityChanges, EventCallback, SubKind, Subscription};
+use crate::subscription::{Command, Delivery, EntityChanges, EventCallback, SubKind, Subscribed, Subscription};
 use crate::{ConnectionState, HAClient};
 
 /// State shared between the runner and every [`HAClient`] handle.
@@ -40,11 +40,16 @@ pub(crate) fn in_callback() -> bool {
     IN_CALLBACK.try_with(|_| ()).is_ok()
 }
 
+/// Answers a `Subscribe` command once the subscription is established.
+type SubscribeResponder = oneshot::Sender<Result<Subscribed>>;
+
 struct SubEntry {
     kind: SubKind,
     request: Request,
     /// Feeds the subscription's worker task, which runs callbacks one at a time.
     events: QueueTx,
+    /// The receiving end of a stream subscription, until `confirm` hands it to the caller.
+    stream_rx: Option<QueueRx>,
     /// Message id of the subscription on the current connection, once acknowledged.
     ha_id: Option<u64>,
     /// `Interrupted` was delivered and `Restored` not yet.
@@ -54,10 +59,10 @@ struct SubEntry {
     last_state: Option<Option<State>>,
     /// Events of an entity subscription that arrive while its state is re-read after a
     /// reconnect. Delivered after `Restored`, without those the re-read already covers.
-    held: Option<Vec<Event>>,
+    held: Option<Vec<SubEvent>>,
     /// Events that arrived before Home Assistant acknowledged the subscription (it sends a
     /// template's first render this way). Delivered once the subscription is confirmed.
-    early: Vec<Event>,
+    early: Vec<SubEvent>,
 }
 
 enum PendingKind {
@@ -65,7 +70,7 @@ enum PendingKind {
     /// `responder` is `None` for re-subscriptions after a reconnect.
     Subscribe {
         sub_id: u64,
-        responder: Option<oneshot::Sender<Result<Subscription>>>,
+        responder: Option<SubscribeResponder>,
     },
     /// `subscribe_entities` used to read one state; answered by the first event.
     StateOnce {
@@ -78,7 +83,7 @@ enum PendingKind {
     Resync {
         sub_id: u64,
         restoring: bool,
-        responder: Option<oneshot::Sender<Result<Subscription>>>,
+        responder: Option<SubscribeResponder>,
     },
     /// `unsubscribe_events` of `ha_id`; `responder` is `None` for internal cleanups.
     Unsubscribe {
@@ -222,7 +227,7 @@ impl Runner {
     }
 
     /// Registers a subscription and starts its worker. Not yet sent to Home Assistant.
-    fn add_subscription(&mut self, kind: SubKind, request: Request, callback: EventCallback) -> u64 {
+    fn add_subscription(&mut self, kind: SubKind, request: Request, delivery: Delivery) -> u64 {
         let sub_id = self.next_sub_id;
         self.next_sub_id += 1;
         let filter = match kind {
@@ -232,9 +237,24 @@ impl Runner {
         };
         let subscription = Subscription { id: sub_id, client: self.shared.client_id };
         let (events, rx) = queue::channel(subscription, self.shared.config.subscription_queue_size, filter);
-        tokio::spawn(Worker::new(rx, callback, self.weak_tx.clone(), self.shared.clone()).run());
-        let entry =
-            SubEntry { kind, request, events, ha_id: None, interrupted: false, last_state: None, held: None, early: Vec::new() };
+        let stream_rx = match delivery {
+            Delivery::Callback(callback) => {
+                tokio::spawn(Worker::new(rx, callback, self.weak_tx.clone(), self.shared.clone()).run());
+                None
+            }
+            Delivery::Stream => Some(rx),
+        };
+        let entry = SubEntry {
+            kind,
+            request,
+            events,
+            stream_rx,
+            ha_id: None,
+            interrupted: false,
+            last_state: None,
+            held: None,
+            early: Vec::new(),
+        };
         self.subs.insert(sub_id, entry);
         sub_id
     }
@@ -242,8 +262,10 @@ impl Runner {
     /// Hands the subscription to its caller. If the caller stopped waiting (timed out or
     /// dropped the future), nobody could ever unsubscribe it, so it is removed; the
     /// returned Home Assistant id, if any, must then be unsubscribed.
-    fn confirm(&mut self, sub_id: u64, responder: oneshot::Sender<Result<Subscription>>) -> Option<u64> {
-        if responder.send(Ok(Subscription { id: sub_id, client: self.shared.client_id })).is_ok() {
+    fn confirm(&mut self, sub_id: u64, responder: SubscribeResponder) -> Option<u64> {
+        let rx = self.subs.get_mut(&sub_id).and_then(|entry| entry.stream_rx.take());
+        let subscription = Subscription { id: sub_id, client: self.shared.client_id };
+        if responder.send(Ok(Subscribed { subscription, rx })).is_ok() {
             return None;
         }
         log::debug!("Subscription {sub_id} was abandoned by its caller; removing it");
@@ -299,8 +321,8 @@ impl Runner {
             Command::Request { responder, .. } => drop(responder.send(Err(Error::NotConnected))),
             Command::GetStateOnce { responder, .. } => drop(responder.send(Err(Error::NotConnected))),
             // Kept and sent with the others once reconnected; starts out `Interrupted`.
-            Command::Subscribe { kind, request, callback, responder } => {
-                let sub_id = self.add_subscription(kind, request, callback);
+            Command::Subscribe { kind, request, delivery, responder } => {
+                let sub_id = self.add_subscription(kind, request, delivery);
                 self.confirm(sub_id, responder);
                 if let Some(entry) = self.subs.get_mut(&sub_id) {
                     entry.interrupted = true;
@@ -490,8 +512,8 @@ impl Runner {
             }
             // The caller gave up while the command was queued.
             Command::Subscribe { responder, .. } if responder.is_closed() => {}
-            Command::Subscribe { kind, request, callback, responder } => {
-                let sub_id = self.add_subscription(kind, request.clone(), callback);
+            Command::Subscribe { kind, request, delivery, responder } => {
+                let sub_id = self.add_subscription(kind, request.clone(), delivery);
                 self.send(ws, request, PendingKind::Subscribe { sub_id, responder: Some(responder) }).await?;
             }
             Command::Unsubscribe { id, responder } => {
@@ -603,7 +625,7 @@ impl Runner {
         &mut self,
         sub_id: u64,
         restoring: bool,
-        responder: Option<oneshot::Sender<Result<Subscription>>>,
+        responder: Option<SubscribeResponder>,
     ) -> Option<u64> {
         let abandoned = responder.and_then(|r| self.confirm(sub_id, r));
         if restoring {
@@ -617,7 +639,7 @@ impl Runner {
         ws: &mut WsStream,
         ha_id: u64,
         sub_id: u64,
-        responder: Option<oneshot::Sender<Result<Subscription>>>,
+        responder: Option<SubscribeResponder>,
         deadline: Instant,
     ) -> Result<(), String> {
         let restoring = responder.is_none();
@@ -730,7 +752,7 @@ impl Runner {
         &mut self,
         sub_id: u64,
         restoring: bool,
-        responder: Option<oneshot::Sender<Result<Subscription>>>,
+        responder: Option<SubscribeResponder>,
         payload: &Value,
     ) -> Option<u64> {
         let entry = self.subs.get_mut(&sub_id)?;
@@ -756,7 +778,7 @@ impl Runner {
         let missed = restoring && changed(entry.last_state.as_ref().map(Option::as_ref), current.as_ref());
         let old_state = entry.last_state.replace(current.clone()).flatten();
         if missed {
-            entry.events.push(Event::StateChanged { entity_id, old_state, new_state: current });
+            entry.events.push(SubEvent::StateChanged(StateChange { entity_id, old_state, new_state: current }));
         }
         if restoring {
             self.restored(sub_id);
@@ -840,8 +862,8 @@ impl SubEntry {
     /// Queues an event, tracking `last_state` for entity subscriptions. A state change
     /// that `last_state` already includes is skipped: the same update (seen by both the
     /// state re-read and the trigger) or, with `or_older`, an earlier one.
-    fn push_entity_event(&mut self, event: Event, or_older: bool) {
-        if let (SubKind::EntityState { .. }, Event::StateChanged { new_state, .. }) = (&self.kind, &event) {
+    fn push_entity_event(&mut self, event: SubEvent, or_older: bool) {
+        if let (SubKind::EntityState { .. }, SubEvent::StateChanged(StateChange { new_state, .. })) = (&self.kind, &event) {
             if covered(self.last_state.as_ref().and_then(Option::as_ref), new_state.as_ref(), or_older) {
                 return;
             }
@@ -905,7 +927,7 @@ impl Worker {
             let Some(cmd_tx) = self.weak_tx.upgrade() else { continue };
             let client = HAClient { cmd_tx, shared: self.shared.clone() };
             // Each callback runs in its own task, so a panic is contained and logged.
-            let task = tokio::spawn(IN_CALLBACK.scope((), (self.callback)(client, event)));
+            let task = tokio::spawn(IN_CALLBACK.scope((), (self.callback)(client, event, sub_id)));
             match self.watch_slow(sub_id, task).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => log::error!("Callback of subscription {sub_id} failed: {}", error_chain(&*e)),

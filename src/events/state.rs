@@ -159,16 +159,40 @@ impl From<HistoricalState> for State {
     }
 }
 
-/// The `data` field of a `state_changed` event (also the shape of a state trigger's
-/// `variables.trigger`). `new_state` is `None` when the entity was removed,
-/// `old_state` is `None` when it was added.
+/// A state change of an entity: from `subscribe_entity` and `subscribe_state_changes`.
+///
+/// Deserializes from the `data` of a `state_changed` event, which is also the shape of a
+/// state trigger's `variables.trigger`. `old_state` is `None` when the entity was added,
+/// `new_state` when it was removed.
+// States are kept unboxed so callbacks can pattern-match them directly.
 #[derive(Deserialize, Debug, Clone)]
-pub(crate) struct StateChangedData {
+pub struct StateChange {
     pub entity_id: String,
-    #[serde(alias = "to_state")]
-    pub new_state: Option<State>,
-    #[serde(alias = "from_state")]
+    #[serde(default, alias = "from_state")]
     pub old_state: Option<State>,
+    #[serde(default, alias = "to_state")]
+    pub new_state: Option<State>,
+}
+
+impl StateChange {
+    /// Whether the state string changed, or the entity was added or removed.
+    /// `false` for an update of attributes only.
+    pub fn is_state_change(&self) -> bool {
+        match (&self.old_state, &self.new_state) {
+            (Some(old), Some(new)) => old.state != new.state,
+            _ => true,
+        }
+    }
+
+    /// The entity was added (there is no old state).
+    pub fn added(&self) -> bool {
+        self.old_state.is_none()
+    }
+
+    /// The entity was removed (there is no new state).
+    pub fn removed(&self) -> bool {
+        self.new_state.is_none()
+    }
 }
 
 #[cfg(test)]
@@ -234,8 +258,21 @@ mod tests {
 
     #[test]
     fn state_changed_allows_missing_states() {
-        let d: StateChangedData =
+        let d: StateChange =
             serde_json::from_value(json!({"entity_id": "sensor.x", "old_state": null, "new_state": null})).unwrap();
         assert!(d.new_state.is_none() && d.old_state.is_none());
+        assert!(d.added() && d.removed() && d.is_state_change());
+    }
+
+    #[test]
+    fn state_change_helpers() {
+        let s = |v: &str| Some(State::from_compressed("sensor.x", &json!({"s": v, "lc": 1.0})).unwrap());
+        let change = |old, new| StateChange { entity_id: "sensor.x".into(), old_state: old, new_state: new };
+        assert!(change(s("1"), s("2")).is_state_change());
+        assert!(!change(s("1"), s("1")).is_state_change());
+        let added = change(None, s("1"));
+        assert!(added.added() && !added.removed() && added.is_state_change());
+        let removed = change(s("1"), None);
+        assert!(removed.removed() && !removed.added() && removed.is_state_change());
     }
 }

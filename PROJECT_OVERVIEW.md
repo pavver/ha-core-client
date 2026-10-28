@@ -328,3 +328,6 @@ An extensive refactoring was performed to move the client to a "Handle/Runner" p
 
 **Refactoring Complete:**
 The refactoring, while architecturally significant, is now complete and the project compiles successfully. The ownership and lifetime issues related to sharing the command channel across the `HAClient` handle and the background `ClientRunner` have been resolved by using `Arc` for the senders. The client now correctly implements the Handle/Runner pattern.
+### October 29, 2026 (Typed subscriptions, streams, WeakClient)
+
+Callbacks no longer receive one `Event` enum. Each subscription kind delivers its own type wrapped in `Update<T>`; `Source<T>` describes a subscription (`HAClient::subscribe` for callbacks, `HAClient::stream` for `EventStream<T>`). The runner and queue still work with the crate-private `SubEvent`; conversion runs in the worker (or in the stream's `poll_next`). Added `subscribe_state_changes`, `subscribe_template_as`, `BusEvent::data_as`, `WeakClient`. See `CHANGELOG.md` for the migration table.

@@ -3,10 +3,13 @@
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use ha_core_client::events::Event;
+use ha_core_client::events::{BusEvent, Silence, State, StateChange, TemplateErrorLevel, TemplateUpdate, TriggerFired};
 use ha_core_client::state::{Domain, Service};
 use ha_core_client::triggers::{TemplateTrigger, TimePatternTrigger};
-use ha_core_client::{CallbackResult, ClientConfig, ConnectionState, EntityChanges, Error, HAClient, HaErrorCode, SubscriptionStatus, Target};
+use ha_core_client::{
+    CallbackResult, ClientConfig, ConnectionState, EntityChanges, Error, EventStream, HAClient, HaErrorCode, Source, SubscriptionStatus, Target,
+    Update,
+};
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -130,26 +133,59 @@ fn entity_trigger_event(entity_id: &str, from: &str, to: &str) -> Value {
     })
 }
 
-/// Describes an event as a short string: `"old->new"` for state changes, the status otherwise.
-fn describe(event: &Event) -> String {
-    match event {
-        Event::StateChanged { old_state, new_state, .. } => {
-            let s = |st: &Option<ha_core_client::events::State>| st.as_ref().map_or("-".to_string(), |s| s.state.clone());
-            format!("{}->{}", s(old_state), s(new_state))
+/// Describes an update as a short string: `"old->new"` for state changes, the status otherwise.
+trait Describe {
+    fn describe(&self) -> String;
+}
+
+impl<T: Describe> Describe for Update<T> {
+    fn describe(&self) -> String {
+        match self {
+            Update::Event(event) => event.describe(),
+            Update::Status { status, .. } => format!("{status:?}"),
+            _ => "unknown update".to_string(),
         }
-        Event::Status { status, .. } => format!("{status:?}"),
-        Event::TriggerFired(t) => format!("trigger {}", t.trigger["n"]),
-        other => format!("{other:?}"),
     }
 }
 
-/// A callback forwarding `describe(event)` to a channel.
-fn collector() -> (
-    impl Fn(HAClient, Event) -> std::future::Ready<CallbackResult> + Send + Sync + 'static,
+impl Describe for StateChange {
+    fn describe(&self) -> String {
+        let s = |st: &Option<State>| st.as_ref().map_or("-".to_string(), |s| s.state.clone());
+        format!("{}->{}", s(&self.old_state), s(&self.new_state))
+    }
+}
+
+impl Describe for TriggerFired {
+    fn describe(&self) -> String {
+        format!("trigger {}", self.trigger["n"])
+    }
+}
+
+impl Describe for TemplateUpdate {
+    fn describe(&self) -> String {
+        match self {
+            TemplateUpdate::Rendered(result) => format!("TemplateRendered {{ result: {result:?} }}"),
+            TemplateUpdate::RenderError { message, level } => {
+                format!("TemplateError {{ message: {message:?}, level: {:?} }}", level.as_str())
+            }
+            _ => "unknown template update".to_string(),
+        }
+    }
+}
+
+impl Describe for Silence {
+    fn describe(&self) -> String {
+        format!("{self:?}")
+    }
+}
+
+/// A callback forwarding `describe` of each update to a channel.
+fn collector<T: Describe + Send + 'static>() -> (
+    impl Fn(HAClient, Update<T>) -> std::future::Ready<CallbackResult> + Send + Sync + 'static,
     mpsc::UnboundedReceiver<String>,
 ) {
     let (tx, rx) = mpsc::unbounded_channel();
-    (move |_, event: Event| std::future::ready(tx.send(describe(&event)).map_err(Into::into)), rx)
+    (move |_, update: Update<T>| std::future::ready(tx.send(update.describe()).map_err(Into::into)), rx)
 }
 
 /// Answers a one-shot `subscribe_entities` read (`msg`) of `entity_id`.
@@ -254,7 +290,7 @@ async fn trigger_events_are_delivered_in_order() {
                 .subscribe_trigger(TimePatternTrigger::new().seconds("/5"), move |_, event| {
                     let tx = tx.clone();
                     async move {
-                        let Event::TriggerFired(t) = event else {
+                        let Update::Event(t) = event else {
                             return Err(format!("unexpected event {event:?}").into());
                         };
                         let n = t.trigger["n"].as_u64().unwrap();
@@ -480,7 +516,7 @@ async fn handler_can_unsubscribe_while_interrupted() {
                 .subscribe_trigger(TimePatternTrigger::new().seconds("/5"), move |client, event| {
                     let tx = tx.clone();
                     async move {
-                        if let Event::Status { subscription, status: SubscriptionStatus::Interrupted } = event {
+                        if let Update::Status { subscription, status: SubscriptionStatus::Interrupted } = event {
                             tx.send(client.unsubscribe(subscription).await.is_ok()).unwrap();
                         }
                         Ok(())
@@ -892,8 +928,8 @@ type BoxedFuture = std::pin::Pin<Box<dyn std::future::Future<Output = CallbackRe
 
 /// A callback that records each event as soon as it starts, then waits for a permit,
 /// so the test controls when the subscription catches up.
-fn gated_collector() -> (
-    impl Fn(HAClient, Event) -> BoxedFuture + Send + Sync + 'static,
+fn gated_collector<T: Describe + Send + 'static>() -> (
+    impl Fn(HAClient, Update<T>) -> BoxedFuture + Send + Sync + 'static,
     mpsc::UnboundedReceiver<String>,
     std::sync::Arc<tokio::sync::Semaphore>,
 ) {
@@ -901,10 +937,10 @@ fn gated_collector() -> (
     let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
     let callback = {
         let gate = gate.clone();
-        move |_: HAClient, event: Event| {
+        move |_: HAClient, event: Update<T>| {
             let (tx, gate) = (tx.clone(), gate.clone());
             Box::pin(async move {
-                tx.send(describe(&event))?;
+                tx.send(event.describe())?;
                 gate.acquire().await?.forget();
                 Ok(())
             }) as BoxedFuture
@@ -1268,7 +1304,7 @@ async fn stop_waits_for_queued_callbacks() {
                     let tx = tx.clone();
                     async move {
                         tokio::time::sleep(Duration::from_millis(100)).await;
-                        tx.send(describe(&event))?;
+                        tx.send(event.describe())?;
                         Ok(())
                     }
                 })
@@ -1298,7 +1334,7 @@ async fn stop_from_a_callback_does_not_wait_for_itself() {
                 .subscribe_trigger(TimePatternTrigger::new().seconds("/5"), move |client, event| {
                     let tx = tx.clone();
                     async move {
-                        if let Event::TriggerFired(_) = event {
+                        if let Update::Event(_) = event {
                             client.stop().await;
                             tx.send(())?;
                         }
@@ -1370,4 +1406,279 @@ async fn state_only_entity_subscription_skips_attribute_updates() {
     let read = conn.recv_type("subscribe_entities").await;
     answer_read(&mut conn, &read, "sensor.a", "2", 500.0).await;
     assert_eq!(recv_within(&mut rx).await, "Restored");
+}
+
+/// The next update of a stream, described.
+async fn next_described<T: Describe>(stream: &mut EventStream<T>) -> String {
+    tokio::time::timeout(WAIT, stream.next()).await.expect("stream yielded nothing").expect("stream ended").describe()
+}
+
+#[tokio::test]
+async fn entity_stream_delivers_changes_and_statuses() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let sub = tokio::spawn({
+        let client = client.clone();
+        async move { client.stream(Source::entity("sensor.a")).await }
+    });
+    let msg = conn.recv_type("subscribe_trigger").await;
+    conn.ok(&msg["id"], Value::Null).await;
+    answer_state_read(&mut conn, "sensor.a", "1", 100.0).await;
+    let mut stream = sub.await.unwrap().unwrap();
+
+    conn.event(&msg["id"], entity_trigger_event("sensor.a", "1", "2")).await;
+    assert_eq!(next_described(&mut stream).await, "1->2");
+
+    // Changed while disconnected: reported before `Restored`.
+    conn.ws.close(None).await.unwrap();
+    assert_eq!(next_described(&mut stream).await, "Interrupted");
+    let mut conn = ha.accept().await;
+    let resub = conn.recv_type("subscribe_trigger").await;
+    conn.ok(&resub["id"], Value::Null).await;
+    let read = conn.recv_type("subscribe_entities").await;
+    answer_read(&mut conn, &read, "sensor.a", "3", 200.0).await;
+    conn.recv_type("unsubscribe_events").await;
+    assert_eq!(next_described(&mut stream).await, "2->3");
+    assert_eq!(next_described(&mut stream).await, "Restored");
+
+    conn.event(&resub["id"], entity_trigger_event("sensor.a", "3", "4")).await;
+    assert_eq!(next_described(&mut stream).await, "3->4");
+    assert_eq!(stream.subscription().id(), 1);
+}
+
+#[tokio::test]
+async fn stream_subscribed_while_offline_gets_interrupted_first() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config().reconnect_delay(Duration::from_millis(300), Duration::from_millis(300))).await;
+    conn.ws.close(None).await.unwrap();
+    wait_state(&client, |s| matches!(s, ConnectionState::Reconnecting { .. })).await;
+    let mut stream = client.stream(Source::trigger(TimePatternTrigger::new().seconds("/5"))).await.unwrap();
+    assert_eq!(next_described(&mut stream).await, "Interrupted");
+    let mut conn = ha.accept().await;
+    let msg = conn.recv_type("subscribe_trigger").await;
+    conn.ok(&msg["id"], Value::Null).await;
+    assert_eq!(next_described(&mut stream).await, "Restored");
+    conn.event(&msg["id"], time_pattern_event(1)).await;
+    assert_eq!(next_described(&mut stream).await, "trigger 1");
+}
+
+#[tokio::test]
+async fn dropping_a_stream_unsubscribes() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let sub = tokio::spawn({
+        let client = client.clone();
+        async move { client.stream(Source::trigger(TimePatternTrigger::new().seconds("/5"))).await }
+    });
+    let msg = conn.recv_type("subscribe_trigger").await;
+    conn.ok(&msg["id"], Value::Null).await;
+    let stream = sub.await.unwrap().unwrap();
+    drop(stream);
+    let unsub = conn.recv_type("unsubscribe_events").await;
+    assert_eq!(unsub["subscription"], msg["id"]);
+}
+
+#[tokio::test]
+async fn stream_unsubscribe_ends_the_stream() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let sub = tokio::spawn({
+        let client = client.clone();
+        async move { client.stream(Source::trigger(TimePatternTrigger::new().seconds("/5"))).await }
+    });
+    let msg = conn.recv_type("subscribe_trigger").await;
+    conn.ok(&msg["id"], Value::Null).await;
+    let stream = sub.await.unwrap().unwrap();
+    let unsubscribe = tokio::spawn(stream.unsubscribe());
+    let unsub = conn.recv_type("unsubscribe_events").await;
+    assert_eq!(unsub["subscription"], msg["id"]);
+    conn.ok(&unsub["id"], Value::Null).await;
+    unsubscribe.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn stream_ends_after_stop() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let sub = tokio::spawn({
+        let client = client.clone();
+        async move { client.stream(Source::trigger(TimePatternTrigger::new().seconds("/5"))).await }
+    });
+    let msg = conn.recv_type("subscribe_trigger").await;
+    conn.ok(&msg["id"], Value::Null).await;
+    let mut stream = sub.await.unwrap().unwrap();
+
+    // `stop()` does not wait for streams, which are not workers.
+    tokio::time::timeout(WAIT, client.stop()).await.unwrap();
+    assert_eq!(next_described(&mut stream).await, "Closed");
+    assert!(tokio::time::timeout(WAIT, stream.next()).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn template_as_decodes_or_reports() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let sub = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .subscribe_template_as::<f64, _, _>("{{ states('sensor.a') }}", move |_, update| {
+                    let tx = tx.clone();
+                    async move {
+                        if let Update::Event(update) = update {
+                            tx.send(update)?;
+                        }
+                        Ok(())
+                    }
+                })
+                .await
+        }
+    });
+    let msg = conn.recv_type("render_template").await;
+    conn.ok(&msg["id"], Value::Null).await;
+    sub.await.unwrap().unwrap();
+
+    conn.event(&msg["id"], rendered(json!(2.5))).await;
+    assert!(matches!(recv_within(&mut rx).await, TemplateUpdate::Rendered(v) if v == 2.5));
+    conn.event(&msg["id"], rendered(json!("x"))).await;
+    assert!(matches!(
+        recv_within(&mut rx).await,
+        TemplateUpdate::DecodeError { ref result, ref error } if result == "x" && !error.is_empty()
+    ));
+    conn.event(&msg["id"], json!({"error": "ZeroDivisionError: division by zero", "level": "ERROR"})).await;
+    assert!(matches!(
+        recv_within(&mut rx).await,
+        TemplateUpdate::RenderError { ref message, ref level }
+            if message.contains("ZeroDivisionError") && *level == TemplateErrorLevel::Error
+    ));
+}
+
+#[tokio::test]
+async fn state_changes_and_bus_events_are_typed() {
+    #[derive(serde::Deserialize, Debug, PartialEq)]
+    struct MyData {
+        x: u32,
+    }
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+
+    let (callback, mut changes) = collector();
+    let sub = tokio::spawn({
+        let client = client.clone();
+        async move { client.subscribe_state_changes(callback).await }
+    });
+    let changed = conn.recv_type("subscribe_events").await;
+    assert_eq!(changed["event_type"], "state_changed");
+    conn.ok(&changed["id"], Value::Null).await;
+    sub.await.unwrap().unwrap();
+
+    let (tx, mut bus) = mpsc::unbounded_channel();
+    let sub = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .subscribe_events("my_event", move |_, update| {
+                    let tx = tx.clone();
+                    async move {
+                        if let Update::Event(event) = update {
+                            tx.send(event)?;
+                        }
+                        Ok(())
+                    }
+                })
+                .await
+        }
+    });
+    let custom = conn.recv_type("subscribe_events").await;
+    assert_eq!(custom["event_type"], "my_event");
+    conn.ok(&custom["id"], Value::Null).await;
+    sub.await.unwrap().unwrap();
+
+    conn.event(
+        &changed["id"],
+        json!({"event_type": "state_changed", "data": {
+            "entity_id": "sensor.a", "old_state": state("sensor.a", "1"), "new_state": state("sensor.a", "2")}}),
+    )
+    .await;
+    assert_eq!(recv_within(&mut changes).await, "1->2");
+
+    conn.event(
+        &custom["id"],
+        json!({"event_type": "my_event", "data": {"x": 7}, "origin": "LOCAL",
+            "time_fired": "2026-10-28T14:45:09.185007+00:00",
+            "context": {"id": "01X", "parent_id": null, "user_id": null}}),
+    )
+    .await;
+    let event: BusEvent = recv_within(&mut bus).await;
+    assert_eq!(event.event_type, "my_event");
+    assert_eq!(event.data_as::<MyData>().unwrap(), MyData { x: 7 });
+    assert_eq!(event.origin.as_deref(), Some("LOCAL"));
+    assert!(event.time_fired.is_some());
+}
+
+#[tokio::test]
+async fn service_calls_are_typed() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let sub = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .subscribe_service_calls(move |_, update| {
+                    let tx = tx.clone();
+                    async move {
+                        tx.send(update)?;
+                        Ok(())
+                    }
+                })
+                .await
+        }
+    });
+    let msg = conn.recv_type("subscribe_events").await;
+    assert_eq!(msg["event_type"], "call_service");
+    conn.ok(&msg["id"], Value::Null).await;
+    sub.await.unwrap().unwrap();
+    conn.event(
+        &msg["id"],
+        json!({"event_type": "call_service", "data": {"domain": "light", "service": "turn_on", "service_data": {"entity_id": "light.a"}}}),
+    )
+    .await;
+    let call = recv_within(&mut rx).await.into_event().unwrap();
+    assert_eq!(call.domain, Domain::Light);
+    assert_eq!(call.service, Service::TurnOn);
+    assert_eq!(call.service_data["entity_id"], "light.a");
+}
+
+#[tokio::test]
+async fn weak_client_does_not_keep_the_client_alive() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let weak = client.downgrade();
+    assert!(weak.upgrade().is_some());
+    let sub = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .subscribe_trigger(TimePatternTrigger::new().seconds("/5"), move |_, _| {
+                    let weak = weak.clone();
+                    async move {
+                        let _ = weak.upgrade();
+                        Ok(())
+                    }
+                })
+                .await
+        }
+    });
+    let msg = conn.recv_type("subscribe_trigger").await;
+    conn.ok(&msg["id"], Value::Null).await;
+    sub.await.unwrap().unwrap();
+
+    let weak = client.downgrade();
+    let mut state = client.watch_connection_state();
+    drop(client);
+    tokio::time::timeout(WAIT, state.wait_for(|s| *s == ConnectionState::Stopped)).await.expect("client kept running").unwrap();
+    assert!(weak.upgrade().is_none());
+    conn.expect_close().await;
 }

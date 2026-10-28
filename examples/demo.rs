@@ -11,9 +11,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{TimeDelta, Utc};
-use ha_core_client::events::Event;
 use ha_core_client::triggers::{SunEvent, SunTrigger, TemplateTrigger, TimePatternTrigger};
-use ha_core_client::{ClientConfig, HAClient};
+use futures_util::StreamExt;
+use ha_core_client::{ClientConfig, HAClient, Source, Update};
 use log::{info, warn};
 use serde_json::Value;
 use tracing_subscriber::EnvFilter;
@@ -51,14 +51,14 @@ async fn main() -> Result<()> {
 
     // --- Subscriptions ---
     client
-        .subscribe_entity(&entity, |_client, event| async move {
-            match event {
-                Event::StateChanged { entity_id, old_state, new_state } => {
-                    let old = old_state.map(|s| s.state).unwrap_or_default();
-                    let new = new_state.map(|s| s.state).unwrap_or_default();
-                    info!("[entity] {entity_id}: {old} -> {new}");
+        .subscribe_entity(&entity, |_client, update| async move {
+            match update {
+                Update::Event(change) => {
+                    let old = change.old_state.map(|s| s.state).unwrap_or_default();
+                    let new = change.new_state.map(|s| s.state).unwrap_or_default();
+                    info!("[entity] {}: {old} -> {new}", change.entity_id);
                 }
-                Event::Status { subscription, status } => {
+                Update::Status { subscription, status } => {
                     info!("[entity] subscription {} status: {status:?}", subscription.id());
                 }
                 _ => {}
@@ -68,8 +68,8 @@ async fn main() -> Result<()> {
         .await?;
 
     client
-        .subscribe_trigger(TimePatternTrigger::new().seconds("/30"), |_client, event| async move {
-            if let Event::TriggerFired(t) = event {
+        .subscribe_trigger(TimePatternTrigger::new().seconds("/30"), |_client, update| async move {
+            if let Update::Event(t) = update {
                 info!("[trigger] {}", t.description().unwrap_or("time pattern"));
             }
             Ok(())
@@ -77,13 +77,21 @@ async fn main() -> Result<()> {
         .await?;
 
     client
-        .subscribe_trigger(SunTrigger::new(SunEvent::Sunset).offset(TimeDelta::minutes(-30)), |_client, event| async move {
-            if let Event::TriggerFired(_) = event {
+        .subscribe_trigger(SunTrigger::new(SunEvent::Sunset).offset(TimeDelta::minutes(-30)), |_client, update| async move {
+            if let Update::Event(_) = update {
                 info!("[trigger] 30 minutes before sunset");
             }
             Ok(())
         })
         .await?;
+
+    // The same kind of subscription as a stream, here for a template.
+    let mut template = client.stream(Source::template_as::<f64>("{{ now().minute }}")).await?;
+    tokio::spawn(async move {
+        while let Some(update) = template.next().await {
+            info!("[template] {update:?}");
+        }
+    });
 
     // Rejected configurations are reported immediately.
     if let Err(e) = client.subscribe_trigger(TemplateTrigger::new("{{ invalid"), |_, _| async { Ok(()) }).await {

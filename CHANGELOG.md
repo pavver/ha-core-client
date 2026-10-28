@@ -9,6 +9,23 @@
 *   The `target` sent to Home Assistant now lists entity ids (`{"entity_id": ["light.x"]}`) instead of a bare string.
 *   `Error::Ha { code }` and `SubscriptionStatus::Rejected { code }` are `HaErrorCode` instead of `String`. Compare with `code == HaErrorCode::NotFound`; its `Debug` output is now the variant name.
 *   `ServiceCalledEvent::domain` and `service` are `Domain` and `Service` instead of `String`.
+*   Subscription callbacks no longer receive one big `events::Event` enum: each subscription kind delivers its own type, wrapped in `Update<T>` (`Update::Event(T)` or `Update::Status { subscription, status }`). `events::Event` is gone. Callback signature: `Fn(HAClient, Update<T>) -> Fut`. Migration:
+
+    | Before | After |
+    |---|---|
+    | `Event::StateChanged { entity_id, old_state, new_state }` | `Update::Event(StateChange { entity_id, old_state, new_state })` |
+    | `Event::Status { subscription, status }` | `Update::Status { subscription, status }` |
+    | `Event::TemplateRendered { result }` | `Update::Event(TemplateUpdate::Rendered(result))` |
+    | `Event::TemplateError { message, level: String }` | `Update::Event(TemplateUpdate::RenderError { message, level: TemplateErrorLevel })` |
+    | `Event::Silence { entity_id, silent }` | `Update::Event(Silence { entity_id, silent })` |
+    | `Event::Generic { event_type, data }` | `Update::Event(BusEvent { event_type, data, .. })` |
+    | `Event::ServiceCalled(ServiceCalledEvent)` | `Update::Event(ServiceCall)` (renamed) |
+    | `Event::TriggerFired(TriggerFiredEvent)` | `Update::Event(TriggerFired)` (renamed) |
+    | `subscribe_events("state_changed", ..)` | `subscribe_state_changes(..)` (`subscribe_events("state_changed", ..)` now delivers raw `BusEvent`s) |
+    | `subscribe_events("call_service", ..)` | `subscribe_service_calls(..)` |
+
+*   `subscribe_events` always delivers `BusEvent`; `state_changed` and `call_service` are no longer special-cased.
+*   A `watch_silence` template render error (and an entity-subscription payload that cannot be parsed) is logged and skipped instead of being delivered as another event type.
 
 ### Fixed
 
@@ -27,6 +44,10 @@
 
 *   `Target`: what a service call acts on (entities, devices, areas, floors, labels), with `From` impls for entity ids.
 *   `HaErrorCode`: typed Home Assistant error codes with an `Other(String)` fallback.
+*   `Source<T>` (`Source::entity`, `entity_with`, `state_changes`, `service_calls`, `events`, `trigger`, `trigger_raw`, `template`, `template_as`, `silence`) and `HAClient::subscribe(source, callback)`: the general form of the `subscribe_*` methods.
+*   `HAClient::stream(source) -> EventStream<T>`: consume any subscription as a `futures_util::Stream<Item = Update<T>>` (same statuses, resync and ordering as callbacks; dropping the stream unsubscribes).
+*   `subscribe_state_changes` (the `state_changed` bus event as typed `StateChange`s), `subscribe_template_as::<T>` (`TemplateUpdate<T>` with `DecodeError`), `StateChange::{is_state_change, added, removed}`, `BusEvent::data_as`, `TemplateErrorLevel`.
+*   `HAClient::downgrade() -> WeakClient` (`upgrade() -> Option<HAClient>`), for callbacks that need a client handle without keeping the client alive.
 
 ### Changed
 

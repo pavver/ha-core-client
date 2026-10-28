@@ -31,16 +31,16 @@ anyhow = "1"
 Pin a release tag ([releases](https://github.com/pavver/ha-core-client/releases)); `master` may contain breaking changes.
 
 ```rust
-use ha_core_client::{HAClient, events::Event};
+use ha_core_client::{HAClient, Update};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Fails right away on a wrong URL or token; later disconnects are retried.
     let client = HAClient::connect("ws://192.168.1.100:8123/api/websocket", "YOUR_TOKEN").await?;
 
-    client.subscribe_entity("binary_sensor.motion", |client, event| async move {
-        if let Event::StateChanged { new_state: Some(state), .. } = event {
-            if state.state == "on" {
+    client.subscribe_entity("binary_sensor.motion", |client, update| async move {
+        if let Update::Event(change) = update {
+            if change.new_state.is_some_and(|state| state.state == "on") {
                 client.turn_on("light.hallway").await?;
             }
         }
@@ -56,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-Keep at least one `HAClient` handle alive: when every handle is dropped, the client shuts down.
+Keep at least one `HAClient` handle alive: when every handle is dropped, the client shuts down. A callback receives its own handle while it runs; if it needs one outside that, capture a `WeakClient` (`client.downgrade()`, `weak.upgrade()`) so the subscription does not keep the client alive.
 
 Callbacks return `ha_core_client::CallbackResult` (`Result<(), Box<dyn Error + Send + Sync>>`): end with `Ok(())`, and `?` works on any error type, including `anyhow::Error`. Returned errors are logged.
 
@@ -101,14 +101,14 @@ while states.changed().await.is_ok() {
 Every subscription callback is also told about the connection, in order with its data:
 
 ```rust
-use ha_core_client::{events::Event, SubscriptionStatus};
+use ha_core_client::{SubscriptionStatus, Update};
 
-client.subscribe_entity("sensor.power", |client, event| async move {
-    match event {
-        Event::StateChanged { new_state, .. } => { /* use the new state */ }
-        Event::Status { status: SubscriptionStatus::Interrupted, .. } => { /* data may be stale now */ }
-        Event::Status { status: SubscriptionStatus::Restored, .. } => { /* live again */ }
-        Event::Status { subscription, status: SubscriptionStatus::Rejected { message, .. } } => {
+client.subscribe_entity("sensor.power", |client, update| async move {
+    match update {
+        Update::Event(change) => { /* change.new_state: the new state */ }
+        Update::Status { status: SubscriptionStatus::Interrupted, .. } => { /* data may be stale now */ }
+        Update::Status { status: SubscriptionStatus::Restored, .. } => { /* live again */ }
+        Update::Status { subscription, status: SubscriptionStatus::Rejected { message, .. } } => {
             eprintln!("subscription {} dropped by Home Assistant: {message}", subscription.id());
         }
         _ => {}
@@ -117,9 +117,23 @@ client.subscribe_entity("sensor.power", |client, event| async move {
 }).await?;
 ```
 
+Each subscription kind delivers its own type (`StateChange`, `TriggerFired`, `BusEvent`, `TemplateUpdate<T>`, …) wrapped in `Update<T>`. Instead of a callback you can consume a subscription as a `Stream`, with the same updates in the same order:
+
+```rust
+use futures_util::StreamExt;
+use ha_core_client::{Source, Update};
+
+let mut stream = client.stream(Source::entity("sensor.power")).await?;
+while let Some(update) = stream.next().await {
+    if let Update::Event(change) = update { /* ... */ }
+}
+```
+
+Dropping the stream unsubscribes; it ends after the subscription's last status (`Closed`, `Unsubscribed`, `Rejected`). It holds an `HAClient`, so it keeps the client running, like a `SubscriptionGuard`.
+
 Callbacks of one subscription run one after another. If a callback falls behind, `subscribe_entity` merges the waiting state changes into one (from the last delivered state to the newest), and other subscriptions drop their oldest events beyond `subscription_queue_size`; the callback is told with `SubscriptionStatus::Lagged { dropped }`. To process events concurrently, `tokio::spawn` inside the callback.
 
-After a reconnect, `subscribe_entity` re-reads the entity: if it changed while disconnected, one `StateChanged` (last known → current state) arrives right before `Restored`, and live changes follow only after it. A handler can also `client.unsubscribe(subscription)` on `Interrupted`, which works while offline.
+After a reconnect, `subscribe_entity` re-reads the entity: if it changed while disconnected, one `StateChange` (last known → current state) arrives right before `Restored`, and live changes follow only after it. A handler can also `client.unsubscribe(subscription)` on `Interrupted`, which works while offline.
 
 `unsubscribe` ends with `SubscriptionStatus::Unsubscribed`; `stop()` waits (up to 5s) for callbacks to handle what is queued, ending with `Closed`.
 
@@ -145,12 +159,13 @@ While reconnecting, requests fail fast with `Error::NotConnected`, but new subsc
 
 ### Subscriptions
 
-*   `subscribe_entity(entity_id, callback)`: state/attribute changes of one entity, as `Event::StateChanged`.
+*   `subscribe_entity(entity_id, callback)`: state/attribute changes of one entity, as `StateChange`.
 *   `subscribe_entity_with(entity_id, EntityChanges::State, callback)`: only changes of the state itself, skipping attribute-only updates. (A sensor re-reporting an unchanged value is never delivered: Home Assistant does not send such reports over the WebSocket API.)
-*   `watch_silence("sensor.outdoor", Duration::from_secs(1800), callback)`: `Event::Silence { silent }` when a sensor has not reported (even an unchanged value) for longer than the given time, and when it reports again. Checked in Home Assistant, with no polling.
-*   `subscribe_template("{{ states('sensor.x') | float * 2 }}", callback)`: `Event::TemplateRendered { result }` with the current result and on every change.
-*   `subscribe_events(event_type, callback)`, `subscribe_service_calls(callback)`: bus events.
-*   `subscribe_trigger(trigger, callback)`: a trigger built with `StateTrigger`, `NumericStateTrigger`, `SunTrigger`, `TimeTrigger`, `TimePatternTrigger`, `TemplateTrigger` or `ZoneTrigger` (`triggers` module), as `Event::TriggerFired`:
+*   `watch_silence("sensor.outdoor", Duration::from_secs(1800), callback)`: `Silence { entity_id, silent }` when a sensor has not reported (even an unchanged value) for longer than the given time, and when it reports again. Checked in Home Assistant, with no polling.
+*   `subscribe_template("{{ states('sensor.x') | float * 2 }}", callback)`: `TemplateUpdate::Rendered(Value)` with the current result and on every change, `RenderError` if a render fails. `subscribe_template_as::<f64>(template, callback)` decodes the result into `T` (`DecodeError` if it does not fit).
+*   `subscribe_events(event_type, callback)`: raw `BusEvent`s (with `data_as::<T>()`). `subscribe_state_changes(callback)`: every state change in the system as `StateChange`. `subscribe_service_calls(callback)`: `ServiceCall`.
+*   `subscribe(Source, callback)` / `stream(Source)`: the general forms the methods above are shortcuts for (`Source::entity`, `Source::trigger`, `Source::template_as::<T>`, …).
+*   `subscribe_trigger(trigger, callback)`: a trigger built with `StateTrigger`, `NumericStateTrigger`, `SunTrigger`, `TimeTrigger`, `TimePatternTrigger`, `TemplateTrigger` or `ZoneTrigger` (`triggers` module), as `TriggerFired`:
     ```rust
     client.subscribe_trigger(StateTrigger::new("binary_sensor.door").to(HaState::On).for_duration(Duration::from_secs(60)), callback).await?;
     client.subscribe_trigger(TimePatternTrigger::new().minutes("/5"), callback).await?;

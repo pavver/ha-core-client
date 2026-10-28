@@ -60,24 +60,54 @@ All client methods return `ha_core_client::Result<T>` = `Result<T, ha_core_clien
 *   `Target`: `Target::new()`, `entity(id)`, `entities(ids)`, `device(id)`, `area(id)`, `floor(id)`, `label(id)`, chained with `.and_entity/.and_device/.and_area/.and_floor/.and_label`, `is_empty()`. `()` is no target; `&str`, `String`, `[&str; N]`, `Vec<String>`, `Vec<&str>`, `&[&str]` convert to entity ids.
 
 ### Subscriptions
-Callback bound: `F: Fn(HAClient, events::Event) -> Fut + Send + Sync + 'static`, `Fut: Future<Output = ha_core_client::CallbackResult> + Send + 'static`, where `CallbackResult = Result<(), BoxError>` and `BoxError = Box<dyn std::error::Error + Send + Sync>`. A closure ending in `Ok(())` needs no annotation; `?` works on any `std::error::Error` and on `anyhow::Error`. To fail with a message: `return Err("reason".into())`. Errors returned by a callback are logged with their source chain.
+Every subscription delivers `Update<T>` (below), where `T` depends on the subscription. Callback bound: `F: Fn(HAClient, Update<T>) -> Fut + Send + Sync + 'static`, `Fut: Future<Output = ha_core_client::CallbackResult> + Send + 'static`, where `CallbackResult = Result<(), BoxError>` and `BoxError = Box<dyn std::error::Error + Send + Sync>`. A closure ending in `Ok(())` needs no annotation; `?` works on any `std::error::Error` and on `anyhow::Error`. To fail with a message: `return Err("reason".into())`. Errors returned by a callback are logged with their source chain.
 
 Each `subscribe_*` returns `Result<Subscription>` after Home Assistant accepts it (an invalid configuration returns `Error::Ha`). While reconnecting (or if the connection drops before Home Assistant answers), subscribing succeeds: the subscription starts with `Interrupted` and is sent when the connection is back. If the caller stops waiting (cancelled future, timeout), the subscription is cancelled and its callback never runs.
 
-*   `subscribe_entity(entity_id: &str, cb)`: `Event::StateChanged` for that entity only (state and attribute changes, filtered server-side). Same as `subscribe_entity_with(entity_id, EntityChanges::Any, cb)`.
+*   `subscribe<T, F, Fut>(&self, source: Source<T>, cb: F) -> Result<Subscription>`: the general form; every method below is `subscribe(Source::..., cb)`.
+*   `stream<T>(&self, source: Source<T>) -> Result<EventStream<T>>`: the same subscription as a `futures_util::Stream<Item = Update<T>>` (see "Streams" below). There are no `*_stream` variants: use `client.stream(Source::entity("x"))`.
+*   `subscribe_entity(entity_id: &str, cb)` (`Update<StateChange>`): `StateChange` for that entity only (state and attribute changes, filtered server-side). Same as `subscribe_entity_with(entity_id, EntityChanges::Any, cb)`.
 *   `subscribe_entity_with(entity_id: &str, changes: EntityChanges, cb)`: `EntityChanges::State` delivers only changes of the state string (attribute-only updates and queued changes that cancel out, `A → B → A`, are skipped); `EntityChanges::Any` delivers every recorded update. Neither sees a sensor re-reporting the same value with the same attributes: Home Assistant only bumps `last_reported` and does not send it over the WebSocket API (`state_reported` cannot be subscribed to), so "sensor silent for N minutes" logic must not rely on such reports (use `watch_silence` instead). Fails with `Error::Ha { code: HaErrorCode::NotFound, .. }` if the entity does not exist; use `subscribe_trigger(StateTrigger::new(id), cb)` for entities that may appear later.
-*   `subscribe_events(event_type: &str, cb)`: bus events. `state_changed` → `Event::StateChanged` (**every** entity), `call_service` → `Event::ServiceCalled`, others → `Event::Generic`.
-*   `subscribe_service_calls(cb)`: same as `subscribe_events("call_service", cb)`.
-*   `subscribe_trigger(trigger: impl Into<triggers::Trigger>, cb)`, `subscribe_trigger_raw(trigger: serde_json::Value, cb)`: `Event::TriggerFired`. A raw trigger that is not a JSON object fails with `Error::InvalidInput`.
-*   `subscribe_template(template: &str, cb)`: Home Assistant renders the template and sends `Event::TemplateRendered { result: Value }` right after subscribing, after every reconnect (following `Restored`, possibly unchanged) and whenever the result changes. Re-rendered when a referenced entity changes, and every minute if it uses `now()`. Results are typed (`2`, `true`, `"158 W"`). A syntax error fails the call with `Error::Ha`; a failing render arrives as `Event::TemplateError { message, level }` and the subscription stays.
-*   `watch_silence(entity_id: &str, max_silence: std::time::Duration, cb)`: `Event::Silence { entity_id, silent: bool }`: the current value right after subscribing and after every reconnect, then each flip. `silent` is `true` when the entity has not reported for longer than `max_silence`, counting reports of an unchanged value (`last_reported`), and for a missing entity. Built on `subscribe_template`; evaluated in Home Assistant on its clock, on entity changes and every minute, so flips can be up to a minute late. The way to implement "sensor silent for N minutes" without `get_states`. `Error::InvalidInput` for a malformed entity id.
+*   `subscribe_state_changes(cb)` (`Update<StateChange>`): the `state_changed` bus event of **every** entity. No existence check, resync or merging; prefer `subscribe_entity` for single entities.
+*   `subscribe_events(event_type: &str, cb)` (`Update<BusEvent>`): raw bus events of one type. `state_changed` and `call_service` are not special-cased here.
+*   `subscribe_service_calls(cb)` (`Update<ServiceCall>`): all `call_service` events.
+*   `subscribe_trigger(trigger: impl Into<triggers::Trigger>, cb)`, `subscribe_trigger_raw(trigger: serde_json::Value, cb)`: `TriggerFired` (`Update<TriggerFired>`). A raw trigger that is not a JSON object fails with `Error::InvalidInput`.
+*   `subscribe_template(template: &str, cb)`: Home Assistant renders the template and sends `TemplateUpdate::Rendered(Value)` (`Update<TemplateUpdate>`) right after subscribing, after every reconnect (following `Restored`, possibly unchanged) and whenever the result changes. Re-rendered when a referenced entity changes, and every minute if it uses `now()`. Results are typed (`2`, `true`, `"158 W"`). A syntax error fails the call with `Error::Ha`; a failing render arrives as `TemplateUpdate::RenderError { message, level: TemplateErrorLevel }` and the subscription stays.
+*   `subscribe_template_as::<T: DeserializeOwned>(template: &str, cb)` (`Update<TemplateUpdate<T>>`): like `subscribe_template`, decoding each result into `T` (`f64`, `bool`, `String`, a struct, …); a result that does not fit arrives as `TemplateUpdate::DecodeError { result: Value, error: String }`.
+*   `watch_silence(entity_id: &str, max_silence: std::time::Duration, cb)`: `Silence { entity_id, silent: bool }` (`Update<Silence>`): the current value right after subscribing and after every reconnect, then each flip. `silent` is `true` when the entity has not reported for longer than `max_silence`, counting reports of an unchanged value (`last_reported`), and for a missing entity. Built on `subscribe_template`; evaluated in Home Assistant on its clock, on entity changes and every minute, so flips can be up to a minute late. The way to implement "sensor silent for N minutes" without `get_states`. `Error::InvalidInput` for a malformed entity id.
 *   `unsubscribe(&self, subscription: Subscription) -> Result<()>`: the callback then gets `SubscriptionStatus::Unsubscribed` as its last event.
 *   `Subscription::id() -> u64`, which stays the same across reconnects. Dropping a `Subscription` does not unsubscribe. A `Subscription` belongs to the client that created it: `unsubscribe` on another client fails with `Error::InvalidInput` (ids are per client).
 *   `Subscription::guard(self, &client) -> SubscriptionGuard`: unsubscribes on drop; `guard.subscription()`, `guard.unsubscribe().await`, `guard.into_inner()`. The guard holds a client handle.
 
+#### `Source<T>`, streams and `WeakClient`
+*   `Source<T>` (crate root) describes one subscription and its item type `T`. Constructors: `Source::entity(id)`, `Source::entity_with(id, EntityChanges)`, `Source::state_changes()` (all `StateChange`); `Source::service_calls()` (`ServiceCall`); `Source::events(event_type)` (`BusEvent`); `Source::trigger(impl Into<Trigger>)`, `Source::trigger_raw(Value) -> Result<Source<TriggerFired>>` (`Error::InvalidInput` unless an object); `Source::template(t)` (`TemplateUpdate<Value>`), `Source::template_as::<T>(t)` (`TemplateUpdate<T>`); `Source::silence(id, max_silence) -> Result<Source<Silence>>`.
+*   `stream<T: Send + 'static>(&self, source: Source<T>) -> Result<EventStream<T>>`. `EventStream<T>` implements `futures_util::Stream<Item = Update<T>> + Unpin` and ends after the subscription's last status (`Closed`/`Unsubscribed`/`Rejected`). `subscription() -> &Subscription`; `async unsubscribe(self) -> Result<()>` waits for Home Assistant; dropping it unsubscribes. It holds an `HAClient` (keeps the client alive, like `SubscriptionGuard`). `stop()` does not wait for streams. Reconnect statuses, resync and queue merging behave exactly as for callbacks.
+*   `HAClient::downgrade() -> WeakClient`; `WeakClient: Clone`, `upgrade() -> Option<HAClient>`. A callback that needs a client handle outside its own run should capture a `WeakClient`, not an `HAClient`, or dropping all user handles no longer stops the client.
+
+```rust
+use futures_util::StreamExt;
+use ha_core_client::{Source, Update};
+
+// Callback
+client.subscribe(Source::entity("sensor.power"), |_client, update| async move {
+    match update {
+        Update::Event(change) => println!("{} -> {:?}", change.entity_id, change.new_state.map(|s| s.state)),
+        Update::Status { status, .. } => println!("status: {status:?}"),
+        _ => {}
+    }
+    Ok(())
+}).await?;
+
+// Stream
+let mut stream = client.stream(Source::template_as::<f64>("{{ states('sensor.power') | float }}")).await?;
+while let Some(update) = stream.next().await {
+    if let Some(ha_core_client::events::TemplateUpdate::Rendered(watts)) = update.event() { println!("{watts} W"); }
+}
+```
+
 ## 5. Automation Triggers
 
-All fire `Event::TriggerFired`. After a reconnect, triggers are re-created in Home Assistant, so a pending `for` countdown restarts.
+All fire `TriggerFired`. After a reconnect, triggers are re-created in Home Assistant, so a pending `for` countdown restarts.
 
 Builders (preferred), passed to `subscribe_trigger`:
 
@@ -113,21 +143,22 @@ Use these instead of `call_service` for cleaner code. All return `Result<()>`.
 *   All string enums are `#[non_exhaustive]`: `match` needs a wildcard arm.
 
 ### `ha_core_client::events`
-*   `Event` (`#[non_exhaustive]`):
-    *   `StateChanged { entity_id: String, old_state: Option<State>, new_state: Option<State> }`: `old_state` is `None` if the entity was added, `new_state` is `None` if it was removed. `old_state.state` may equal `new_state.state` (attribute-only change, or merged changes).
-    *   `ServiceCalled(ServiceCalledEvent { domain: Domain, service: Service, service_data: Value })`.
-    *   `TriggerFired(TriggerFiredEvent { trigger: Value, context: Option<Value> })` with `platform()`, `description()`, `entity_id()`, `from_state()`, `to_state()`.
-    *   `TemplateRendered { result: Value }`, `TemplateError { message: String, level: String }` (from `subscribe_template`).
-    *   `Silence { entity_id: String, silent: bool }` (from `watch_silence`).
-    *   `Generic { event_type: String, data: Value }`.
-    *   `Status { subscription: Subscription, status: SubscriptionStatus }`: lifecycle of the subscription itself, delivered in order with its data:
-        *   `Interrupted`: the connection was lost. No events until `Restored`, so treat derived data as unknown.
-        *   `Restored`: active again. For `subscribe_entity`, a change missed while disconnected arrives just before as one `StateChanged` (last known → current; `new_state: None` if the entity was removed).
-        *   `Lagged { dropped }`: the callback fell behind. For `subscribe_entity`, `dropped` state changes were merged into the next `StateChanged`; for other subscriptions, the `dropped` oldest events were discarded (queue limit `subscription_queue_size`). Statuses are never dropped.
-        *   `Rejected { code: HaErrorCode, message }`: Home Assistant refused it when restoring after a reconnect. Removed, no more events.
-        *   `Closed`: the client stopped. No more events.
-        *   `Unsubscribed`: cancelled by `unsubscribe()` or a dropped `SubscriptionGuard`. No more events.
-        *   `subscription` can be passed to `client.unsubscribe(...)`, also while offline.
+*   `Update<T>` (`#[non_exhaustive]`, re-exported at the crate root): `Event(T)` (a data event) or `Status { subscription: Subscription, status: SubscriptionStatus }`. Helpers `into_event() -> Option<T>`, `event() -> Option<&T>`, `status() -> Option<&SubscriptionStatus>`. A data event that does not fit the subscription's type (e.g. a malformed payload) is logged with `warn!` and skipped.
+*   Item types by subscription (`events` module):
+    *   `StateChange { entity_id: String, old_state: Option<State>, new_state: Option<State> }` (`subscribe_entity[_with]`, `subscribe_state_changes`): `old_state` is `None` if the entity was added, `new_state` is `None` if it was removed. `old_state.state` may equal `new_state.state` (attribute-only change, or merged changes). Helpers: `is_state_change()` (state string differs, or added/removed), `added()`, `removed()`.
+    *   `ServiceCall { domain: Domain, service: Service, service_data: Value }` (`subscribe_service_calls`).
+    *   `BusEvent { event_type: String, data: Value, origin: Option<String>, time_fired: Option<DateTime<Utc>>, context: Option<Value> }` (`subscribe_events`) with `data_as::<T: DeserializeOwned>() -> Result<T>` (`Error::Decode`). `time_fired` is `None` if absent or unparsable.
+    *   `TriggerFired { trigger: Value, context: Option<Value> }` (`subscribe_trigger[_raw]`) with `platform()`, `description()`, `entity_id()`, `from_state()`, `to_state()`.
+    *   `TemplateUpdate<T = Value>` (`#[non_exhaustive]`; `subscribe_template`, `subscribe_template_as`): `Rendered(T)`, `RenderError { message: String, level: TemplateErrorLevel }` (`Error`/`Warning`/`Other`; the subscription stays active), `DecodeError { result: Value, error: String }`.
+    *   `Silence { entity_id: String, silent: bool }` (`watch_silence`).
+*   `SubscriptionStatus` (`#[non_exhaustive]`; the `status` of `Update::Status`): lifecycle of the subscription itself, delivered in order with its data:
+    *   `Interrupted`: the connection was lost. No events until `Restored`, so treat derived data as unknown.
+    *   `Restored`: active again. For `subscribe_entity`, a change missed while disconnected arrives just before as one `StateChange` (last known → current; `new_state: None` if the entity was removed).
+    *   `Lagged { dropped }`: the callback fell behind. For `subscribe_entity`, `dropped` state changes were merged into the next `StateChange`; for other subscriptions, the `dropped` oldest events were discarded (queue limit `subscription_queue_size`). Statuses are never dropped.
+    *   `Rejected { code: HaErrorCode, message }`: Home Assistant refused it when restoring after a reconnect. Removed, no more events.
+    *   `Closed`: the client stopped. No more events.
+    *   `Unsubscribed`: cancelled by `unsubscribe()` or a dropped `SubscriptionGuard`/`EventStream`. No more events.
+    *   `subscription` can be passed to `client.unsubscribe(...)`, also while offline.
 *   `State { entity_id, state: String, attributes: AttributeSet, last_changed, last_updated, last_reported: Option<_>, context: Value }` with `ha_state() -> HaState`, `domain() -> Option<Domain>` and `last_seen() -> DateTime<Utc>` (`last_reported`, or `last_updated` when it is `None`, as in `get_state` and history results).
 *   `AttributeSet` (`#[non_exhaustive]`): `Climate(Box<ClimateAttributes>)` (only for `climate.*` entities) or `Generic(GenericAttributes { friendly_name, unit_of_measurement, device_class, state_class, rest })`; `friendly_name()`, `get(key) -> Option<Value>` (any attribute as JSON, `None` if missing or null). Unknown keys are in `rest: serde_json::Map`.
 *   `ClimateAttributes { friendly_name, hvac_modes: Option<Vec<HvacMode>> (unknown modes skipped), hvac_action: Option<HvacAction>, current_temperature, current_humidity, temperature, target_temp_low, target_temp_high, target_temp_step, min_temp, max_temp, fan_mode, fan_modes, preset_mode, preset_modes, swing_mode, swing_modes, rest }`. The current HVAC mode is the state (`State::ha_state()`). Structs are `#[non_exhaustive]`: read fields, do not build literals.
@@ -136,10 +167,10 @@ Use these instead of `call_service` for cleaner code. All return `Result<()>`.
 ## 8. Implementation Pattern
 
 ```rust
-use ha_core_client::{HAClient, events::Event, state::HaState};
+use ha_core_client::{HAClient, Update, events::StateChange, state::HaState};
 
-async fn on_motion(client: HAClient, event: Event) -> ha_core_client::CallbackResult {
-    if let Event::StateChanged { new_state: Some(state), .. } = event {
+async fn on_motion(client: HAClient, update: Update<StateChange>) -> ha_core_client::CallbackResult {
+    if let Update::Event(StateChange { new_state: Some(state), .. }) = update {
         if state.ha_state() == HaState::On {
             client.turn_on("light.hallway").await?;
         }
@@ -163,5 +194,5 @@ async fn main() -> anyhow::Result<()> {
 ## 9. Development Notes
 *   **Logging**: through the `log` facade. Use `RUST_LOG=ha_core_client=debug`; `trace` logs raw WebSocket messages (the token is never logged).
 *   **Time**: `chrono::DateTime<Utc>` for timestamps, `std::time::Duration` for trigger `for`, `chrono::TimeDelta` for signed offsets and lookbacks.
-*   **Stale data**: react to `Event::Status` with `SubscriptionStatus::Interrupted`/`Restored` instead of polling `connection_state()`.
+*   **Stale data**: react to `Update::Status` with `SubscriptionStatus::Interrupted`/`Restored` instead of polling `connection_state()`.
 *   **Retries**: `NotConnected` means nothing was sent, so retrying is safe. `ConnectionLost`/`Timeout` mean the outcome is unknown, so check the state before retrying non-idempotent calls.

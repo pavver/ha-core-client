@@ -1,14 +1,14 @@
 //! A strongly-typed, resilient asynchronous client for the Home Assistant WebSocket API.
 //!
 //! ```no_run
-//! use ha_core_client::{HAClient, events::Event};
+//! use ha_core_client::{HAClient, Update};
 //!
 //! # async fn example() -> ha_core_client::Result<()> {
 //! let client = HAClient::connect("ws://homeassistant.local:8123/api/websocket", "TOKEN").await?;
 //!
-//! client.subscribe_entity("binary_sensor.motion", |client, event| async move {
-//!     if let Event::StateChanged { new_state: Some(state), .. } = event {
-//!         if state.state == "on" {
+//! client.subscribe_entity("binary_sensor.motion", |client, update| async move {
+//!     if let Update::Event(change) = update {
+//!         if change.new_state.is_some_and(|state| state.state == "on") {
 //!             client.turn_on("light.hallway").await?;
 //!         }
 //!     }
@@ -29,7 +29,9 @@ pub mod events;
 mod protocol;
 mod queue;
 mod runner;
+mod source;
 pub mod state;
+mod stream;
 mod subscription;
 mod target;
 pub mod triggers;
@@ -37,7 +39,9 @@ pub mod triggers;
 pub use config::ClientConfig;
 pub use error::{Error, HaErrorCode, Result};
 pub use target::Target;
-pub use events::SubscriptionStatus;
+pub use events::{BusEvent, ServiceCall, Silence, State, StateChange, SubscriptionStatus, TemplateUpdate, TriggerFired, Update};
+pub use source::Source;
+pub use stream::EventStream;
 pub use subscription::{BoxError, CallbackResult, EntityChanges, Subscription, SubscriptionGuard};
 
 use std::collections::HashMap;
@@ -53,10 +57,11 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::events::{Event, HistoricalState, State};
+use crate::events::HistoricalState;
 use crate::runner::{Runner, Shared};
 use crate::state::{Domain, Service};
-use crate::subscription::{boxed_callback, Command, SubKind};
+use crate::source::into_update;
+use crate::subscription::{Command, Delivery, EventCallback};
 
 /// How long [`HAClient::stop`] waits for callbacks to handle their queued events.
 const STOP_CALLBACKS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -91,11 +96,28 @@ impl ConnectionState {
 /// which owns the connection, reconnects with backoff and restores subscriptions.
 /// The task stops when [`stop`](Self::stop) is called or when every handle is dropped.
 /// Handles captured by callbacks count too; callbacks don't need to capture one, since
-/// they receive their own handle while they run.
+/// they receive their own handle while they run. A callback that needs a handle outside of
+/// its own run should capture a [`WeakClient`] ([`downgrade`](Self::downgrade)), so that
+/// dropping all user handles still stops the client. An [`EventStream`] and a
+/// [`SubscriptionGuard`] hold a handle too.
 #[derive(Clone)]
 pub struct HAClient {
     cmd_tx: mpsc::Sender<Command>,
     shared: Arc<Shared>,
+}
+
+/// A handle that does not keep the client running, from [`HAClient::downgrade`].
+#[derive(Clone)]
+pub struct WeakClient {
+    cmd_tx: mpsc::WeakSender<Command>,
+    shared: Arc<Shared>,
+}
+
+impl WeakClient {
+    /// The client, or `None` if every [`HAClient`] handle is gone (the client is stopping).
+    pub fn upgrade(&self) -> Option<HAClient> {
+        self.cmd_tx.upgrade().map(|cmd_tx| HAClient { cmd_tx, shared: self.shared.clone() })
+    }
 }
 
 impl HAClient {
@@ -126,6 +148,12 @@ impl HAClient {
         tokio::spawn(runner.run(ws, cmd_rx, shutdown_rx));
 
         Ok(Self { cmd_tx, shared })
+    }
+
+    /// A handle that does not keep the client running. Capture it in callbacks instead of an
+    /// `HAClient`, which would keep the client alive for as long as the subscription exists.
+    pub fn downgrade(&self) -> WeakClient {
+        WeakClient { cmd_tx: self.cmd_tx.downgrade(), shared: self.shared.clone() }
     }
 
     /// The current connection state.
@@ -330,22 +358,69 @@ impl HAClient {
 
     // --- Subscriptions ---
 
+    /// Subscribes to `source` and runs `callback` for each [`Update`]: data events as
+    /// [`Update::Event`], changes of the subscription itself (connection lost, restored, …)
+    /// as [`Update::Status`]. Callbacks of one subscription run one after another, in order.
+    /// The convenience methods (`subscribe_entity`, `subscribe_trigger`, …) are shortcuts.
+    ///
     /// While the client is reconnecting, subscribing succeeds right away: the subscription
     /// starts with `SubscriptionStatus::Interrupted` and is sent once the connection is back
     /// (`Restored`, or `Rejected` if Home Assistant refuses it). The existence check of
     /// `subscribe_entity` is skipped in that case.
-    async fn subscribe_with<F, Fut>(&self, kind: SubKind, request: protocol::Request, callback: F) -> Result<Subscription>
+    ///
+    /// A callback keeps whatever it captures alive for as long as the subscription exists.
+    /// It receives its own [`HAClient`] while it runs, so it does not need to capture one; if
+    /// it must call Home Assistant from elsewhere, capture a [`WeakClient`], otherwise
+    /// dropping the last user handle no longer stops the client.
+    pub async fn subscribe<T, F, Fut>(&self, source: Source<T>, callback: F) -> Result<Subscription>
     where
-        F: Fn(HAClient, Event) -> Fut + Send + Sync + 'static,
+        T: Send + 'static,
+        F: Fn(HAClient, Update<T>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = CallbackResult> + Send + 'static,
     {
-        let callback = boxed_callback(callback);
-        self.call(|responder| Command::Subscribe { kind, request, callback, responder }).await
+        debug!("Subscribing: {}", source.request);
+        let Source { kind, request, convert } = source;
+        // The conversion runs in the subscription's worker, not in the runner.
+        let callback: EventCallback = Arc::new(move |client, event, sub_id| match into_update(convert, event, sub_id) {
+            Some(update) => Box::pin(callback(client, update)),
+            None => Box::pin(std::future::ready(Ok(()))),
+        });
+        let delivery = Delivery::Callback(callback);
+        let subscribed = self.call(|responder| Command::Subscribe { kind, request, delivery, responder }).await?;
+        Ok(subscribed.subscription)
+    }
+
+    /// Subscribes to `source` and returns its updates as a [`Stream`](futures_util::Stream),
+    /// instead of running a callback. Behaves like [`subscribe`](Self::subscribe) otherwise.
+    ///
+    /// ```no_run
+    /// # use ha_core_client::{HAClient, Source, Update};
+    /// # use futures_util::StreamExt;
+    /// # async fn example(client: HAClient) -> ha_core_client::Result<()> {
+    /// let mut stream = client.stream(Source::entity("sensor.temperature")).await?;
+    /// while let Some(update) = stream.next().await {
+    ///     if let Update::Event(change) = update {
+    ///         println!("{} -> {:?}", change.entity_id, change.new_state.map(|s| s.state));
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The stream holds a handle to the client (so it keeps it running) and unsubscribes when
+    /// dropped. See [`EventStream`].
+    pub async fn stream<T: Send + 'static>(&self, source: Source<T>) -> Result<EventStream<T>> {
+        debug!("Subscribing (stream): {}", source.request);
+        let Source { kind, request, convert } = source;
+        let subscribed =
+            self.call(|responder| Command::Subscribe { kind, request, delivery: Delivery::Stream, responder }).await?;
+        let rx = subscribed.rx.ok_or(Error::Stopped)?;
+        Ok(EventStream::new(self.clone(), subscribed.subscription, rx, convert))
     }
 
     /// Subscribes to changes of one entity (state and attributes).
     ///
-    /// The callback receives [`Event::StateChanged`]. Filtering happens in Home Assistant,
+    /// The callback receives [`StateChange`]s. Filtering happens in Home Assistant,
     /// so only this entity's changes are transferred. Callbacks of one subscription run
     /// one after another, in order.
     ///
@@ -354,16 +429,16 @@ impl HAClient {
     /// [`subscribe_trigger`](Self::subscribe_trigger) with a [`StateTrigger`](triggers::StateTrigger) instead.
     ///
     /// After a reconnect the entity's state is re-read: if it changed while disconnected,
-    /// the callback gets one `StateChanged` from the last known to the current state,
-    /// followed by [`Event::Status`] with [`SubscriptionStatus::Restored`].
+    /// the callback gets one `StateChange` from the last known to the current state,
+    /// followed by [`Update::Status`] with [`SubscriptionStatus::Restored`].
     ///
     /// Same as [`subscribe_entity_with`](Self::subscribe_entity_with) with [`EntityChanges::Any`].
     pub async fn subscribe_entity<F, Fut>(&self, entity_id: &str, callback: F) -> Result<Subscription>
     where
-        F: Fn(HAClient, Event) -> Fut + Send + Sync + 'static,
+        F: Fn(HAClient, Update<StateChange>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = CallbackResult> + Send + 'static,
     {
-        self.subscribe_entity_with(entity_id, EntityChanges::Any, callback).await
+        self.subscribe(Source::entity(entity_id), callback).await
     }
 
     /// Like [`subscribe_entity`](Self::subscribe_entity), choosing which updates arrive:
@@ -376,42 +451,46 @@ impl HAClient {
         callback: F,
     ) -> Result<Subscription>
     where
-        F: Fn(HAClient, Event) -> Fut + Send + Sync + 'static,
+        F: Fn(HAClient, Update<StateChange>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = CallbackResult> + Send + 'static,
     {
-        debug!("Subscribing to entity: {} ({:?})", entity_id, changes);
-        let mut trigger = serde_json::json!({ "trigger": "state", "entity_id": entity_id });
-        if changes == EntityChanges::State {
-            // `to: null` makes Home Assistant skip attribute-only changes.
-            trigger["to"] = Value::Null;
-        }
-        let kind = SubKind::EntityState { entity_id: entity_id.to_string(), changes };
-        self.subscribe_with(kind, protocol::subscribe_trigger(&trigger), callback).await
+        self.subscribe(Source::entity_with(entity_id, changes), callback).await
     }
 
-    /// Subscribes to bus events of one type (`state_changed`, `call_service`, custom events, …).
-    ///
-    /// Note that `state_changed` delivers every state change in the system; prefer
-    /// [`subscribe_entity`](Self::subscribe_entity) for single entities.
-    pub async fn subscribe_events<F, Fut>(&self, event_type: &str, callback: F) -> Result<Subscription>
+    /// Subscribes to every state change in the system (the `state_changed` bus event).
+    /// Prefer [`subscribe_entity`](Self::subscribe_entity) for single entities: this one
+    /// transfers all of them, and has no existence check, resync after reconnects or merging.
+    pub async fn subscribe_state_changes<F, Fut>(&self, callback: F) -> Result<Subscription>
     where
-        F: Fn(HAClient, Event) -> Fut + Send + Sync + 'static,
+        F: Fn(HAClient, Update<StateChange>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = CallbackResult> + Send + 'static,
     {
-        debug!("Subscribing to events: {}", event_type);
-        self.subscribe_with(SubKind::Events, protocol::subscribe_events(event_type), callback).await
+        self.subscribe(Source::state_changes(), callback).await
+    }
+
+    /// Subscribes to bus events of one type (custom events, …), delivered as [`BusEvent`]s.
+    ///
+    /// `state_changed` and `call_service` are not special-cased here; use
+    /// [`subscribe_state_changes`](Self::subscribe_state_changes) and
+    /// [`subscribe_service_calls`](Self::subscribe_service_calls) for typed events.
+    pub async fn subscribe_events<F, Fut>(&self, event_type: &str, callback: F) -> Result<Subscription>
+    where
+        F: Fn(HAClient, Update<BusEvent>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = CallbackResult> + Send + 'static,
+    {
+        self.subscribe(Source::events(event_type), callback).await
     }
 
     /// Subscribes to all `call_service` events on the Home Assistant event bus.
     pub async fn subscribe_service_calls<F, Fut>(&self, callback: F) -> Result<Subscription>
     where
-        F: Fn(HAClient, Event) -> Fut + Send + Sync + 'static,
+        F: Fn(HAClient, Update<ServiceCall>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = CallbackResult> + Send + 'static,
     {
-        self.subscribe_events("call_service", callback).await
+        self.subscribe(Source::service_calls(), callback).await
     }
 
-    /// Subscribes to a Home Assistant trigger. The callback receives [`Event::TriggerFired`].
+    /// Subscribes to a Home Assistant trigger. The callback receives [`TriggerFired`]s.
     ///
     /// Accepts a [`triggers::Trigger`] or any of its platform structs, e.g.
     /// `StateTrigger::new("binary_sensor.door").to(HaState::On).for_duration(..)`.
@@ -423,13 +502,10 @@ impl HAClient {
         callback: F,
     ) -> Result<Subscription>
     where
-        F: Fn(HAClient, Event) -> Fut + Send + Sync + 'static,
+        F: Fn(HAClient, Update<TriggerFired>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = CallbackResult> + Send + 'static,
     {
-        let trigger = trigger.into();
-        debug!("Subscribing to trigger: {:?}", trigger);
-        let trigger = serde_json::to_value(trigger)?;
-        self.subscribe_trigger_raw(trigger, callback).await
+        self.subscribe(Source::trigger(trigger), callback).await
     }
 
     /// Subscribes to a trigger given as raw JSON, for trigger platforms and options
@@ -438,36 +514,44 @@ impl HAClient {
     /// Fails with [`Error::InvalidInput`] if `trigger` is not a JSON object.
     pub async fn subscribe_trigger_raw<F, Fut>(&self, trigger: Value, callback: F) -> Result<Subscription>
     where
-        F: Fn(HAClient, Event) -> Fut + Send + Sync + 'static,
+        F: Fn(HAClient, Update<TriggerFired>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = CallbackResult> + Send + 'static,
     {
-        if !trigger.is_object() {
-            return Err(Error::InvalidInput(format!("a trigger must be a JSON object, got {trigger}")));
-        }
-        self.subscribe_with(SubKind::Trigger, protocol::subscribe_trigger(&trigger), callback).await
+        self.subscribe(Source::trigger_raw(trigger)?, callback).await
     }
 
     /// Subscribes to a template rendered by Home Assistant. The callback receives
-    /// [`Event::TemplateRendered`] with the current result right after subscribing, then
-    /// each time the result changes, and [`Event::TemplateError`] if a later render fails.
+    /// [`TemplateUpdate::Rendered`] with the current result right after subscribing, then
+    /// each time the result changes, and [`TemplateUpdate::RenderError`] if a later render fails.
     ///
     /// Home Assistant re-renders when a referenced entity changes, and at the start of
     /// every minute if the template uses `now()`. Results are parsed like in automations
     /// (`"{{ 1 + 1 }}"` gives the number `2`). A syntax error fails the subscription with
-    /// [`Error::Ha`]; a render that fails (`{{ 1 / 0 }}`) arrives as `TemplateError`.
+    /// [`Error::Ha`]; a render that fails (`{{ 1 / 0 }}`) arrives as `RenderError`.
     ///
     /// After a reconnect the template is rendered again, so the current result follows
     /// [`SubscriptionStatus::Restored`], also if it did not change.
     pub async fn subscribe_template<F, Fut>(&self, template: &str, callback: F) -> Result<Subscription>
     where
-        F: Fn(HAClient, Event) -> Fut + Send + Sync + 'static,
+        F: Fn(HAClient, Update<TemplateUpdate>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = CallbackResult> + Send + 'static,
     {
-        debug!("Subscribing to template: {}", template);
-        self.subscribe_with(SubKind::Template, protocol::render_template(template), callback).await
+        self.subscribe(Source::template(template), callback).await
     }
 
-    /// Watches whether an entity keeps reporting: the callback receives [`Event::Silence`]
+    /// Like [`subscribe_template`](Self::subscribe_template), decoding each result into `T`
+    /// (`f64`, `bool`, `String`, a struct, …). A result that does not fit arrives as
+    /// [`TemplateUpdate::DecodeError`].
+    pub async fn subscribe_template_as<T, F, Fut>(&self, template: &str, callback: F) -> Result<Subscription>
+    where
+        T: DeserializeOwned + Send + 'static,
+        F: Fn(HAClient, Update<TemplateUpdate<T>>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = CallbackResult> + Send + 'static,
+    {
+        self.subscribe(Source::template_as::<T>(template), callback).await
+    }
+
+    /// Watches whether an entity keeps reporting: the callback receives [`Silence`]
     /// with `silent: true` once it has not reported for longer than `max_silence`, and
     /// `silent: false` when it reports again. The current value arrives right after
     /// subscribing and after every reconnect (following `Restored`).
@@ -481,13 +565,10 @@ impl HAClient {
     /// Fails with [`Error::InvalidInput`] for a malformed entity id.
     pub async fn watch_silence<F, Fut>(&self, entity_id: &str, max_silence: Duration, callback: F) -> Result<Subscription>
     where
-        F: Fn(HAClient, Event) -> Fut + Send + Sync + 'static,
+        F: Fn(HAClient, Update<Silence>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = CallbackResult> + Send + 'static,
     {
-        let template = silence_template(entity_id, max_silence)?;
-        debug!("Watching silence of {} ({:?})", entity_id, max_silence);
-        let kind = SubKind::Silence { entity_id: entity_id.to_string() };
-        self.subscribe_with(kind, protocol::render_template(&template), callback).await
+        self.subscribe(Source::silence(entity_id, max_silence)?, callback).await
     }
 
     /// Cancels a subscription. Events already queued for its callback are still delivered,
@@ -551,21 +632,6 @@ fn parse_history(result: Value, entity_id: &str) -> serde_json::Result<Vec<Histo
         .collect())
 }
 
-/// The template of [`HAClient::watch_silence`]: renders `true` while the entity is missing
-/// or its last report is older than `max_silence`. The id is checked because it is part of
-/// the template. The object id is subscripted, since `states.sensor.1st_floor` is a
-/// Jinja syntax error.
-fn silence_template(entity_id: &str, max_silence: Duration) -> Result<String> {
-    let part_ok = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
-    match entity_id.split_once('.') {
-        Some((domain, object_id)) if part_ok(domain) && part_ok(object_id) => Ok(format!(
-            "{{% set s = states.{domain}['{object_id}'] %}}{{{{ s is none or (now() - s.last_reported).total_seconds() > {} }}}}",
-            max_silence.as_secs_f64()
-        )),
-        _ => Err(Error::InvalidInput(format!("invalid entity_id: {entity_id}"))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,18 +646,5 @@ mod tests {
         let states: Vec<_> = parse_history(result, "sensor.t").unwrap().into_iter().map(|h| h.state).collect();
         assert_eq!(states, ["1", "3"]);
         assert!(parse_history(serde_json::json!({}), "sensor.t").unwrap().is_empty());
-    }
-
-    #[test]
-    fn silence_template_checks_the_entity_id() {
-        assert_eq!(
-            silence_template("sensor.outdoor_2", Duration::from_secs(1800)).unwrap(),
-            "{% set s = states.sensor['outdoor_2'] %}{{ s is none or (now() - s.last_reported).total_seconds() > 1800 }}"
-        );
-        // Object ids may start with a digit.
-        assert!(silence_template("sensor.1st_floor", Duration::from_secs(1)).unwrap().contains("states.sensor['1st_floor']"));
-        for bad in ["sensor", "sensor.", ".x", "sensor.x }}{{ 1", "Sensor.x", "sensor.x.y"] {
-            assert!(matches!(silence_template(bad, Duration::from_secs(1)), Err(Error::InvalidInput(_))), "{bad}");
-        }
     }
 }

@@ -6,8 +6,9 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 
 use crate::error::Result;
-use crate::events::{Event, State};
+use crate::events::{State, SubEvent};
 use crate::protocol::Request;
+use crate::queue::QueueRx;
 use crate::HAClient;
 
 /// The error type callbacks return. Any `std::error::Error + Send + Sync` (including
@@ -74,15 +75,24 @@ impl Drop for SubscriptionGuard {
     }
 }
 
+/// Runs a subscription's callback for one event. The last argument is the subscription id
+/// (for log messages); the conversion into the user's type happens inside, in the worker.
 pub(crate) type EventCallback =
-    Arc<dyn Fn(HAClient, Event) -> Pin<Box<dyn Future<Output = CallbackResult> + Send>> + Send + Sync>;
+    Arc<dyn Fn(HAClient, SubEvent, u64) -> Pin<Box<dyn Future<Output = CallbackResult> + Send>> + Send + Sync>;
 
-pub(crate) fn boxed_callback<F, Fut>(callback: F) -> EventCallback
-where
-    F: Fn(HAClient, Event) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = CallbackResult> + Send + 'static,
-{
-    Arc::new(move |client, event| Box::pin(callback(client, event)))
+/// How the events of a subscription reach the user.
+pub(crate) enum Delivery {
+    /// A worker task runs the callback for each event.
+    Callback(EventCallback),
+    /// The queue's receiving end is handed to the caller (an [`EventStream`](crate::EventStream)).
+    Stream,
+}
+
+/// The answer to a `Subscribe` command.
+pub(crate) struct Subscribed {
+    pub(crate) subscription: Subscription,
+    /// The queue of a [`Delivery::Stream`] subscription.
+    pub(crate) rx: Option<QueueRx>,
 }
 
 /// Which updates of an entity [`HAClient::subscribe_entity_with`] delivers.
@@ -102,30 +112,36 @@ pub enum EntityChanges {
     State,
 }
 
-/// How the payloads of a subscription are turned into [`Event`]s.
+/// How the payloads of a subscription are turned into [`SubEvent`]s.
 #[derive(Clone, Debug)]
 pub(crate) enum SubKind {
-    /// `subscribe_events`: bus events.
+    /// `subscribe_events`: bus events, reported as `SubEvent::Bus`.
     Events,
-    /// `subscribe_trigger` with a `state` trigger, reported as `Event::StateChanged`.
+    /// `subscribe_events` for `state_changed`, reported as `SubEvent::StateChanged`.
+    StateChangedEvents,
+    /// `subscribe_events` for `call_service`, reported as `SubEvent::ServiceCall`.
+    ServiceCallEvents,
+    /// `subscribe_trigger` with a `state` trigger, reported as `SubEvent::StateChanged`.
     /// The entity's state is re-read after every reconnect.
     EntityState { entity_id: String, changes: EntityChanges },
-    /// Any other `subscribe_trigger`, reported as `Event::TriggerFired`.
+    /// Any other `subscribe_trigger`, reported as `SubEvent::TriggerFired`.
     Trigger,
-    /// `render_template`, reported as `Event::TemplateRendered`.
+    /// `render_template`, reported as `SubEvent::TemplateRendered`.
     Template,
-    /// The `render_template` of `watch_silence`, reported as `Event::Silence`.
+    /// The `render_template` of `watch_silence`, reported as `SubEvent::Silence`.
     Silence { entity_id: String },
 }
 
 impl SubKind {
-    pub(crate) fn convert(&self, payload: Value) -> Event {
+    pub(crate) fn convert(&self, payload: Value) -> SubEvent {
         match self {
-            SubKind::Events => Event::from_bus_event(payload),
-            SubKind::EntityState { .. } => Event::from_entity_trigger(payload),
-            SubKind::Trigger => Event::TriggerFired(crate::events::TriggerFiredEvent::from_payload(payload)),
-            SubKind::Template => Event::from_template(payload),
-            SubKind::Silence { entity_id } => Event::from_silence(entity_id, payload),
+            SubKind::Events => SubEvent::from_bus_event(payload),
+            SubKind::StateChangedEvents => SubEvent::from_state_changed(payload),
+            SubKind::ServiceCallEvents => SubEvent::from_service_call(payload),
+            SubKind::EntityState { .. } => SubEvent::from_entity_trigger(payload),
+            SubKind::Trigger => SubEvent::TriggerFired(crate::events::TriggerFired::from_payload(payload)),
+            SubKind::Template => SubEvent::from_template(payload),
+            SubKind::Silence { entity_id } => SubEvent::from_silence(entity_id, payload),
         }
     }
 }
@@ -144,8 +160,8 @@ pub(crate) enum Command {
     Subscribe {
         kind: SubKind,
         request: Request,
-        callback: EventCallback,
-        responder: oneshot::Sender<Result<Subscription>>,
+        delivery: Delivery,
+        responder: oneshot::Sender<Result<Subscribed>>,
     },
     Unsubscribe {
         id: u64,
