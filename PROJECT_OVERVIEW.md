@@ -54,6 +54,8 @@ Below is a list of Home Assistant WebSocket API features that are not yet implem
 *   Legacy removed (breaking, agreed): positional `subscribe_*_trigger` helpers (builders + `subscribe_trigger` instead); `Historical*Attributes` (history carries full attributes, checked on 2026.9.4, so `HistoricalState` uses `AttributeSet`). `ClimateAttributes` gained `friendly_name`, `hvac_action`, target range and current modes, `rest` is a `Map`, unknown `hvac_modes` are skipped; attribute types are `#[non_exhaustive]`.
 *   New scenarios in `tests/client.rs` for each runner change.
 
+*   Repository: GitHub Actions CI (clippy with `-D warnings`, tests, rustls backend, MSRV 1.85 check), Dependabot, release tags `v0.2.0`/`v0.3.0` with GitHub Releases; docs pin the tag.
+
 See [CHANGELOG.md](CHANGELOG.md) for the migration guide from 0.2.
 
 ### October 28, 2026 (0.2.0: Production Hardening)

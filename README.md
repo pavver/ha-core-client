@@ -1,5 +1,7 @@
 # Home Assistant Core Client (ha-core-client)
 
+[![CI](https://github.com/pavver/ha-core-client/actions/workflows/ci.yml/badge.svg)](https://github.com/pavver/ha-core-client/actions/workflows/ci.yml)
+
 A strongly-typed, ergonomic, and resilient asynchronous Rust client for the Home Assistant WebSocket API.
 
 ## Key Features
@@ -21,10 +23,12 @@ Home Assistant **2024.10 or newer**: triggers are sent with the `trigger` key (o
 
 ```toml
 [dependencies]
-ha-core-client = { git = "https://github.com/pavver/ha-core-client" }
+ha-core-client = { git = "https://github.com/pavver/ha-core-client", tag = "v0.3.0" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 ```
+
+Pin a release tag ([releases](https://github.com/pavver/ha-core-client/releases)); `master` may contain breaking changes.
 
 ```rust
 use ha_core_client::{HAClient, events::Event};
