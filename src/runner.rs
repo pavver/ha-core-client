@@ -48,7 +48,8 @@ struct SubEntry {
     /// `Interrupted` was delivered and `Restored` not yet.
     interrupted: bool,
     /// Last state seen by an entity subscription, to detect changes missed while disconnected.
-    last_state: Option<State>,
+    /// `None` until known; `Some(None)` while the entity does not exist (it was removed).
+    last_state: Option<Option<State>>,
     /// Events of an entity subscription that arrive while its state is re-read after a
     /// reconnect. Delivered after `Restored`, without those the re-read already covers.
     held: Option<Vec<Event>>,
@@ -746,11 +747,11 @@ impl Runner {
                 let _ = r.send(Err(Error::Ha { code: "not_found".into(), message }));
                 return ha_id;
             }
-            entry.last_state = current;
+            entry.last_state = Some(current);
             return self.confirm(sub_id, r);
         }
-        let missed = restoring && changed(entry.last_state.as_ref(), current.as_ref());
-        let old_state = std::mem::replace(&mut entry.last_state, current.clone());
+        let missed = restoring && changed(entry.last_state.as_ref().map(Option::as_ref), current.as_ref());
+        let old_state = entry.last_state.replace(current.clone()).flatten();
         if missed {
             entry.events.push(Event::StateChanged { entity_id, old_state, new_state: current });
         }
@@ -832,10 +833,10 @@ impl SubEntry {
     /// state re-read and the trigger) or, with `or_older`, an earlier one.
     fn push_entity_event(&mut self, event: Event, or_older: bool) {
         if let (SubKind::EntityState { .. }, Event::StateChanged { new_state, .. }) = (&self.kind, &event) {
-            if covered(self.last_state.as_ref(), new_state.as_ref(), or_older) {
+            if covered(self.last_state.as_ref().and_then(Option::as_ref), new_state.as_ref(), or_older) {
                 return;
             }
-            self.last_state = new_state.clone();
+            self.last_state = Some(new_state.clone());
         }
         self.events.push(event);
     }
@@ -860,9 +861,14 @@ fn covered(last: Option<&State>, new: Option<&State>, or_older: bool) -> bool {
     }
 }
 
-/// Whether the entity differs from the last known state. Without a baseline nothing is reported.
-fn changed(last: Option<&State>, current: Option<&State>) -> bool {
-    last.is_some() && !covered(last, current, false)
+/// Whether the entity differs from the last known state (`Some(None)`: known not to
+/// exist). Without a baseline (`None`) nothing is reported.
+fn changed(last: Option<Option<&State>>, current: Option<&State>) -> bool {
+    match last {
+        None => false,
+        Some(None) => current.is_some(),
+        Some(Some(last)) => !covered(Some(last), current, false),
+    }
 }
 
 /// Resolves once shutdown is requested. Returns `()` so no (non-`Send`) watch guard
@@ -1004,10 +1010,13 @@ mod tests {
     fn change_detection() {
         let s = |state: &str, lu: f64| State::from_compressed("sensor.x", &json!({"s": state, "lc": lu, "lu": lu})).unwrap();
         assert!(!changed(None, Some(&s("1", 1.0))));
-        assert!(changed(Some(&s("1", 1.0)), None));
-        assert!(changed(Some(&s("1", 1.0)), Some(&s("2", 1.0))));
-        assert!(changed(Some(&s("1", 1.0)), Some(&s("1", 2.0))));
-        assert!(!changed(Some(&s("1", 1.0000004)), Some(&s("1", 1.0))));
+        assert!(changed(Some(Some(&s("1", 1.0))), None));
+        assert!(changed(Some(Some(&s("1", 1.0))), Some(&s("2", 1.0))));
+        assert!(changed(Some(Some(&s("1", 1.0))), Some(&s("1", 2.0))));
+        assert!(!changed(Some(Some(&s("1", 1.0000004))), Some(&s("1", 1.0))));
+        // Removed, then re-added while disconnected.
+        assert!(changed(Some(None), Some(&s("1", 1.0))));
+        assert!(!changed(Some(None), None));
     }
 
     #[test]

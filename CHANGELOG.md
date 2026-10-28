@@ -10,6 +10,7 @@
 *   The reconnect backoff started over after every successful connect, so a connection that Home Assistant (or a proxy) dropped right after `auth_ok` was retried at the shortest delay forever. It now starts over only after a session that stayed up for the longest backoff delay (at most a minute); `ConnectionState::Reconnecting { attempt }` keeps counting until then.
 *   `subscribe_entity` (subscribe, then read the state) gave each step its own `request_timeout`, so it could take up to twice as long, and the caller's own timeout fired first with `Timeout` while the subscription was still being set up. Both steps now share one deadline.
 *   The request timeout did not cover waiting for room in the command queue, so a call could wait indefinitely while the client task was busy.
+*   `subscribe_entity` did not report an entity that was removed and then added back while disconnected: after a removal the last known state was lost, so the re-read had nothing to compare with. The callback now gets `StateChanged { old_state: None, new_state: Some(..) }` before `Restored`.
 
 ## 0.3.0
 

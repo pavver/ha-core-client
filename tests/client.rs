@@ -362,6 +362,26 @@ async fn removed_entity_is_reported_after_reconnect() {
 }
 
 #[tokio::test]
+async fn entity_added_back_while_disconnected_is_reported() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let (mut rx, sub_id) = subscribe_collecting(&client, &mut conn, "sensor.a").await;
+    let mut removed = entity_trigger_event("sensor.a", "1", "1");
+    removed["variables"]["trigger"]["to_state"] = Value::Null;
+    conn.event(&sub_id, removed).await;
+    assert_eq!(recv_within(&mut rx).await, "1->-");
+    conn.ws.close(None).await.unwrap();
+    assert_eq!(recv_within(&mut rx).await, "Interrupted");
+
+    let mut conn = ha.accept().await;
+    let sub = conn.recv_type("subscribe_trigger").await;
+    conn.ok(&sub["id"], Value::Null).await;
+    answer_state_read(&mut conn, "sensor.a", "2", 200.0).await;
+    assert_eq!(recv_within(&mut rx).await, "-->2");
+    assert_eq!(recv_within(&mut rx).await, "Restored");
+}
+
+#[tokio::test]
 async fn trigger_subscriptions_get_interrupted_and_restored() {
     let ha = MockHa::start().await;
     let (client, mut conn) = ha.connect(ha.config()).await;
