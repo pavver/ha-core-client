@@ -10,6 +10,7 @@ A strongly-typed, ergonomic, and resilient asynchronous Rust client for the Home
 *   **Server-side filtering**: `subscribe_entity` receives only that entity's changes, not every state change in the house.
 *   **Ordered callbacks**: callbacks of one subscription run one after another, in event order; each receives an `HAClient` handle to make further calls.
 *   **Triggers**: State, Numeric State, Sun (with negative offsets), Time, Time Pattern, Template, Zone (with builders), plus raw JSON for any other platform.
+*   **Templates**: subscribe to a template rendered by Home Assistant, and detect sensors that stopped reporting (`watch_silence`) without polling.
 *   **History**: entity history and the state at a past point in time.
 
 ## Supported Home Assistant versions
@@ -64,6 +65,7 @@ use std::time::Duration;
 use ha_core_client::{ClientConfig, HAClient};
 
 let config = ClientConfig::new("wss://ha.example.com/api/websocket", "TOKEN")
+    .connect_timeout(Duration::from_secs(10))   // default 10s
     .request_timeout(Duration::from_secs(10))   // default 30s
     .ping_interval(Duration::from_secs(30))     // default 30s
     .pong_timeout(Duration::from_secs(10))      // default 10s
@@ -138,8 +140,12 @@ While reconnecting, requests fail fast with `Error::NotConnected`, but new subsc
 *   `watch_silence("sensor.outdoor", Duration::from_secs(1800), callback)`: `Event::Silence { silent }` when a sensor has not reported (even an unchanged value) for longer than the given time, and when it reports again. Checked in Home Assistant, with no polling.
 *   `subscribe_template("{{ states('sensor.x') | float * 2 }}", callback)`: `Event::TemplateRendered { result }` with the current result and on every change.
 *   `subscribe_events(event_type, callback)`, `subscribe_service_calls(callback)`: bus events.
-*   `subscribe_trigger(trigger, callback)`, `subscribe_trigger_raw(json, callback)`: any trigger, as `Event::TriggerFired`. Builders: `StateTrigger::new("binary_sensor.door").to(HaState::On).for_duration(..)`, `NumericStateTrigger::new(..).above(..)`, `TimePatternTrigger::new().minutes("/5")`, …
-*   Builders for every typed platform: `StateTrigger`, `NumericStateTrigger`, `SunTrigger`, `TimeTrigger`, `TimePatternTrigger`, `TemplateTrigger`, `ZoneTrigger`.
+*   `subscribe_trigger(trigger, callback)`: a trigger built with `StateTrigger`, `NumericStateTrigger`, `SunTrigger`, `TimeTrigger`, `TimePatternTrigger`, `TemplateTrigger` or `ZoneTrigger` (`triggers` module), as `Event::TriggerFired`:
+    ```rust
+    client.subscribe_trigger(StateTrigger::new("binary_sensor.door").to(HaState::On).for_duration(Duration::from_secs(60)), callback).await?;
+    client.subscribe_trigger(TimePatternTrigger::new().minutes("/5"), callback).await?;
+    ```
+*   `subscribe_trigger_raw(json!({"trigger": "mqtt", "topic": "x"}), callback)`: any other platform (see [TRIGGERS_OVERVIEW.md](TRIGGERS_OVERVIEW.md)).
 *   `unsubscribe(subscription)`, or `subscription.guard(&client)` to unsubscribe on drop.
 
 ### Domain Helpers
