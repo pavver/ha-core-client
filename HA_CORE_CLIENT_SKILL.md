@@ -7,7 +7,7 @@ This document serves as a comprehensive technical guide for AI agents to write a
 *   **`HAClient`**: a lightweight, **cloneable** handle. Clone it freely; every clone talks to the same background task.
 *   **Background task**: owns the WebSocket, reconnects with backoff, restores subscriptions, pings to detect dead connections.
 *   **Lifetime**: the task stops on `stop()`, on a permanently rejected token, or when **every handle is dropped**. Keep a handle alive (e.g. `client.closed().await`).
-*   **Callbacks** are `async`, receive their own `HAClient`, and may call the API (no deadlocks). Callbacks of one subscription run **sequentially, in event order**; to process events concurrently, `tokio::spawn` inside the callback.
+*   **Callbacks** are `async`, receive their own `HAClient`, and may call the API (no deadlocks). Callbacks of one subscription run **sequentially, in event order**; to process events concurrently, `tokio::spawn` inside the callback. Keep callbacks short: a slow callback makes entity subscriptions merge state changes and other subscriptions drop old events (`SubscriptionStatus::Lagged`), and runs longer than 5s are logged as warnings.
 
 ## 2. Library Setup
 
@@ -41,8 +41,8 @@ All client methods return `ha_core_client::Result<T>` = `Result<T, ha_core_clien
 ### Lifecycle
 *   `async fn connect(url: impl Into<String>, token: impl Into<String>) -> Result<HAClient>`: connects and authenticates; the first attempt is not retried.
 *   `async fn connect_with(config: ClientConfig) -> Result<HAClient>`.
-*   `ClientConfig::new(url, token)` with builder methods `.connect_timeout(Duration)` (10s), `.request_timeout(Duration)` (30s), `.ping_interval(Duration)` (30s), `.pong_timeout(Duration)` (10s), `.reconnect_delay(min, max)` (1s, 60s).
-*   `async fn stop(&self)`: stops the client for all handles.
+*   `ClientConfig::new(url, token)` with builder methods `.connect_timeout(Duration)` (10s), `.request_timeout(Duration)` (30s), `.ping_interval(Duration)` (30s), `.pong_timeout(Duration)` (10s, also bounds each write), `.reconnect_delay(min, max)` (1s, 60s), `.subscription_queue_size(usize)` (1024), `.slow_callback_warning(Duration)` (5s; `ZERO` disables). Durations are capped at one year (`Duration::MAX` is fine).
+*   `async fn stop(&self)`: stops the client for all handles. Subscriptions receive `SubscriptionStatus::Closed`.
 *   `async fn closed(&self) -> ConnectionState`: waits for `Stopped` or `AuthFailed`.
 *   `fn connection_state(&self) -> ConnectionState`, `fn watch_connection_state(&self) -> tokio::sync::watch::Receiver<ConnectionState>`.
 *   `ConnectionState`: `Connected`, `Reconnecting { attempt: u32 }`, `AuthFailed(String)`, `Stopped`; `is_terminal()`.
@@ -60,9 +60,9 @@ All client methods return `ha_core_client::Result<T>` = `Result<T, ha_core_clien
 ### Subscriptions
 Callback bound: `F: Fn(HAClient, events::Event) -> Fut + Send + Sync + 'static`, `Fut: Future<Output = anyhow::Result<()>> + Send + 'static`. Errors returned by a callback are logged.
 
-Each `subscribe_*` returns `Result<Subscription>` after Home Assistant accepts it (an invalid configuration returns `Error::Ha`).
+Each `subscribe_*` returns `Result<Subscription>` after Home Assistant accepts it (an invalid configuration returns `Error::Ha`). While reconnecting, subscribing succeeds immediately: the subscription starts with `Interrupted` and is sent when the connection is back.
 
-*   `subscribe_entity(entity_id: &str, cb)`: `Event::StateChanged` for that entity only (state and attribute changes, filtered server-side).
+*   `subscribe_entity(entity_id: &str, cb)`: `Event::StateChanged` for that entity only (state and attribute changes, filtered server-side). Fails with `Error::Ha { code: "not_found", .. }` if the entity does not exist; use `subscribe_state_trigger` for entities that may appear later.
 *   `subscribe_events(event_type: &str, cb)`: bus events. `state_changed` → `Event::StateChanged` (**every** entity), `call_service` → `Event::ServiceCalled`, others → `Event::Generic`.
 *   `subscribe_service_calls(cb)`: same as `subscribe_events("call_service", cb)`.
 *   `subscribe_trigger(trigger: triggers::Trigger, cb)`, `subscribe_trigger_raw(trigger: serde_json::Value, cb)`: `Event::TriggerFired`.
@@ -71,7 +71,7 @@ Each `subscribe_*` returns `Result<Subscription>` after Home Assistant accepts i
 
 ## 5. Automation Triggers
 
-All fire `Event::TriggerFired`.
+All fire `Event::TriggerFired`. After a reconnect, triggers are re-created in Home Assistant, so a pending `for` countdown restarts.
 
 *   `subscribe_state_trigger(entity_id: &str, to: Option<HaState>, from: Option<HaState>, for_duration: Option<std::time::Duration>, cb)`
 *   `subscribe_numeric_state_trigger(entity_id: &str, above: Option<f64>, below: Option<f64>, for_duration: Option<std::time::Duration>, cb)`
@@ -97,7 +97,7 @@ Use these instead of `call_service` for cleaner code. All return `Result<()>`.
 
 ### `ha_core_client::state`
 *   `Domain`, `Service`: known variants (`Domain::Light`, `Domain::HomeAssistant`, …, `Service::TurnOn`, `Service::Reload`, …) plus `Other(String)`. `From<&str>`, `Display` gives the wire string, `Domain::of_entity("light.x")`.
-*   `HaState`: `On`, `Off`, `Unavailable`, `Unknown`, `Home`, `NotHome`, `Alarm(AlarmState)`, `Climate(HvacMode)`, `Cover(CoverState)`, `Lock(LockState)`, `Number(f64)`, `String(String)`. `HaState::from_string(&str)`; serializes as the plain state string.
+*   `HaState`: `On`, `Off`, `Unavailable`, `Unknown`, `Home`, `NotHome`, `Alarm(AlarmState)`, `Climate(HvacMode)`, `Cover(CoverState)`, `Lock(LockState)`, `Number(f64)`, `String(String)`. `HaState::from_string(&str)` (domain-agnostic), `HaState::parse_for_domain(&Domain, &str)` (resolves e.g. `open` for lock vs cover); `State::ha_state()` uses the entity's domain. Serializes as the plain state string.
 *   `climate::{HvacMode, FanMode, SwingMode, PresetMode}`. `HvacMode` is closed; the others have `Other(String)`.
 *   `device_class::DeviceClass`, `state_class::StateClass`, `common::UnitOfMeasurement`: all with `Other(String)`.
 *   All string enums are `#[non_exhaustive]`: `match` needs a wildcard arm.
@@ -108,6 +108,13 @@ Use these instead of `call_service` for cleaner code. All return `Result<()>`.
     *   `ServiceCalled(ServiceCalledEvent { domain, service, service_data })`.
     *   `TriggerFired(TriggerFiredEvent { trigger: Value, context: Option<Value> })` with `platform()`, `description()`, `entity_id()`, `from_state()`, `to_state()`.
     *   `Generic { event_type: String, data: Value }`.
+    *   `Status { subscription: Subscription, status: SubscriptionStatus }`: lifecycle of the subscription itself, delivered in order with its data:
+        *   `Interrupted`: the connection was lost. No events until `Restored`, so treat derived data as unknown.
+        *   `Restored`: active again. For `subscribe_entity`, a change missed while disconnected arrives just before as one `StateChanged` (last known → current; `new_state: None` if the entity was removed).
+        *   `Lagged { dropped }`: the callback fell behind. For `subscribe_entity`, `dropped` state changes were merged into the next `StateChanged`; for other subscriptions, the `dropped` oldest events were discarded (queue limit `subscription_queue_size`). Statuses are never dropped.
+        *   `Rejected { code, message }`: Home Assistant refused it when restoring after a reconnect. Removed, no more events.
+        *   `Closed`: the client stopped. No more events.
+        *   `subscription` can be passed to `client.unsubscribe(...)`, also while offline.
 *   `State { entity_id, state: String, attributes: AttributeSet, last_changed, last_updated, last_reported: Option<_>, context: Value }` with `ha_state() -> HaState` and `domain() -> Option<Domain>`.
 *   `AttributeSet`: `Climate(ClimateAttributes)` or `Generic(GenericAttributes { friendly_name, unit_of_measurement, device_class, state_class, rest })`; `friendly_name()`. Unknown keys are in `rest`.
 *   `HistoricalState { entity_id, state, attributes: HistoricalAttributeSet, last_changed, last_updated }`.
@@ -142,4 +149,5 @@ async fn main() -> anyhow::Result<()> {
 ## 9. Development Notes
 *   **Logging**: through the `log` facade. Use `RUST_LOG=ha_core_client=debug`; `trace` logs raw WebSocket messages (the token is never logged).
 *   **Time**: `chrono::DateTime<Utc>` for timestamps, `std::time::Duration` for trigger `for`, `chrono::TimeDelta` for signed offsets and lookbacks.
+*   **Stale data**: react to `Event::Status` with `SubscriptionStatus::Interrupted`/`Restored` instead of polling `connection_state()`.
 *   **Retries**: `NotConnected` means nothing was sent, so retrying is safe. `ConnectionLost`/`Timeout` mean the outcome is unknown, so check the state before retrying non-idempotent calls.

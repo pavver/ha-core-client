@@ -1,6 +1,10 @@
 use std::fmt;
 use std::time::Duration;
 
+/// Upper bound for every configured duration, so arithmetic on deadlines cannot overflow.
+/// Larger values (e.g. `Duration::MAX` meaning "never") are clamped to this.
+const MAX_DURATION: Duration = Duration::from_secs(365 * 24 * 3600);
+
 /// Connection settings for [`HAClient::connect_with`](crate::HAClient::connect_with).
 ///
 /// ```
@@ -20,6 +24,8 @@ pub struct ClientConfig {
     pub(crate) pong_timeout: Duration,
     pub(crate) reconnect_min_delay: Duration,
     pub(crate) reconnect_max_delay: Duration,
+    pub(crate) subscription_queue_size: usize,
+    pub(crate) slow_callback_warning: Duration,
 }
 
 impl ClientConfig {
@@ -37,38 +43,60 @@ impl ClientConfig {
             pong_timeout: Duration::from_secs(10),
             reconnect_min_delay: Duration::from_secs(1),
             reconnect_max_delay: Duration::from_secs(60),
+            subscription_queue_size: 1024,
+            slow_callback_warning: Duration::from_secs(5),
         }
     }
 
     /// Timeout for establishing the connection and completing authentication. Default: 10s.
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
-        self.connect_timeout = timeout;
+        self.connect_timeout = timeout.min(MAX_DURATION);
         self
     }
 
     /// How long a request waits for Home Assistant's answer before failing with
     /// [`Error::Timeout`](crate::Error::Timeout). Default: 30s.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
-        self.request_timeout = timeout;
+        self.request_timeout = timeout.min(MAX_DURATION);
         self
     }
 
     /// Idle time after which the client sends a `ping` to check the connection. Default: 30s.
     pub fn ping_interval(mut self, interval: Duration) -> Self {
-        self.ping_interval = interval;
+        self.ping_interval = interval.min(MAX_DURATION);
         self
     }
 
-    /// How long to wait for a `pong` before treating the connection as dead. Default: 10s.
+    /// How long to wait for a `pong`, or for a single write to complete, before treating
+    /// the connection as dead. Default: 10s.
     pub fn pong_timeout(mut self, timeout: Duration) -> Self {
-        self.pong_timeout = timeout;
+        self.pong_timeout = timeout.min(MAX_DURATION);
         self
     }
 
     /// Bounds of the exponential reconnect backoff. Defaults: 1s and 60s.
     pub fn reconnect_delay(mut self, min: Duration, max: Duration) -> Self {
-        self.reconnect_min_delay = min;
-        self.reconnect_max_delay = max.max(min);
+        self.reconnect_min_delay = min.min(MAX_DURATION);
+        self.reconnect_max_delay = max.clamp(self.reconnect_min_delay, MAX_DURATION);
+        self
+    }
+
+    /// Maximum number of events waiting for one subscription's callback. Default: 1024.
+    ///
+    /// Callbacks of a subscription run one at a time. When one falls behind, entity
+    /// subscriptions merge consecutive state changes (so they never queue more than one),
+    /// and other subscriptions drop their oldest events once this limit is reached. Either
+    /// way the callback then receives `SubscriptionStatus::Lagged`. Status events are never
+    /// dropped and don't count towards the limit.
+    pub fn subscription_queue_size(mut self, size: usize) -> Self {
+        self.subscription_queue_size = size.max(1);
+        self
+    }
+
+    /// Logs a warning when a single callback runs longer than this. `Duration::ZERO`
+    /// disables the warning. Default: 5s.
+    pub fn slow_callback_warning(mut self, threshold: Duration) -> Self {
+        self.slow_callback_warning = threshold.min(MAX_DURATION);
         self
     }
 }
@@ -84,6 +112,8 @@ impl fmt::Debug for ClientConfig {
             .field("pong_timeout", &self.pong_timeout)
             .field("reconnect_min_delay", &self.reconnect_min_delay)
             .field("reconnect_max_delay", &self.reconnect_max_delay)
+            .field("subscription_queue_size", &self.subscription_queue_size)
+            .field("slow_callback_warning", &self.slow_callback_warning)
             .finish()
     }
 }

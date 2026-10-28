@@ -27,6 +27,7 @@ mod context_helpers;
 mod error;
 pub mod events;
 mod protocol;
+mod queue;
 mod runner;
 pub mod state;
 mod subscription;
@@ -34,6 +35,7 @@ pub mod triggers;
 
 pub use config::ClientConfig;
 pub use error::{Error, Result};
+pub use events::SubscriptionStatus;
 pub use subscription::Subscription;
 
 use std::collections::HashMap;
@@ -142,7 +144,7 @@ impl HAClient {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx.send(make(tx)).await.map_err(|_| Error::Stopped)?;
         // A little slack so that the runner's own expiry usually answers first.
-        let timeout = self.shared.config.request_timeout + Duration::from_secs(1);
+        let timeout = self.shared.config.request_timeout.saturating_add(Duration::from_secs(1));
         match tokio::time::timeout(timeout, rx).await {
             Err(_) => Err(Error::Timeout),
             Ok(Err(_)) => Err(Error::Stopped),
@@ -270,6 +272,10 @@ impl HAClient {
 
     // --- Subscriptions ---
 
+    /// While the client is reconnecting, subscribing succeeds right away: the subscription
+    /// starts with `SubscriptionStatus::Interrupted` and is sent once the connection is back
+    /// (`Restored`, or `Rejected` if Home Assistant refuses it). The existence check of
+    /// `subscribe_entity` is skipped in that case.
     async fn subscribe_with<F, Fut>(&self, kind: SubKind, request: protocol::Request, callback: F) -> Result<Subscription>
     where
         F: Fn(HAClient, Event) -> Fut + Send + Sync + 'static,
@@ -284,6 +290,14 @@ impl HAClient {
     /// The callback receives [`Event::StateChanged`]. Filtering happens in Home Assistant,
     /// so only this entity's changes are transferred. Callbacks of one subscription run
     /// one after another, in order.
+    ///
+    /// Fails with [`Error::Ha`] (code `not_found`) if the entity does not exist, which
+    /// catches typos. To wait for an entity that does not exist yet, use
+    /// [`subscribe_state_trigger`](Self::subscribe_state_trigger) instead.
+    ///
+    /// After a reconnect the entity's state is re-read: if it changed while disconnected,
+    /// the callback gets one `StateChanged` from the last known to the current state,
+    /// followed by [`Event::Status`] with [`SubscriptionStatus::Restored`].
     pub async fn subscribe_entity<F, Fut>(&self, entity_id: &str, callback: F) -> Result<Subscription>
     where
         F: Fn(HAClient, Event) -> Fut + Send + Sync + 'static,
@@ -291,7 +305,8 @@ impl HAClient {
     {
         debug!("Subscribing to entity: {}", entity_id);
         let trigger = serde_json::json!({ "platform": "state", "entity_id": entity_id });
-        self.subscribe_with(SubKind::EntityState, protocol::subscribe_trigger(&trigger), callback).await
+        let kind = SubKind::EntityState { entity_id: entity_id.to_string() };
+        self.subscribe_with(kind, protocol::subscribe_trigger(&trigger), callback).await
     }
 
     /// Subscribes to bus events of one type (`state_changed`, `call_service`, custom events, …).
@@ -349,6 +364,9 @@ impl HAClient {
     /// Subscribes to a state trigger.
     ///
     /// Fires when an entity changes state.
+    ///
+    /// Note: after a reconnect the trigger is re-created in Home Assistant, so a pending
+    /// `for_duration` countdown starts over. This applies to every trigger with `for`.
     pub async fn subscribe_state_trigger<F, Fut>(
         &self,
         entity_id: &str,

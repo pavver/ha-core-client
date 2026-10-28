@@ -39,21 +39,22 @@ where
 }
 
 /// How the payloads of a subscription are turned into [`Event`]s.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum SubKind {
     /// `subscribe_events`: bus events.
     Events,
     /// `subscribe_trigger` with a `state` trigger, reported as `Event::StateChanged`.
-    EntityState,
+    /// The entity's state is re-read after every reconnect.
+    EntityState { entity_id: String },
     /// Any other `subscribe_trigger`, reported as `Event::TriggerFired`.
     Trigger,
 }
 
 impl SubKind {
-    pub(crate) fn convert(self, payload: Value) -> Event {
+    pub(crate) fn convert(&self, payload: Value) -> Event {
         match self {
             SubKind::Events => Event::from_bus_event(payload),
-            SubKind::EntityState => Event::from_entity_trigger(payload),
+            SubKind::EntityState { .. } => Event::from_entity_trigger(payload),
             SubKind::Trigger => Event::TriggerFired(crate::events::TriggerFiredEvent::from_payload(payload)),
         }
     }

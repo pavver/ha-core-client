@@ -52,10 +52,16 @@ async fn main() -> Result<()> {
     // --- Subscriptions ---
     client
         .subscribe_entity(&entity, |_client, event| async move {
-            if let Event::StateChanged { entity_id, old_state, new_state } = event {
-                let old = old_state.map(|s| s.state).unwrap_or_default();
-                let new = new_state.map(|s| s.state).unwrap_or_default();
-                info!("[entity] {entity_id}: {old} -> {new}");
+            match event {
+                Event::StateChanged { entity_id, old_state, new_state } => {
+                    let old = old_state.map(|s| s.state).unwrap_or_default();
+                    let new = new_state.map(|s| s.state).unwrap_or_default();
+                    info!("[entity] {entity_id}: {old} -> {new}");
+                }
+                Event::Status { subscription, status } => {
+                    info!("[entity] subscription {} status: {status:?}", subscription.id());
+                }
+                _ => {}
             }
             Ok(())
         })

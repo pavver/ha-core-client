@@ -13,6 +13,7 @@ pub use service::ServiceCalledEvent;
 use serde_json::Value;
 
 use self::state::StateChangedData;
+use crate::subscription::Subscription;
 
 /// A trigger firing from a `subscribe_trigger` subscription.
 ///
@@ -104,6 +105,39 @@ pub enum Event {
         event_type: String,
         data: Value,
     },
+
+    /// A change in the subscription itself (connection lost, restored, …), delivered
+    /// in order with the data events. `subscription` can be passed to
+    /// [`HAClient::unsubscribe`](crate::HAClient::unsubscribe), also while disconnected.
+    Status {
+        subscription: Subscription,
+        status: SubscriptionStatus,
+    },
+}
+
+/// Lifecycle of a subscription, delivered as [`Event::Status`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SubscriptionStatus {
+    /// The connection was lost. No events arrive until [`Restored`](Self::Restored), so data
+    /// derived from earlier events should be treated as unknown.
+    Interrupted,
+    /// Active again after a reconnect. For `subscribe_entity`, if the entity changed while
+    /// disconnected, one `StateChanged` (last known state → current state) is delivered
+    /// right before this.
+    Restored,
+    /// The callback fell behind and `dropped` events were lost before the events that
+    /// follow. Entity subscriptions merge state changes instead of dropping them (the next
+    /// `StateChanged` spans from the last delivered state to the newest one), so for them
+    /// `dropped` counts merged changes. Other subscriptions drop their oldest events.
+    /// See [`ClientConfig::subscription_queue_size`](crate::ClientConfig::subscription_queue_size).
+    Lagged { dropped: u64 },
+    /// Home Assistant rejected the subscription when it was restored after a reconnect.
+    /// It has been removed; no further events.
+    Rejected { code: String, message: String },
+    /// The client stopped (`stop()`, all handles dropped, or the token was rejected).
+    /// No further events.
+    Closed,
 }
 
 impl Event {

@@ -61,7 +61,9 @@ let config = ClientConfig::new("wss://ha.example.com/api/websocket", "TOKEN")
     .request_timeout(Duration::from_secs(10))   // default 30s
     .ping_interval(Duration::from_secs(30))     // default 30s
     .pong_timeout(Duration::from_secs(10))      // default 10s
-    .reconnect_delay(Duration::from_secs(1), Duration::from_secs(60)); // backoff bounds
+    .reconnect_delay(Duration::from_secs(1), Duration::from_secs(60)) // backoff bounds
+    .subscription_queue_size(1024)              // events waiting per subscription
+    .slow_callback_warning(Duration::from_secs(5)); // log callbacks that run this long
 let client = HAClient::connect_with(config).await?;
 ```
 
@@ -83,7 +85,30 @@ while states.changed().await.is_ok() {
 }
 ```
 
-While reconnecting, requests fail fast with `Error::NotConnected`. If Home Assistant rejects the token during a reconnect, the client stops with `ConnectionState::AuthFailed` instead of retrying (repeated failed logins can get the client's IP banned).
+Every subscription callback is also told about the connection, in order with its data:
+
+```rust
+use ha_core_client::{events::Event, SubscriptionStatus};
+
+client.subscribe_entity("sensor.power", |client, event| async move {
+    match event {
+        Event::StateChanged { new_state, .. } => { /* use the new state */ }
+        Event::Status { status: SubscriptionStatus::Interrupted, .. } => { /* data may be stale now */ }
+        Event::Status { status: SubscriptionStatus::Restored, .. } => { /* live again */ }
+        Event::Status { subscription, status: SubscriptionStatus::Rejected { message, .. } } => {
+            eprintln!("subscription {} dropped by Home Assistant: {message}", subscription.id());
+        }
+        _ => {}
+    }
+    Ok(())
+}).await?;
+```
+
+Callbacks of one subscription run one after another. If a callback falls behind, `subscribe_entity` merges the waiting state changes into one (from the last delivered state to the newest), and other subscriptions drop their oldest events beyond `subscription_queue_size`; the callback is told with `SubscriptionStatus::Lagged { dropped }`. To process events concurrently, `tokio::spawn` inside the callback.
+
+After a reconnect, `subscribe_entity` re-reads the entity: if it changed while disconnected, one `StateChanged` (last known → current state) arrives right before `Restored`. A handler can also `client.unsubscribe(subscription)` on `Interrupted`, which works while offline.
+
+While reconnecting, requests fail fast with `Error::NotConnected`, but new subscriptions are accepted: they start as `Interrupted` and are sent once the connection is back. After a reconnect, triggers are re-created in Home Assistant, so a pending `for` countdown starts over. If Home Assistant rejects the token during a reconnect, the client stops with `ConnectionState::AuthFailed` instead of retrying (repeated failed logins can get the client's IP banned).
 
 ## API Overview
 

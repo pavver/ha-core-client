@@ -20,9 +20,16 @@ This library is designed with type safety, asynchronicity, and resilience to net
 *   Each subscription has a stable client-side id (the `Subscription` handle) plus the Home Assistant message id on the current connection. A `routes` map translates the latter back to the former.
 *   On reconnect, all subscriptions are re-sent in creation order (a `BTreeMap`). A re-subscription that Home Assistant rejects is logged and dropped.
 *   `subscribe_*` calls complete when Home Assistant acknowledges them, so configuration errors reach the caller.
+*   Subscriptions learn about the connection through `Event::Status`, which goes through the same per-subscription queue as data events: `Interrupted` when a session is lost, `Restored` once re-acknowledged, `Rejected` if Home Assistant refuses the re-subscription (it is then dropped), `Closed` when the client stops.
+*   A `Subscribe` received while offline is registered locally (marked interrupted, `Interrupted` delivered) and sent by the next `resubscribe`.
+*   For `subscribe_entity`, the caller's responder is carried by the initial `Resync` read, so a missing entity fails the call (both server-side subscriptions are then unsubscribed).
+*   Entity subscriptions keep their last seen state. After subscribing, and again after each re-subscription, the runner reads the entity with a one-shot `subscribe_entities` (`PendingKind::Resync`). After a reconnect, a difference from the last seen state is delivered as one `StateChanged`, then `Restored`. A re-subscription that times out forces a new reconnect instead of dropping the subscription.
 
 ### 4. Request Bookkeeping
 *   Every sent request has a `Pending` entry with a deadline. The housekeeping tick expires overdue entries (`Timeout`) and drives the `ping`/`pong` keep-alive.
+*   Each write is bounded by `pong_timeout`; a blocked write (half-open connection) ends the session.
+*   Server-side subscriptions the client no longer routes (one-shot reads, unsubscribed, timed out) are unsubscribed once; their late events are ignored.
+*   A `Drop` guard on the runner sets `ConnectionState::Stopped` if the task ever ends without `finish` (a panic), so waiters are released.
 *   `get_state` uses a one-shot `subscribe_entities`: the ack is followed by an event with the compressed state, after which the client unsubscribes.
 
 ### 5. Type-Safe Protocol
@@ -31,5 +38,7 @@ This library is designed with type safety, asynchronicity, and resilience to net
 *   **`events/`**: `Event` conversion per subscription kind: bus events, entity state triggers (as `StateChanged`) and other triggers (as `TriggerFired`). Attribute parsing never fails; values that do not fit the typed schema are kept untyped.
 
 ### 6. Callbacks
-*   Each subscription has a worker task that runs its callbacks one at a time, in event order. Each callback runs in its own spawned task, so a panic is contained and logged.
+*   Each subscription has a worker task that runs its callbacks one at a time, in event order. Each callback runs in its own spawned task, so a panic is contained and logged. A callback running longer than `slow_callback_warning` is logged once when it crosses the threshold and again when it finishes.
+*   Runner and worker are connected by a bounded queue (`src/queue.rs`). The runner never waits on it. When a callback falls behind, entity subscriptions merge the newest `StateChanged` into the queued one; other subscriptions drop their oldest data event past `subscription_queue_size`. Status events bypass the limit. The count of merged/dropped events is handed to the callback as `SubscriptionStatus::Lagged` before the next event.
+*   The worker holds only a weak command sender, so queued events don't keep a dropped client alive.
 *   Callbacks receive an `HAClient` handle, so they can call Home Assistant themselves without deadlocking the runner.

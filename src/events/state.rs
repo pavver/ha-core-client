@@ -25,9 +25,13 @@ pub struct State {
 }
 
 impl State {
-    /// The state parsed into a typed [`HaState`].
+    /// The state parsed into a typed [`HaState`], using the entity's domain to resolve
+    /// ambiguous values (see [`HaState::parse_for_domain`]).
     pub fn ha_state(&self) -> HaState {
-        HaState::from_string(&self.state)
+        match self.domain() {
+            Some(domain) => HaState::parse_for_domain(&domain, &self.state),
+            None => HaState::from_string(&self.state),
+        }
     }
 
     /// The entity's domain (`light`, `sensor`, …).

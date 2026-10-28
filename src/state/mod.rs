@@ -56,7 +56,25 @@ impl HaState {
         Self::from_string(s)
     }
 
-    /// Parses a string slice into an HaState.
+    /// Parses a state using the entity's domain to resolve ambiguous values:
+    /// `"open"` is `Lock(Open)` for `lock`, `Cover(Open)` for `cover`; `"heat"` is
+    /// `Climate(Heat)` only for `climate`. Other domains fall back to [`from_string`](Self::from_string).
+    pub fn parse_for_domain(domain: &Domain, s: &str) -> Self {
+        let s_lower = s.to_lowercase();
+        let domain_specific = match domain {
+            Domain::Lock => LockState::from_str(&s_lower).ok().map(HaState::Lock),
+            Domain::Cover => CoverState::from_str(&s_lower).ok().map(HaState::Cover),
+            Domain::AlarmControlPanel => AlarmState::from_str(&s_lower).ok().map(HaState::Alarm),
+            Domain::Climate => HvacMode::from_str(&s_lower).ok().map(HaState::Climate),
+            _ => None,
+        };
+        domain_specific.unwrap_or_else(|| Self::from_string(s))
+    }
+
+    /// Parses a string slice into an HaState without knowing the entity's domain.
+    /// Ambiguous values resolve to the first match in this order: cover, lock, alarm,
+    /// climate. Prefer [`parse_for_domain`](Self::parse_for_domain) (or
+    /// `State::ha_state`) when the domain is known.
     pub fn from_string(s: &str) -> Self {
         let s_lower = s.to_lowercase();
         match s_lower.as_str() {
@@ -260,5 +278,16 @@ mod tests {
         assert_eq!(HaState::from_string("open"), HaState::Cover(CoverState::Open));
         assert_eq!(HaState::from_string("12.5"), HaState::Number(12.5));
         assert_eq!(HaState::from_string("Mixed"), HaState::String("Mixed".into()));
+    }
+
+    #[test]
+    fn domain_resolves_ambiguous_states() {
+        assert_eq!(HaState::parse_for_domain(&Domain::Lock, "open"), HaState::Lock(LockState::Open));
+        assert_eq!(HaState::parse_for_domain(&Domain::Cover, "open"), HaState::Cover(CoverState::Open));
+        assert_eq!(HaState::parse_for_domain(&Domain::Climate, "heat"), HaState::Climate(HvacMode::Heat));
+        assert_eq!(HaState::parse_for_domain(&Domain::Climate, "off"), HaState::Climate(HvacMode::Off));
+        assert_eq!(HaState::parse_for_domain(&Domain::Light, "off"), HaState::Off);
+        assert_eq!(HaState::parse_for_domain(&Domain::Other("sensor".into()), "21.5"), HaState::Number(21.5));
+        assert_eq!(HaState::parse_for_domain(&Domain::Lock, "unavailable"), HaState::Unavailable);
     }
 }
