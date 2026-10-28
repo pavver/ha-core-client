@@ -567,7 +567,7 @@ async fn watch_silence_reports_silent_and_back() {
     });
     let msg = conn.recv_type("render_template").await;
     let template = msg["template"].as_str().unwrap();
-    assert!(template.contains("states.sensor.outdoor"), "{template}");
+    assert!(template.contains("states.sensor['outdoor']"), "{template}");
     assert!(template.contains("last_reported).total_seconds() > 1800"), "{template}");
     conn.ok(&msg["id"], Value::Null).await;
     conn.event(&msg["id"], rendered(json!(false))).await;

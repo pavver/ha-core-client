@@ -472,12 +472,13 @@ impl HAClient {
 
 /// The template of [`HAClient::watch_silence`]: renders `true` while the entity is missing
 /// or its last report is older than `max_silence`. The id is checked because it is part of
-/// the template.
+/// the template. The object id is subscripted, since `states.sensor.1st_floor` is a
+/// Jinja syntax error.
 fn silence_template(entity_id: &str, max_silence: Duration) -> Result<String> {
     let part_ok = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
     match entity_id.split_once('.') {
         Some((domain, object_id)) if part_ok(domain) && part_ok(object_id) => Ok(format!(
-            "{{% set s = states.{entity_id} %}}{{{{ s is none or (now() - s.last_reported).total_seconds() > {} }}}}",
+            "{{% set s = states.{domain}['{object_id}'] %}}{{{{ s is none or (now() - s.last_reported).total_seconds() > {} }}}}",
             max_silence.as_secs_f64()
         )),
         _ => Err(Error::InvalidInput(format!("invalid entity_id: {entity_id}"))),
@@ -492,8 +493,10 @@ mod tests {
     fn silence_template_checks_the_entity_id() {
         assert_eq!(
             silence_template("sensor.outdoor_2", Duration::from_secs(1800)).unwrap(),
-            "{% set s = states.sensor.outdoor_2 %}{{ s is none or (now() - s.last_reported).total_seconds() > 1800 }}"
+            "{% set s = states.sensor['outdoor_2'] %}{{ s is none or (now() - s.last_reported).total_seconds() > 1800 }}"
         );
+        // Object ids may start with a digit.
+        assert!(silence_template("sensor.1st_floor", Duration::from_secs(1)).unwrap().contains("states.sensor['1st_floor']"));
         for bad in ["sensor", "sensor.", ".x", "sensor.x }}{{ 1", "Sensor.x", "sensor.x.y"] {
             assert!(matches!(silence_template(bad, Duration::from_secs(1)), Err(Error::InvalidInput(_))), "{bad}");
         }
