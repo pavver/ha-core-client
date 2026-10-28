@@ -1,5 +1,25 @@
 use thiserror::Error;
 
+use crate::state::string_enum;
+
+string_enum! {
+    /// Error code of a Home Assistant WebSocket error (`websocket_api/const.py`).
+    pub enum HaErrorCode {
+        HomeAssistantError => "home_assistant_error",
+        InvalidFormat => "invalid_format",
+        IdReuse => "id_reuse",
+        NotFound => "not_found",
+        NotSupported => "not_supported",
+        NotAllowed => "not_allowed",
+        UnknownCommand => "unknown_command",
+        UnknownError => "unknown_error",
+        Unauthorized => "unauthorized",
+        Timeout => "timeout",
+        TemplateError => "template_error",
+        ServiceValidationError => "service_validation_error",
+    }
+}
+
 /// Errors returned by [`HAClient`](crate::HAClient) methods.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -31,7 +51,7 @@ pub enum Error {
 
     /// Home Assistant answered the request with an error.
     #[error("Home Assistant error `{code}`: {message}")]
-    Ha { code: String, message: String },
+    Ha { code: HaErrorCode, message: String },
 
     /// Home Assistant sent something the client did not expect.
     #[error("unexpected response: {0}")]

@@ -20,7 +20,7 @@ impl HAClient {
         self.call_service(
             Domain::AlarmControlPanel,
             service,
-            Some(entity_id),
+            entity_id,
             service_data,
         )
         .await

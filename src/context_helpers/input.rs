@@ -24,14 +24,14 @@ impl HAClient {
     pub async fn set_number(&self, entity_id: &str, value: f64) -> Result<()> {
         let (domain, entity_id) = resolve(entity_id, Domain::InputNumber);
         let service_data = json!({ "value": value });
-        self.call_service(domain, Service::SetValue, Some(&entity_id), Some(service_data)).await
+        self.call_service(domain, Service::SetValue, entity_id, service_data).await
     }
 
     /// Sets the value of an `input_text` or `text` entity. A bare object id means `input_text.<id>`.
     pub async fn set_text(&self, entity_id: &str, value: &str) -> Result<()> {
         let (domain, entity_id) = resolve(entity_id, Domain::InputText);
         let service_data = json!({ "value": value });
-        self.call_service(domain, Service::SetValue, Some(&entity_id), Some(service_data)).await
+        self.call_service(domain, Service::SetValue, entity_id, service_data).await
     }
 
     /// Selects an option of an `input_select` or `select` entity. A bare object id means
@@ -39,7 +39,7 @@ impl HAClient {
     pub async fn select_option(&self, entity_id: &str, option: &str) -> Result<()> {
         let (domain, entity_id) = resolve(entity_id, Domain::InputSelect);
         let service_data = json!({ "option": option });
-        self.call_service(domain, Service::SelectOption, Some(&entity_id), Some(service_data)).await
+        self.call_service(domain, Service::SelectOption, entity_id, service_data).await
     }
 }
 

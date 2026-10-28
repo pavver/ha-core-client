@@ -18,8 +18,8 @@ impl HAClient {
         self.call_service(
             Domain::Climate,
             Service::SetHvacMode,
-            Some(entity_id),
-            Some(service_data),
+            entity_id,
+            service_data,
         )
         .await
     }
@@ -30,8 +30,8 @@ impl HAClient {
         self.call_service(
             Domain::Climate,
             Service::SetTemperature,
-            Some(entity_id),
-            Some(service_data),
+            entity_id,
+            service_data,
         )
         .await
     }
@@ -42,8 +42,8 @@ impl HAClient {
         self.call_service(
             Domain::Climate,
             Service::SetTemperature,
-            Some(entity_id),
-            Some(service_data),
+            entity_id,
+            service_data,
         )
         .await
     }
@@ -54,8 +54,8 @@ impl HAClient {
         self.call_service(
             Domain::Climate,
             Service::SetFanMode,
-            Some(entity_id),
-            Some(service_data),
+            entity_id,
+            service_data,
         )
         .await
     }
@@ -66,8 +66,8 @@ impl HAClient {
         self.call_service(
             Domain::Climate,
             Service::SetPresetMode,
-            Some(entity_id),
-            Some(service_data),
+            entity_id,
+            service_data,
         )
         .await
     }
@@ -78,8 +78,8 @@ impl HAClient {
         self.call_service(
             Domain::Climate,
             Service::SetSwingMode,
-            Some(entity_id),
-            Some(service_data),
+            entity_id,
+            service_data,
         )
         .await
     }

@@ -10,7 +10,7 @@ impl HAClient {
     async fn call_entity_service(&self, entity_id: &str, service: Service) -> Result<()> {
         let domain = Domain::of_entity(entity_id)
             .ok_or_else(|| Error::InvalidInput(format!("invalid entity_id: {entity_id}")))?;
-        self.call_service(domain, service, Some(entity_id), None).await
+        self.call_service(domain, service, entity_id, ()).await
     }
 
     /// Turns on an entity (switch, light, fan, …).

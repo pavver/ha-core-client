@@ -5,6 +5,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::Error;
+#[cfg(test)]
+use crate::error::HaErrorCode;
+use crate::target::Target;
 
 /// A command body without its `id`; the runner assigns ids per connection.
 pub(crate) type Request = Value;
@@ -49,7 +52,7 @@ pub(crate) fn get_states() -> Request {
 pub(crate) fn call_service(
     domain: &str,
     service: &str,
-    entity_id: Option<&str>,
+    target: &Target,
     service_data: Option<Value>,
     return_response: bool,
 ) -> Request {
@@ -57,8 +60,8 @@ pub(crate) fn call_service(
     if let Some(data) = service_data {
         msg["service_data"] = data;
     }
-    if let Some(entity_id) = entity_id {
-        msg["target"] = json!({ "entity_id": entity_id });
+    if !target.is_empty() {
+        msg["target"] = json!(target);
     }
     if return_response {
         msg["return_response"] = true.into();
@@ -114,7 +117,7 @@ pub(crate) struct HaError {
 
 impl From<HaError> for Error {
     fn from(e: HaError) -> Self {
-        Error::Ha { code: e.code, message: e.message }
+        Error::Ha { code: e.code.into(), message: e.message }
     }
 }
 
@@ -124,13 +127,19 @@ mod tests {
 
     #[test]
     fn call_service_uses_target() {
-        let v = call_service("light", "turn_on", Some("light.a"), Some(json!({"brightness": 10})), true);
+        let v = call_service("light", "turn_on", &Target::entity("light.a"), Some(json!({"brightness": 10})), true);
         assert_eq!(
             v,
             json!({"type": "call_service", "domain": "light", "service": "turn_on",
-                   "service_data": {"brightness": 10}, "target": {"entity_id": "light.a"},
+                   "service_data": {"brightness": 10}, "target": {"entity_id": ["light.a"]},
                    "return_response": true})
         );
+    }
+
+    #[test]
+    fn call_service_without_target_or_data() {
+        let v = call_service("homeassistant", "reload", &Target::new(), None, false);
+        assert_eq!(v, json!({"type": "call_service", "domain": "homeassistant", "service": "reload"}));
     }
 
     #[test]
@@ -140,6 +149,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(m.id, Some(5));
-        assert!(matches!(Error::from(m.error.unwrap()), Error::Ha { code, .. } if code == "invalid_format"));
+        assert!(matches!(Error::from(m.error.unwrap()), Error::Ha { code, .. } if code == HaErrorCode::InvalidFormat));
     }
 }

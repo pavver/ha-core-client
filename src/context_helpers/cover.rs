@@ -13,8 +13,8 @@ impl HAClient {
         self.call_service(
             Domain::Cover,
             Service::OpenCover,
-            Some(entity_id),
-            None,
+            entity_id,
+            (),
         )
         .await
     }
@@ -23,8 +23,8 @@ impl HAClient {
         self.call_service(
             Domain::Cover,
             Service::CloseCover,
-            Some(entity_id),
-            None,
+            entity_id,
+            (),
         )
         .await
     }
@@ -33,8 +33,8 @@ impl HAClient {
         self.call_service(
             Domain::Cover,
             Service::StopCover,
-            Some(entity_id),
-            None,
+            entity_id,
+            (),
         )
         .await
     }
@@ -44,8 +44,8 @@ impl HAClient {
         self.call_service(
             Domain::Cover,
             Service::SetCoverPosition,
-            Some(entity_id),
-            Some(service_data),
+            entity_id,
+            service_data,
         )
         .await
     }
@@ -55,8 +55,8 @@ impl HAClient {
         self.call_service(
             Domain::Cover,
             Service::SetCoverTiltPosition,
-            Some(entity_id),
-            Some(service_data),
+            entity_id,
+            service_data,
         )
         .await
     }

@@ -31,10 +31,12 @@ mod queue;
 mod runner;
 pub mod state;
 mod subscription;
+mod target;
 pub mod triggers;
 
 pub use config::ClientConfig;
-pub use error::{Error, Result};
+pub use error::{Error, HaErrorCode, Result};
+pub use target::Target;
 pub use events::SubscriptionStatus;
 pub use subscription::{BoxError, CallbackResult, EntityChanges, Subscription, SubscriptionGuard};
 
@@ -46,6 +48,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use log::debug;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -242,50 +246,85 @@ impl HAClient {
             .max_by_key(|state| state.last_updated)
             .map(Into::into)
             .ok_or_else(|| Error::Ha {
-                code: "not_found".into(),
+                code: HaErrorCode::NotFound,
                 message: format!("No state for '{entity_id}' in the window ending at {timestamp}"),
             })
     }
 
     // --- Services ---
 
-    /// Calls a Home Assistant service, optionally targeting an entity.
+    /// Calls a Home Assistant service.
     ///
-    /// Accepts typed values or plain strings: `call_service(Domain::Light, Service::TurnOn, ...)`
-    /// or `call_service("vacuum", "start", ...)`.
+    /// `domain` and `service` accept typed values or plain strings. `target` is anything that
+    /// converts into a [`Target`]: `()` for none, an entity id, a list of entity ids, or a
+    /// `Target` built for areas, devices, floors and labels. `data` is any value that serializes
+    /// to a JSON object (`()` for no service data); anything else fails with
+    /// [`Error::InvalidInput`].
+    ///
+    /// ```no_run
+    /// # use ha_core_client::{HAClient, Target, state::{Domain, Service}};
+    /// # use serde_json::json;
+    /// # async fn example(client: HAClient) -> ha_core_client::Result<()> {
+    /// client.call_service("light", "turn_on", "light.kitchen", json!({"brightness": 120})).await?;
+    /// client.call_service(Domain::HomeAssistant, Service::Reload, (), ()).await?;
+    /// client.call_service("light", "turn_off", Target::area("kitchen").and_entity("light.porch"), ()).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn call_service(
         &self,
         domain: impl Into<Domain>,
         service: impl Into<Service>,
-        entity_id: Option<&str>,
-        service_data: Option<Value>,
+        target: impl Into<Target>,
+        data: impl Serialize,
     ) -> Result<()> {
-        self.service_call(domain.into(), service.into(), entity_id, service_data, false).await.map(drop)
+        self.service_call(domain.into(), service.into(), target.into(), data, false).await.map(drop)
     }
 
-    /// Calls a service that returns data (e.g. `weather.get_forecasts`) and returns its response.
-    pub async fn call_service_with_response(
+    /// Calls a service that returns data (e.g. `weather.get_forecasts`) and decodes its
+    /// `response` into `R`. A missing response decodes from `null` (`Value::Null`, or `None`
+    /// for an `Option`).
+    ///
+    /// ```no_run
+    /// # use ha_core_client::HAClient;
+    /// # use serde_json::{json, Value};
+    /// # async fn example(client: HAClient) -> ha_core_client::Result<()> {
+    /// let forecast: Value = client
+    ///     .call_service_with_response("weather", "get_forecasts", "weather.home", json!({"type": "daily"}))
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn call_service_with_response<R: DeserializeOwned>(
         &self,
         domain: impl Into<Domain>,
         service: impl Into<Service>,
-        entity_id: Option<&str>,
-        service_data: Option<Value>,
-    ) -> Result<Value> {
-        let mut result = self.service_call(domain.into(), service.into(), entity_id, service_data, true).await?;
-        Ok(result.get_mut("response").map(Value::take).unwrap_or(Value::Null))
+        target: impl Into<Target>,
+        data: impl Serialize,
+    ) -> Result<R> {
+        let mut result = self.service_call(domain.into(), service.into(), target.into(), data, true).await?;
+        let response = result.get_mut("response").map(Value::take).unwrap_or(Value::Null);
+        Ok(serde_json::from_value(response)?)
     }
 
     async fn service_call(
         &self,
         domain: Domain,
         service: Service,
-        entity_id: Option<&str>,
-        service_data: Option<Value>,
+        target: Target,
+        data: impl Serialize,
         return_response: bool,
     ) -> Result<Value> {
-        debug!("Calling service: {}.{} for entity: {:?}", domain, service, entity_id);
-        let request =
-            protocol::call_service(domain.as_str(), service.as_str(), entity_id, service_data, return_response);
+        let service_data = match serde_json::to_value(data) {
+            Ok(Value::Null) => None,
+            Ok(data @ Value::Object(_)) => Some(data),
+            Ok(other) => {
+                return Err(Error::InvalidInput(format!("service data must be a JSON object, got {other}")));
+            }
+            Err(e) => return Err(Error::InvalidInput(format!("service data cannot be serialized: {e}"))),
+        };
+        debug!("Calling service: {}.{} for target: {:?}", domain, service, target);
+        let request = protocol::call_service(domain.as_str(), service.as_str(), &target, service_data, return_response);
         self.request(request).await
     }
 

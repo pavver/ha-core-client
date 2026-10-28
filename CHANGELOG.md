@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Breaking
+
+*   `call_service(domain, service, target, data)`: `target` is `impl Into<Target>` and `data` is `impl Serialize`. Migrate `call_service(d, s, Some("light.x"), None)` to `call_service(d, s, "light.x", ())`, `Some(json!(..))` data to plain `json!(..)`, and a `None` target to `()`. Data must serialize to a JSON object (or `()`/`null` for none), otherwise `Error::InvalidInput`.
+*   `call_service_with_response` is generic: `call_service_with_response::<R>(..) -> Result<R>` decodes the `response` field (`Value` gives the old behaviour; decode failures are `Error::Decode`).
+*   The `target` sent to Home Assistant now lists entity ids (`{"entity_id": ["light.x"]}`) instead of a bare string.
+*   `Error::Ha { code }` and `SubscriptionStatus::Rejected { code }` are `HaErrorCode` instead of `String`. Compare with `code == HaErrorCode::NotFound`; its `Debug` output is now the variant name.
+*   `ServiceCalledEvent::domain` and `service` are `Domain` and `Service` instead of `String`.
+
 ### Fixed
 
 *   `HaState` parsing ignored case and printed the canonical form, so `StateTrigger::new("input_select.mode").to("Home")` was sent as `"to": "home"` and never fired (states are case-sensitive in Home Assistant). Parsing is now exact: `"on"` is `HaState::On`, `"On"` is `String("On")`, and every `HaState` prints back the string it was parsed from. Behaviour change: `HaState::from_string("ON")` (and `State::ha_state()` of a state `"ON"`) is no longer `HaState::On`.
@@ -14,6 +22,11 @@
 *   A re-subscription that Home Assistant did not confirm within `request_timeout` ended the connection, interrupting every subscription; one that never got an answer kept the client reconnecting forever. It is now sent again on the same connection, and the others stay active.
 *   The reconnect jitter came from the clock's nanoseconds, which on platforms with a coarse clock gave only a few distinct delays. It now uses a random value.
 *   `AttributeSet::get` serialized all attributes on every call; it now looks up the one key.
+
+### Added
+
+*   `Target`: what a service call acts on (entities, devices, areas, floors, labels), with `From` impls for entity ids.
+*   `HaErrorCode`: typed Home Assistant error codes with an `Other(String)` fallback.
 
 ### Changed
 

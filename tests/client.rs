@@ -6,7 +6,7 @@ use futures_util::{SinkExt, StreamExt};
 use ha_core_client::events::Event;
 use ha_core_client::state::{Domain, Service};
 use ha_core_client::triggers::{TemplateTrigger, TimePatternTrigger};
-use ha_core_client::{CallbackResult, ClientConfig, ConnectionState, EntityChanges, Error, HAClient, SubscriptionStatus};
+use ha_core_client::{CallbackResult, ClientConfig, ConnectionState, EntityChanges, Error, HAClient, HaErrorCode, SubscriptionStatus, Target};
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -295,7 +295,7 @@ async fn rejected_subscription_returns_ha_error() {
         "error": {"code": "invalid_format", "message": "invalid template"}}))
         .await;
     let err = sub.await.unwrap().unwrap_err();
-    assert!(matches!(err, Error::Ha { ref code, .. } if code == "invalid_format"), "{err:?}");
+    assert!(matches!(err, Error::Ha { ref code, .. } if *code == HaErrorCode::InvalidFormat), "{err:?}");
 }
 
 #[tokio::test]
@@ -456,7 +456,7 @@ async fn rejected_resubscription_is_reported_and_dropped() {
         .await;
     assert_eq!(
         recv_within(&mut rx).await,
-        r#"Rejected { code: "invalid_format", message: "integration not loaded" }"#
+        r#"Rejected { code: InvalidFormat, message: "integration not loaded" }"#
     );
 
     // Gone for good: not re-sent after the next reconnect either.
@@ -522,7 +522,7 @@ async fn blocked_write_triggers_reconnect() {
     for _ in 0..64 {
         let client = client.clone();
         let payload = payload.clone();
-        tokio::spawn(async move { client.call_service("test", "noop", None, Some(payload)).await });
+        tokio::spawn(async move { client.call_service("test", "noop", (), payload).await });
     }
     wait_state(&client, |s| matches!(s, ConnectionState::Reconnecting { .. })).await;
     let mut conn = ha.accept().await;
@@ -730,7 +730,7 @@ async fn get_state_reads_compressed_state() {
     let msg = conn.recv_type("subscribe_entities").await;
     conn.ok(&msg["id"], Value::Null).await;
     conn.event(&msg["id"], json!({"a": {}})).await;
-    assert!(matches!(req.await.unwrap(), Err(Error::Ha { code, .. }) if code == "not_found"));
+    assert!(matches!(req.await.unwrap(), Err(Error::Ha { code, .. }) if code == HaErrorCode::NotFound));
 }
 
 #[tokio::test]
@@ -742,14 +742,14 @@ async fn service_calls_use_wire_names_and_target() {
         let client = client.clone();
         async move {
             client.turn_on("fan.bedroom").await?;
-            client.call_service(Domain::HomeAssistant, Service::Reload, None, None).await?;
-            client.call_service_with_response("weather", "get_forecasts", Some("weather.home"), Some(json!({"type": "daily"}))).await
+            client.call_service(Domain::HomeAssistant, Service::Reload, (), ()).await?;
+            client.call_service_with_response::<Value>("weather", "get_forecasts", "weather.home", json!({"type": "daily"})).await
         }
     });
 
     let m = conn.recv_type("call_service").await;
     assert_eq!((m["domain"].as_str(), m["service"].as_str()), (Some("fan"), Some("turn_on")));
-    assert_eq!(m["target"], json!({"entity_id": "fan.bedroom"}));
+    assert_eq!(m["target"], json!({"entity_id": ["fan.bedroom"]}));
     conn.ok(&m["id"], json!({"context": {}, "response": null})).await;
 
     let m = conn.recv_type("call_service").await;
@@ -765,6 +765,40 @@ async fn service_calls_use_wire_names_and_target() {
     assert_eq!(response, json!({"weather.home": {"forecast": []}}));
 
     assert!(matches!(client.turn_on("not-an-entity").await, Err(Error::InvalidInput(_))));
+}
+
+#[tokio::test]
+async fn service_call_targets_and_data_validation() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+
+    let call = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client.call_service("light", "turn_off", Target::area("kitchen").and_entity("light.a"), ()).await?;
+            client.call_service_with_response::<Value>("test", "plain", (), ()).await
+        }
+    });
+    let m = conn.recv_type("call_service").await;
+    assert_eq!(m["target"], json!({"entity_id": ["light.a"], "area_id": ["kitchen"]}));
+    assert!(m.get("service_data").is_none());
+    conn.ok(&m["id"], json!({"context": {}, "response": null})).await;
+    let m = conn.recv_type("call_service").await;
+    conn.ok(&m["id"], json!({"context": {}})).await;
+    assert_eq!(call.await.unwrap().unwrap(), Value::Null);
+
+    // Non-object data is rejected before anything is sent.
+    let err = client.call_service("test", "noop", (), json!(5)).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+    // Nothing was sent: the next message on the wire is the following call.
+    let call = tokio::spawn({
+        let client = client.clone();
+        async move { client.call_service_with_response::<Option<u32>>("test", "next", (), ()).await }
+    });
+    let m = conn.recv_type("call_service").await;
+    assert_eq!(m["service"], "next");
+    conn.ok(&m["id"], json!({"context": {}, "response": null})).await;
+    assert_eq!(call.await.unwrap().unwrap(), None);
 }
 
 #[tokio::test]
@@ -1009,7 +1043,7 @@ async fn subscribing_to_a_missing_entity_fails() {
     conn.event(&read["id"], json!({"a": {}})).await;
 
     let err = sub.await.unwrap().unwrap_err();
-    assert!(matches!(&err, Error::Ha { code, .. } if code == "not_found"), "{err:?}");
+    assert!(matches!(&err, Error::Ha { code, .. } if *code == HaErrorCode::NotFound), "{err:?}");
     // Both server-side subscriptions are cleaned up.
     let mut unsubscribed = vec![
         conn.recv_type("unsubscribe_events").await["subscription"].clone(),

@@ -144,7 +144,7 @@ pub enum SubscriptionStatus {
     Lagged { dropped: u64 },
     /// Home Assistant rejected the subscription when it was restored after a reconnect.
     /// It has been removed; no further events.
-    Rejected { code: String, message: String },
+    Rejected { code: crate::HaErrorCode, message: String },
     /// The client stopped (`stop()`, all handles dropped, or the token was rejected).
     /// No further events.
     Closed,
@@ -283,7 +283,7 @@ mod tests {
             "event_type": "call_service",
             "data": {"domain": "light", "service": "turn_on", "service_data": {"entity_id": "light.a"}}
         }));
-        assert!(matches!(e, Event::ServiceCalled(ref s) if s.service == "turn_on"));
+        assert!(matches!(e, Event::ServiceCalled(ref s) if s.service == crate::state::Service::TurnOn));
 
         let e = Event::from_bus_event(json!({"event_type": "my_event", "data": {"x": 1}}));
         assert!(matches!(e, Event::Generic { ref event_type, ref data } if event_type == "my_event" && data["x"] == 1));

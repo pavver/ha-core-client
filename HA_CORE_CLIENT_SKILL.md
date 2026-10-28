@@ -34,7 +34,7 @@ All client methods return `ha_core_client::Result<T>` = `Result<T, ha_core_clien
 *   `ConnectionLost`: the connection dropped after sending; the outcome is unknown.
 *   `Timeout`: no answer within `request_timeout`.
 *   `Stopped`: the client was stopped.
-*   `Ha { code, message }`: Home Assistant returned an error (e.g. `invalid_format`, `not_found`, `home_assistant_error`).
+*   `Ha { code, message }`: Home Assistant returned an error (`code: HaErrorCode`, e.g. `InvalidFormat`, `NotFound`, `HomeAssistantError`, `ServiceValidationError`; unknown codes are `Other(String)`).
 *   `Protocol(String)`, `Decode(serde_json::Error)`, `InvalidInput(String)`.
 
 ## 4. Main API: `HAClient`
@@ -49,14 +49,15 @@ All client methods return `ha_core_client::Result<T>` = `Result<T, ha_core_clien
 *   `ConnectionState`: `Connected`, `Reconnecting { attempt: u32 }`, `AuthFailed(String)`, `Stopped`; `is_terminal()`.
 
 ### State Operations
-*   `async fn get_state(&self, entity_id: &str) -> Result<events::State>`: `Error::Ha { code: "not_found", .. }` if missing.
+*   `async fn get_state(&self, entity_id: &str) -> Result<events::State>`: `Error::Ha { code: HaErrorCode::NotFound, .. }` if missing.
 *   `async fn get_states(&self) -> Result<Vec<events::State>>`.
 *   `async fn get_history(&self, entity_id: &str, start: DateTime<Utc>, end: DateTime<Utc>, significant_changes_only: bool) -> Result<Vec<HistoricalState>>` Unparsable entries are skipped with a warning.
 *   `async fn get_state_at_time(&self, entity_id: &str, timestamp: DateTime<Utc>, lookback: chrono::TimeDelta) -> Result<events::State>`.
 
 ### Service Calls
-*   `async fn call_service(&self, domain: impl Into<Domain>, service: impl Into<Service>, entity_id: Option<&str>, data: Option<serde_json::Value>) -> Result<()>`: enums or strings, e.g. `call_service("vacuum", "start", Some("vacuum.robot"), None)`.
-*   `async fn call_service_with_response(...same...) -> Result<serde_json::Value>`: returns the service response (e.g. `weather.get_forecasts`).
+*   `async fn call_service(&self, domain: impl Into<Domain>, service: impl Into<Service>, target: impl Into<Target>, data: impl Serialize) -> Result<()>`: enums or strings for domain/service. `data` must serialize to a JSON object (`()` for none), else `Error::InvalidInput`. Examples: `call_service("light", "turn_on", "light.kitchen", json!({"brightness": 120}))`, `call_service(Domain::HomeAssistant, Service::Reload, (), ())`, `call_service("light", "turn_off", Target::area("kitchen").and_entity("light.porch"), ())`.
+*   `async fn call_service_with_response<R: DeserializeOwned>(...same...) -> Result<R>`: decodes the service response (e.g. `weather.get_forecasts`); a missing response decodes from `null`. `let f: Value = client.call_service_with_response("weather", "get_forecasts", "weather.home", json!({"type": "daily"})).await?;`
+*   `Target`: `Target::new()`, `entity(id)`, `entities(ids)`, `device(id)`, `area(id)`, `floor(id)`, `label(id)`, chained with `.and_entity/.and_device/.and_area/.and_floor/.and_label`, `is_empty()`. `()` is no target; `&str`, `String`, `[&str; N]`, `Vec<String>`, `Vec<&str>`, `&[&str]` convert to entity ids.
 
 ### Subscriptions
 Callback bound: `F: Fn(HAClient, events::Event) -> Fut + Send + Sync + 'static`, `Fut: Future<Output = ha_core_client::CallbackResult> + Send + 'static`, where `CallbackResult = Result<(), BoxError>` and `BoxError = Box<dyn std::error::Error + Send + Sync>`. A closure ending in `Ok(())` needs no annotation; `?` works on any `std::error::Error` and on `anyhow::Error`. To fail with a message: `return Err("reason".into())`. Errors returned by a callback are logged with their source chain.
@@ -64,7 +65,7 @@ Callback bound: `F: Fn(HAClient, events::Event) -> Fut + Send + Sync + 'static`,
 Each `subscribe_*` returns `Result<Subscription>` after Home Assistant accepts it (an invalid configuration returns `Error::Ha`). While reconnecting (or if the connection drops before Home Assistant answers), subscribing succeeds: the subscription starts with `Interrupted` and is sent when the connection is back. If the caller stops waiting (cancelled future, timeout), the subscription is cancelled and its callback never runs.
 
 *   `subscribe_entity(entity_id: &str, cb)`: `Event::StateChanged` for that entity only (state and attribute changes, filtered server-side). Same as `subscribe_entity_with(entity_id, EntityChanges::Any, cb)`.
-*   `subscribe_entity_with(entity_id: &str, changes: EntityChanges, cb)`: `EntityChanges::State` delivers only changes of the state string (attribute-only updates and queued changes that cancel out, `A → B → A`, are skipped); `EntityChanges::Any` delivers every recorded update. Neither sees a sensor re-reporting the same value with the same attributes: Home Assistant only bumps `last_reported` and does not send it over the WebSocket API (`state_reported` cannot be subscribed to), so "sensor silent for N minutes" logic must not rely on such reports (use `watch_silence` instead). Fails with `Error::Ha { code: "not_found", .. }` if the entity does not exist; use `subscribe_trigger(StateTrigger::new(id), cb)` for entities that may appear later.
+*   `subscribe_entity_with(entity_id: &str, changes: EntityChanges, cb)`: `EntityChanges::State` delivers only changes of the state string (attribute-only updates and queued changes that cancel out, `A → B → A`, are skipped); `EntityChanges::Any` delivers every recorded update. Neither sees a sensor re-reporting the same value with the same attributes: Home Assistant only bumps `last_reported` and does not send it over the WebSocket API (`state_reported` cannot be subscribed to), so "sensor silent for N minutes" logic must not rely on such reports (use `watch_silence` instead). Fails with `Error::Ha { code: HaErrorCode::NotFound, .. }` if the entity does not exist; use `subscribe_trigger(StateTrigger::new(id), cb)` for entities that may appear later.
 *   `subscribe_events(event_type: &str, cb)`: bus events. `state_changed` → `Event::StateChanged` (**every** entity), `call_service` → `Event::ServiceCalled`, others → `Event::Generic`.
 *   `subscribe_service_calls(cb)`: same as `subscribe_events("call_service", cb)`.
 *   `subscribe_trigger(trigger: impl Into<triggers::Trigger>, cb)`, `subscribe_trigger_raw(trigger: serde_json::Value, cb)`: `Event::TriggerFired`. A raw trigger that is not a JSON object fails with `Error::InvalidInput`.
@@ -114,7 +115,7 @@ Use these instead of `call_service` for cleaner code. All return `Result<()>`.
 ### `ha_core_client::events`
 *   `Event` (`#[non_exhaustive]`):
     *   `StateChanged { entity_id: String, old_state: Option<State>, new_state: Option<State> }`: `old_state` is `None` if the entity was added, `new_state` is `None` if it was removed. `old_state.state` may equal `new_state.state` (attribute-only change, or merged changes).
-    *   `ServiceCalled(ServiceCalledEvent { domain, service, service_data })`.
+    *   `ServiceCalled(ServiceCalledEvent { domain: Domain, service: Service, service_data: Value })`.
     *   `TriggerFired(TriggerFiredEvent { trigger: Value, context: Option<Value> })` with `platform()`, `description()`, `entity_id()`, `from_state()`, `to_state()`.
     *   `TemplateRendered { result: Value }`, `TemplateError { message: String, level: String }` (from `subscribe_template`).
     *   `Silence { entity_id: String, silent: bool }` (from `watch_silence`).
@@ -123,7 +124,7 @@ Use these instead of `call_service` for cleaner code. All return `Result<()>`.
         *   `Interrupted`: the connection was lost. No events until `Restored`, so treat derived data as unknown.
         *   `Restored`: active again. For `subscribe_entity`, a change missed while disconnected arrives just before as one `StateChanged` (last known → current; `new_state: None` if the entity was removed).
         *   `Lagged { dropped }`: the callback fell behind. For `subscribe_entity`, `dropped` state changes were merged into the next `StateChanged`; for other subscriptions, the `dropped` oldest events were discarded (queue limit `subscription_queue_size`). Statuses are never dropped.
-        *   `Rejected { code, message }`: Home Assistant refused it when restoring after a reconnect. Removed, no more events.
+        *   `Rejected { code: HaErrorCode, message }`: Home Assistant refused it when restoring after a reconnect. Removed, no more events.
         *   `Closed`: the client stopped. No more events.
         *   `Unsubscribed`: cancelled by `unsubscribe()` or a dropped `SubscriptionGuard`. No more events.
         *   `subscription` can be passed to `client.unsubscribe(...)`, also while offline.

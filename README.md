@@ -134,8 +134,14 @@ While reconnecting, requests fail fast with `Error::NotConnected`, but new subsc
 *   `get_state(entity_id)`, `get_states()`.
 *   `get_history(entity_id, start, end, significant_changes_only)`.
 *   `get_state_at_time(entity_id, timestamp, lookback)`.
-*   `call_service(domain, service, entity_id, data)`: domains and services can be enums or strings (`call_service("vacuum", "start", ...)`).
-*   `call_service_with_response(...)`: for services that return data, such as `weather.get_forecasts`.
+*   `call_service(domain, service, target, data)`: domains and services can be enums or strings; `target` is `()`, an entity id, a list of ids or a `Target` (areas, devices, floors, labels); `data` is `()` or anything serializing to a JSON object.
+    ```rust
+    client.call_service("light", "turn_on", "light.kitchen", json!({"brightness": 120})).await?;
+    client.call_service(Domain::HomeAssistant, Service::Reload, (), ()).await?;
+    client.call_service("light", "turn_off", Target::area("kitchen").and_entity("light.porch"), ()).await?;
+    ```
+*   `call_service_with_response::<R>(...)`: for services that return data, such as `weather.get_forecasts`; the `response` is decoded into `R` (`serde_json::Value` works).
+*   Errors from Home Assistant carry a typed `HaErrorCode` (`Error::Ha { code, message }`, `SubscriptionStatus::Rejected`), with `Other(String)` for unknown codes.
 
 ### Subscriptions
 
