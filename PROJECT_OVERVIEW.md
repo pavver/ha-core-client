@@ -42,6 +42,17 @@ Below is a list of Home Assistant WebSocket API features that are not yet implem
 
 ## Current Development State
 
+### October 29, 2026 (Second Review: Fixes)
+
+**Goal:** Fix the issues found in a second code review (potential bugs and architecture).
+
+**Summary of Changes:**
+*   Model: `HaState` parses exactly (case-sensitive), so `.to("Home")` in a trigger is no longer sent as `"home"`. `AttributeSet::get` looks up one key.
+*   API: `watch_silence` subscripts the object id (`states.sensor['1st_floor']`, checked on 2026.9.4); `get_history` skips unparsable entries; non-`ws(s)://` URLs, non-object raw triggers and another client's `Subscription` fail with `InvalidInput`; the request timeout covers queueing the command.
+*   Runner: the backoff starts over only after a stable session; `subscribe_entity`'s two steps share one deadline; an entity re-added while disconnected is reported; an unconfirmed re-subscription is retried on the same connection instead of reconnecting; jitter from `RandomState`.
+*   Not done (bigger API decisions, left for later): typed events per subscription kind, a `Stream` API, a weak client handle for callbacks, `Target` (area/device/several entities) for service calls, parsing large results outside the runner task.
+*   New scenarios in `tests/client.rs` for each runner change.
+
 ### October 28, 2026 (0.3.0: Review Fixes)
 
 **Goal:** Fix the issues found in a code review of the runner and the typed model.
