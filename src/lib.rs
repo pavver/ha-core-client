@@ -202,6 +202,8 @@ impl HAClient {
     }
 
     /// Fetches the history of states for a specific entity within a time range.
+    ///
+    /// Entries that cannot be parsed are skipped with a warning.
     pub async fn get_history(
         &self,
         entity_id: &str,
@@ -211,13 +213,7 @@ impl HAClient {
     ) -> Result<Vec<HistoricalState>> {
         let request = protocol::history_during_period(entity_id, start_time, end_time, significant_changes_only);
         let result = self.request(request).await?;
-        let mut by_entity: HashMap<String, Vec<events::state::HistoricalStateWire>> = serde_json::from_value(result)?;
-        Ok(by_entity
-            .remove(entity_id)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|wire| wire.into_state(entity_id))
-            .collect())
+        Ok(parse_history(result, entity_id)?)
     }
 
     /// Finds the state of an entity at a specific point in time in the past.
@@ -470,6 +466,23 @@ impl HAClient {
     }
 }
 
+/// Parses the `history_during_period` result for `entity_id`, skipping entries that do
+/// not parse, so one bad record does not lose the whole history.
+fn parse_history(result: Value, entity_id: &str) -> serde_json::Result<Vec<HistoricalState>> {
+    let mut by_entity: HashMap<String, Vec<Value>> = serde_json::from_value(result)?;
+    Ok(by_entity
+        .remove(entity_id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|item| {
+            serde_json::from_value::<events::state::HistoricalStateWire>(item)
+                .inspect_err(|e| log::warn!("Skipping unparsable history entry of {entity_id}: {e}"))
+                .ok()
+        })
+        .map(|wire| wire.into_state(entity_id))
+        .collect())
+}
+
 /// The template of [`HAClient::watch_silence`]: renders `true` while the entity is missing
 /// or its last report is older than `max_silence`. The id is checked because it is part of
 /// the template. The object id is subscripted, since `states.sensor.1st_floor` is a
@@ -488,6 +501,18 @@ fn silence_template(entity_id: &str, max_silence: Duration) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_skips_bad_entries() {
+        let result = serde_json::json!({"sensor.t": [
+            {"s": "1", "a": {}, "lu": 100.0},
+            {"s": "2", "lu": "not a timestamp"},
+            {"s": "3", "lu": 300.0}
+        ]});
+        let states: Vec<_> = parse_history(result, "sensor.t").unwrap().into_iter().map(|h| h.state).collect();
+        assert_eq!(states, ["1", "3"]);
+        assert!(parse_history(serde_json::json!({}), "sensor.t").unwrap().is_empty());
+    }
 
     #[test]
     fn silence_template_checks_the_entity_id() {

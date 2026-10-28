@@ -51,7 +51,7 @@ All client methods return `ha_core_client::Result<T>` = `Result<T, ha_core_clien
 ### State Operations
 *   `async fn get_state(&self, entity_id: &str) -> Result<events::State>`: `Error::Ha { code: "not_found", .. }` if missing.
 *   `async fn get_states(&self) -> Result<Vec<events::State>>`.
-*   `async fn get_history(&self, entity_id: &str, start: DateTime<Utc>, end: DateTime<Utc>, significant_changes_only: bool) -> Result<Vec<HistoricalState>>`.
+*   `async fn get_history(&self, entity_id: &str, start: DateTime<Utc>, end: DateTime<Utc>, significant_changes_only: bool) -> Result<Vec<HistoricalState>>` Unparsable entries are skipped with a warning.
 *   `async fn get_state_at_time(&self, entity_id: &str, timestamp: DateTime<Utc>, lookback: chrono::TimeDelta) -> Result<events::State>`.
 
 ### Service Calls

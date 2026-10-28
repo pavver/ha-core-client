@@ -6,6 +6,7 @@
 
 *   `HaState` parsing ignored case and printed the canonical form, so `StateTrigger::new("input_select.mode").to("Home")` was sent as `"to": "home"` and never fired (states are case-sensitive in Home Assistant). Parsing is now exact: `"on"` is `HaState::On`, `"On"` is `String("On")`, and every `HaState` prints back the string it was parsed from. Behaviour change: `HaState::from_string("ON")` (and `State::ha_state()` of a state `"ON"`) is no longer `HaState::On`.
 *   `watch_silence` failed with a template syntax error for entity ids whose object id starts with a digit (`sensor.1st_floor`). The template now uses `states.sensor['1st_floor']`.
+*   `get_history` failed as a whole when a single history entry could not be parsed. Such entries are now skipped with a warning, like in `get_states`.
 
 ## 0.3.0
 
