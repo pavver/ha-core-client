@@ -408,9 +408,20 @@ impl Runner {
     /// Sends `request` with the next message id. The pending entry is registered
     /// first so that `end_session` can fail it if the send itself fails.
     async fn send(&mut self, ws: &mut WsStream, request: Request, kind: PendingKind) -> Result<u64, String> {
+        let deadline = Instant::now() + self.shared.config.request_timeout;
+        self.send_until(ws, request, kind, deadline).await
+    }
+
+    /// Like [`send`](Self::send), with the deadline of an earlier step of the same operation.
+    async fn send_until(
+        &mut self,
+        ws: &mut WsStream,
+        request: Request,
+        kind: PendingKind,
+        deadline: Instant,
+    ) -> Result<u64, String> {
         let id = self.next_msg_id;
         self.next_msg_id += 1;
-        let deadline = Instant::now() + self.shared.config.request_timeout;
         self.pending.insert(id, Pending { kind, deadline });
         self.send_raw(ws, id, request).await?;
         Ok(id)
@@ -545,7 +556,7 @@ impl Runner {
                 }
             }
             PendingKind::Subscribe { sub_id, responder } => match outcome {
-                Ok(_) => self.subscription_acknowledged(ws, id, sub_id, responder).await?,
+                Ok(_) => self.subscription_acknowledged(ws, id, sub_id, responder, pending.deadline).await?,
                 Err(e) => match responder {
                     Some(r) => {
                         self.remove_subscription(sub_id);
@@ -603,6 +614,7 @@ impl Runner {
         ha_id: u64,
         sub_id: u64,
         responder: Option<oneshot::Sender<Result<Subscription>>>,
+        deadline: Instant,
     ) -> Result<(), String> {
         let restoring = responder.is_none();
         let Some(entry) = self.subs.get_mut(&sub_id) else {
@@ -626,8 +638,10 @@ impl Runner {
         self.routes.insert(ha_id, sub_id);
         match read {
             // Read the entity's state: the baseline now, or what changed while disconnected.
+            // Within the subscribe's deadline, so that the caller's timeout covers both steps.
             Some(request) => {
-                self.send(ws, request, PendingKind::Resync { sub_id, restoring, responder }).await?;
+                let kind = PendingKind::Resync { sub_id, restoring, responder };
+                self.send_until(ws, request, kind, deadline).await?;
             }
             None => {
                 if let Some(ha_id) = responder.and_then(|r| self.confirm(sub_id, r)) {

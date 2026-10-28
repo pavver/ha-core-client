@@ -545,6 +545,32 @@ fn rendered(result: Value) -> Value {
 }
 
 #[tokio::test]
+async fn subscribe_entity_times_out_as_a_whole() {
+    let ha = MockHa::start().await;
+    let config = ha.config().request_timeout(Duration::from_secs(1));
+    let (client, mut conn) = ha.connect(config).await;
+    let sub = tokio::spawn({
+        let client = client.clone();
+        async move { client.subscribe_entity("sensor.a", |_, _| async { Ok(()) }).await }
+    });
+    // Each step answers within the request timeout (ack at 0.6s, read at 1.4s),
+    // both together do not.
+    let trigger = conn.recv_type("subscribe_trigger").await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    conn.ok(&trigger["id"], Value::Null).await;
+    let read = conn.recv_type("subscribe_entities").await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    answer_read(&mut conn, &read, "sensor.a", "1", 100.0).await;
+    let result = tokio::time::timeout(WAIT, sub).await.unwrap().unwrap();
+    assert!(matches!(result, Err(Error::Timeout)), "{result:?}");
+    // The trigger Home Assistant created is cancelled, and so is the late read.
+    let unsub = conn.recv_type("unsubscribe_events").await;
+    assert_eq!(unsub["subscription"], trigger["id"]);
+    let unsub = conn.recv_type("unsubscribe_events").await;
+    assert_eq!(unsub["subscription"], read["id"]);
+}
+
+#[tokio::test]
 async fn template_render_before_the_ack_is_delivered() {
     let ha = MockHa::start().await;
     let (client, mut conn) = ha.connect(ha.config()).await;

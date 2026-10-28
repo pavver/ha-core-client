@@ -160,14 +160,14 @@ impl HAClient {
             return Err(Error::Stopped);
         }
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(make(tx)).await.map_err(|_| Error::Stopped)?;
+        // Covers waiting for room in the command queue too, e.g. while the runner is busy.
         // A little slack so that the runner's own expiry usually answers first.
         let timeout = self.shared.config.request_timeout.saturating_add(Duration::from_secs(1));
-        match tokio::time::timeout(timeout, rx).await {
-            Err(_) => Err(Error::Timeout),
-            Ok(Err(_)) => Err(Error::Stopped),
-            Ok(Ok(result)) => result,
-        }
+        let call = async {
+            self.cmd_tx.send(make(tx)).await.map_err(|_| Error::Stopped)?;
+            rx.await.map_err(|_| Error::Stopped)?
+        };
+        tokio::time::timeout(timeout, call).await.unwrap_or(Err(Error::Timeout))
     }
 
     async fn request(&self, request: protocol::Request) -> Result<Value> {

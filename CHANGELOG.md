@@ -8,6 +8,8 @@
 *   `watch_silence` failed with a template syntax error for entity ids whose object id starts with a digit (`sensor.1st_floor`). The template now uses `states.sensor['1st_floor']`.
 *   `get_history` failed as a whole when a single history entry could not be parsed. Such entries are now skipped with a warning, like in `get_states`.
 *   The reconnect backoff started over after every successful connect, so a connection that Home Assistant (or a proxy) dropped right after `auth_ok` was retried at the shortest delay forever. It now starts over only after a session that stayed up for the longest backoff delay (at most a minute); `ConnectionState::Reconnecting { attempt }` keeps counting until then.
+*   `subscribe_entity` (subscribe, then read the state) gave each step its own `request_timeout`, so it could take up to twice as long, and the caller's own timeout fired first with `Timeout` while the subscription was still being set up. Both steps now share one deadline.
+*   The request timeout did not cover waiting for room in the command queue, so a call could wait indefinitely while the client task was busy.
 
 ## 0.3.0
 
