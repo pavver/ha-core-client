@@ -20,6 +20,8 @@ use crate::{ConnectionState, HAClient};
 
 /// State shared between the runner and every [`HAClient`] handle.
 pub(crate) struct Shared {
+    /// Unique per client, so that a [`Subscription`] of another client is recognised.
+    pub(crate) client_id: u64,
     pub(crate) config: ClientConfig,
     pub(crate) shutdown_tx: watch::Sender<bool>,
     pub(crate) state_tx: watch::Sender<ConnectionState>,
@@ -213,7 +215,7 @@ impl Runner {
     fn restored(&mut self, sub_id: u64) {
         let Some(entry) = self.subs.get_mut(&sub_id) else { return };
         entry.interrupted = false;
-        entry.events.push(status_event(sub_id, SubscriptionStatus::Restored));
+        entry.events.push_status(SubscriptionStatus::Restored);
         for event in entry.held.take().unwrap_or_default() {
             entry.push_entity_event(event, true);
         }
@@ -228,7 +230,8 @@ impl Runner {
             SubKind::EntityState { .. } => queue::Filter::Merge,
             _ => queue::Filter::None,
         };
-        let (events, rx) = queue::channel(sub_id, self.shared.config.subscription_queue_size, filter);
+        let subscription = Subscription { id: sub_id, client: self.shared.client_id };
+        let (events, rx) = queue::channel(subscription, self.shared.config.subscription_queue_size, filter);
         tokio::spawn(Worker::new(rx, callback, self.weak_tx.clone(), self.shared.clone()).run());
         let entry =
             SubEntry { kind, request, events, ha_id: None, interrupted: false, last_state: None, held: None, early: Vec::new() };
@@ -240,7 +243,7 @@ impl Runner {
     /// dropped the future), nobody could ever unsubscribe it, so it is removed; the
     /// returned Home Assistant id, if any, must then be unsubscribed.
     fn confirm(&mut self, sub_id: u64, responder: oneshot::Sender<Result<Subscription>>) -> Option<u64> {
-        if responder.send(Ok(Subscription { id: sub_id })).is_ok() {
+        if responder.send(Ok(Subscription { id: sub_id, client: self.shared.client_id })).is_ok() {
             return None;
         }
         log::debug!("Subscription {sub_id} was abandoned by its caller; removing it");
@@ -261,7 +264,7 @@ impl Runner {
     /// Returns its Home Assistant id.
     fn close_subscription(&mut self, sub_id: u64, status: SubscriptionStatus) -> Option<u64> {
         let entry = self.subs.remove(&sub_id)?;
-        entry.events.push(status_event(sub_id, status));
+        entry.events.push_status(status);
         let ha_id = entry.ha_id?;
         self.routes.remove(&ha_id);
         Some(ha_id)
@@ -301,7 +304,7 @@ impl Runner {
                 self.confirm(sub_id, responder);
                 if let Some(entry) = self.subs.get_mut(&sub_id) {
                     entry.interrupted = true;
-                    entry.events.push(status_event(sub_id, SubscriptionStatus::Interrupted));
+                    entry.events.push_status(SubscriptionStatus::Interrupted);
                 }
             }
             Command::Unsubscribe { id, responder } => {
@@ -394,14 +397,14 @@ impl Runner {
         self.orphans.clear();
         self.ping = None;
 
-        for (sub_id, entry) in self.subs.iter_mut() {
+        for entry in self.subs.values_mut() {
             entry.ha_id = None;
             // The next re-read reports everything that changed since `last_state`.
             entry.held = None;
             entry.early.clear();
             if interrupt && !entry.interrupted {
                 entry.interrupted = true;
-                entry.events.push(status_event(*sub_id, SubscriptionStatus::Interrupted));
+                entry.events.push_status(SubscriptionStatus::Interrupted);
             }
         }
     }
@@ -846,10 +849,6 @@ impl SubEntry {
         }
         self.events.push(event);
     }
-}
-
-fn status_event(sub_id: u64, status: SubscriptionStatus) -> Event {
-    Event::Status { subscription: Subscription { id: sub_id }, status }
 }
 
 /// Timestamps are compared with 1ms tolerance because `subscribe_entities` sends them as floats.

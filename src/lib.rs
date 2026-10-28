@@ -40,6 +40,7 @@ pub use subscription::{BoxError, CallbackResult, EntityChanges, Subscription, Su
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -113,7 +114,9 @@ impl HAClient {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (state_tx, _) = watch::channel(ConnectionState::Connected);
         let (workers, _) = watch::channel(0);
-        let shared = Arc::new(Shared { config, shutdown_tx, state_tx, workers });
+        static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
+        let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
+        let shared = Arc::new(Shared { client_id, config, shutdown_tx, state_tx, workers });
 
         let runner = Runner::new(shared.clone(), cmd_tx.downgrade());
         tokio::spawn(runner.run(ws, cmd_rx, shutdown_rx));
@@ -450,14 +453,21 @@ impl HAClient {
 
     /// Cancels a subscription. Events already queued for its callback are still delivered,
     /// followed by [`SubscriptionStatus::Unsubscribed`].
+    ///
+    /// Fails with [`Error::InvalidInput`] for a subscription of another client.
     pub async fn unsubscribe(&self, subscription: Subscription) -> Result<()> {
         debug!("Unsubscribing from subscription ID: {}", subscription.id);
+        self.check_owner(&subscription)?;
         let id = subscription.id;
         self.call(|responder| Command::Unsubscribe { id, responder }).await.map(drop)
     }
 
     /// Unsubscribes without waiting, for `SubscriptionGuard::drop`.
     pub(crate) fn unsubscribe_detached(&self, subscription: Subscription) {
+        if let Err(e) = self.check_owner(&subscription) {
+            log::warn!("Not unsubscribing: {e}");
+            return;
+        }
         let id = subscription.id;
         // Nobody waits for the answer.
         let (responder, _) = oneshot::channel();
@@ -472,6 +482,15 @@ impl HAClient {
             },
             // The client is stopped; its subscriptions are gone already.
             Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+
+    /// Ids are per client, so another client's subscription would cancel an unrelated one.
+    fn check_owner(&self, subscription: &Subscription) -> Result<()> {
+        if subscription.client == self.shared.client_id {
+            Ok(())
+        } else {
+            Err(Error::InvalidInput(format!("subscription {} belongs to another client", subscription.id)))
         }
     }
 }

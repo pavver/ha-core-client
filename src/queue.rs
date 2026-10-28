@@ -23,6 +23,7 @@ struct State {
 }
 
 struct Inner {
+    subscription: Subscription,
     state: Mutex<State>,
     notify: Notify,
     capacity: usize,
@@ -53,18 +54,18 @@ pub(crate) struct QueueTx(Arc<Inner>);
 /// The worker's end.
 pub(crate) struct QueueRx {
     inner: Arc<Inner>,
-    sub_id: u64,
 }
 
 /// `capacity` bounds data events; see [`Filter`] for how state changes are handled.
-pub(crate) fn channel(sub_id: u64, capacity: usize, filter: Filter) -> (QueueTx, QueueRx) {
+pub(crate) fn channel(subscription: Subscription, capacity: usize, filter: Filter) -> (QueueTx, QueueRx) {
     let inner = Arc::new(Inner {
+        subscription,
         state: Mutex::new(State { items: VecDeque::new(), data_len: 0, lagged: 0, closed: false }),
         notify: Notify::new(),
         capacity: capacity.max(1),
         filter,
     });
-    (QueueTx(inner.clone()), QueueRx { inner, sub_id })
+    (QueueTx(inner.clone()), QueueRx { inner })
 }
 
 impl QueueTx {
@@ -94,6 +95,11 @@ impl QueueTx {
         }
         drop(st);
         inner.notify.notify_one();
+    }
+
+    /// Queues a status event of this subscription.
+    pub(crate) fn push_status(&self, status: SubscriptionStatus) {
+        self.push(Event::Status { subscription: self.0.subscription.clone(), status });
     }
 
     /// Drops everything queued, for a subscription whose callback must not run.
@@ -153,7 +159,7 @@ impl QueueRx {
                 if st.lagged > 0 {
                     let dropped = std::mem::take(&mut st.lagged);
                     let status = SubscriptionStatus::Lagged { dropped };
-                    return Some(Event::Status { subscription: Subscription { id: self.sub_id }, status });
+                    return Some(Event::Status { subscription: self.inner.subscription.clone(), status });
                 }
                 if let Some(event) = st.items.pop_front() {
                     if !matches!(event, Event::Status { .. }) {
@@ -171,7 +177,7 @@ impl QueueRx {
     }
 
     pub(crate) fn sub_id(&self) -> u64 {
-        self.sub_id
+        self.inner.subscription.id
     }
 
     /// Events currently waiting.
@@ -192,7 +198,7 @@ mod tests {
     }
 
     fn status(status: SubscriptionStatus) -> Event {
-        Event::Status { subscription: Subscription { id: 1 }, status }
+        Event::Status { subscription: Subscription { id: 1, client: 0 }, status }
     }
 
     fn describe(e: &Event) -> String {
@@ -222,7 +228,7 @@ mod tests {
 
     #[tokio::test]
     async fn merges_consecutive_changes_of_one_entity() {
-        let (tx, rx) = channel(1, 10, Filter::Merge);
+        let (tx, rx) = channel(Subscription { id: 1, client: 0 }, 10, Filter::Merge);
         tx.push(change("a", "1", "2"));
         tx.push(change("a", "2", "3"));
         tx.push(change("a", "3", "4"));
@@ -233,7 +239,7 @@ mod tests {
 
     #[tokio::test]
     async fn different_entities_are_not_merged() {
-        let (tx, rx) = channel(1, 10, Filter::Merge);
+        let (tx, rx) = channel(Subscription { id: 1, client: 0 }, 10, Filter::Merge);
         tx.push(change("a", "1", "2"));
         tx.push(change("b", "1", "2"));
         assert_eq!(drain(&rx).await, ["a:1->2", "b:1->2"]);
@@ -241,7 +247,7 @@ mod tests {
 
     #[tokio::test]
     async fn drops_oldest_data_but_keeps_statuses() {
-        let (tx, rx) = channel(1, 2, Filter::None);
+        let (tx, rx) = channel(Subscription { id: 1, client: 0 }, 2, Filter::None);
         tx.push(generic(1));
         tx.push(status(SubscriptionStatus::Interrupted));
         tx.push(generic(2));
@@ -252,7 +258,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_filter_skips_kept_states_and_cancelled_changes() {
-        let (tx, rx) = channel(1, 10, Filter::StateChanges);
+        let (tx, rx) = channel(Subscription { id: 1, client: 0 }, 10, Filter::StateChanges);
         tx.push(change("a", "1", "1"));
         tx.push(change("a", "1", "2"));
         tx.push(change("a", "2", "1"));
@@ -263,7 +269,7 @@ mod tests {
 
     #[tokio::test]
     async fn closes_after_draining() {
-        let (tx, rx) = channel(1, 2, Filter::None);
+        let (tx, rx) = channel(Subscription { id: 1, client: 0 }, 2, Filter::None);
         tx.push(generic(1));
         drop(tx);
         assert_eq!(describe(&rx.recv().await.unwrap()), "e1");
@@ -272,7 +278,7 @@ mod tests {
 
     #[tokio::test]
     async fn wakes_a_waiting_receiver() {
-        let (tx, rx) = channel(1, 2, Filter::None);
+        let (tx, rx) = channel(Subscription { id: 1, client: 0 }, 2, Filter::None);
         let waiter = tokio::spawn(async move { rx.recv().await.map(|e| describe(&e)) });
         tokio::task::yield_now().await;
         tx.push(generic(7));

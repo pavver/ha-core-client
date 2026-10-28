@@ -1183,6 +1183,29 @@ async fn unsubscribe_is_reported_to_the_callback() {
 }
 
 #[tokio::test]
+async fn subscription_of_another_client_is_rejected() {
+    let ha = MockHa::start().await;
+    let (client_a, mut conn_a) = ha.connect(ha.config()).await;
+    let (client_b, mut conn_b) = ha.connect(ha.config()).await;
+    let (callback, _rx) = collector();
+    let sub = tokio::spawn({
+        let client = client_a.clone();
+        async move { client.subscribe_trigger(TimePatternTrigger::new().seconds("/5"), callback).await }
+    });
+    let msg = conn_a.recv_type("subscribe_trigger").await;
+    conn_a.ok(&msg["id"], Value::Null).await;
+    let sub = sub.await.unwrap().unwrap();
+    let mut rx_b = subscribe_trigger_collecting(&client_b, &mut conn_b).await;
+
+    // Both have id 1; `client_b` must not cancel its own subscription for it.
+    let result = client_b.unsubscribe(sub.clone()).await;
+    assert!(matches!(result, Err(Error::InvalidInput(_))), "{result:?}");
+    drop(sub.guard(&client_b));
+    round_trip(&client_b, &mut conn_b).await;
+    assert!(rx_b.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn dropping_a_guard_unsubscribes() {
     let ha = MockHa::start().await;
     let (client, mut conn) = ha.connect(ha.config()).await;

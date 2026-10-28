@@ -21,9 +21,12 @@ pub type CallbackResult = std::result::Result<(), BoxError>;
 ///
 /// The id is assigned by the client and stays the same across reconnects.
 /// Dropping it does not unsubscribe; use [`guard`](Self::guard) for that.
+/// It belongs to the client that created it: another client rejects it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Subscription {
     pub(crate) id: u64,
+    /// [`Shared::client_id`](crate::runner::Shared) of the client that created it.
+    pub(crate) client: u64,
 }
 
 impl Subscription {
