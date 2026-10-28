@@ -1,192 +1,11 @@
 # Project Overview
 
-This project is a client for the Home Assistant WebSocket API, written in Rust. It's designed to be a modular and resilient client that can handle WebSocket connections, authentication, and subscriptions. Its key features include:
+`ha-core-client` is a library crate: a strongly-typed, resilient client for the Home Assistant WebSocket API.
 
-*   **Type-Safe Protocol**: All WebSocket commands and messages are mapped to strongly-typed structs and enums, eliminating "magic strings" and enabling compile-time verification.
-*   **Type-Safe Events**: Automatically deserializes incoming events (like `state_changed`, `call_service`, etc.) into a strongly-typed `enum`, making handlers robust and easy to write.
-*   **Ergonomic Callbacks**: Subscription methods are generic over `async` functions, allowing users to pass callbacks directly without boilerplate `Arc::new` or `Box::pin`.
-*   **Async Callbacks**: Event handlers are native `async` functions, removing boilerplate like `tokio::spawn`.
-*   **Concurrent Operations**: Handlers can make their own API calls back to Home Assistant (e.g., get the state of another sensor or call a service) without causing deadlocks.
-*   **Idiomatic Error Handling**: Callbacks return `Result` allowing for the use of the `?` operator for concise and consistent error propagation.
-*   **Auto-Reconnection**: Automatically handles WebSocket connection and re-subscription logic.
-*   **Flexible Logging**: Implemented a comprehensive logging system using the `log` facade with a `tracing` backend, allowing for fine-grained control over log verbosity via the `RUST_LOG` environment variable.
-
-## Project Structure
-
-The project has been refactored into a more modular and maintainable structure. The core `client` logic is now split across several focused files.
-
-```
-.
-├── src
-│   ├── client
-│   │   ├── mod.rs              # Core HAClient struct and module declarations.
-│   │   ├── connection.rs       # Handles the raw WebSocket connection and auto-reconnect.
-│   │   ├── protocol.rs         # Defines type-safe structs and enums for the WebSocket protocol.
-│   │   ├── triggers.rs         # Defines type-safe structs for Home Assistant automation triggers.
-│   │   ├── events              # Module for type-safe Home Assistant events and associated data structures.
-│   │   │   ├── mod.rs          # Core Event enum and public re-exports.
-│   │   │   ├── attributes.rs   # Defines type-safe attribute structs (ClimateAttributes, GenericAttributes) and AttributeSet enums.
-│   │   │   ├── helpers.rs      # Deserialization helper functions (e.g., timestamp parsing).
-│   │   │   ├── service.rs      # Defines the data structures for service-related events (e.g., `ServiceCalledEvent`).
-│   │   │   └── state.rs        # Defines State, HistoricalState, and internal state-related structs.
-│   │   ├── subscription.rs     # Defines the core EventHandlerContext and subscription types.
-│   │   ├── context_helpers     # Module containing ergonomic helper methods, split by domain.
-│   │   │   ├── mod.rs          # Declares domain-specific helper modules.
-│   │   │   ├── alarm.rs        # Alarm Control Panel helpers.
-│   │   │   ├── climate.rs      # Climate entity helpers.
-│   │   │   ├── cover.rs        # Cover entity helpers.
-│   │   │   ├── homeassistant.rs # General Home Assistant entity helpers (turn_on, off, toggle).
-│   │   │   ├── input.rs        # Input (number, text, select) entity helpers.
-│   │   │   └── lock.rs         # Lock entity helpers.
-│   │   ├── state               # Module containing strongly-typed enums for HA states and service parameters.
-│   │   │   ├── mod.rs          # Core state enums (HaState, Domain, Service).
-│   │   │   ├── alarm.rs        # Alarm-specific state enums.
-│   │   │   ├── climate.rs      # Climate-specific state enums (HvacMode, FanMode, etc.).
-│   │   │   ├── common.rs       # Common state-related enums like UnitOfMeasurement.
-│   │   │   ├── cover.rs        # Cover-specific state enums.
-│   │   │   └── lock.rs         # Lock-specific state enums.
-│   │   ├── runner.rs           # Contains the ClientRunner struct and main event loop. Delegates message handling to `handler` module.
-│   │   ├── handler             # Module for handling incoming WebSocket messages and outgoing commands.
-│   │   │   ├── mod.rs          # Declares command and incoming handler modules.
-│   │   │   ├── command.rs      # Processes HandlerCommands and serializes outgoing WebSocket messages.
-│   │   │   └── incoming.rs     # Deserializes and dispatches incoming Home Assistant messages (events, results).
-│   │   └── pending.rs          # Defines structs for managing pending API calls.
-│   ├── config.rs               # Configuration reading logic.
-│   └── main.rs                 # The main application entry point.
-```
-
-*   **`main.rs`**: The application's entry point. Initializes the logger, reads configuration, and starts the client.
-*   **`config.rs`**: Contains the logic to read and parse the `config.json` file.
-*   **`client/` module**: The core of the library, containing the `HAClient` implementation.
-    *   **`client/mod.rs`**: The central hub of the `client` module. It defines the `HAClient` handle and orchestrates the primary `run_loop` by interacting with the `ClientRunner`.
-    *   **`client/runner.rs`**: Implements the internal `ClientRunner` which owns the WebSocket connection and the main event loop. It delegates the complex logic of handling incoming WebSocket messages and internal commands to the `client/handler/` module.
-    *   **`client/connection.rs`**: Implements the transport layer. It manages the WebSocket connection lifecycle, including the type-safe authentication handshake.
-    *   **`client/protocol.rs`**: Defines the strict, type-safe structs and enums for all WebSocket messages sent to and received from Home Assistant (e.g., `CommandMessage`, `ResultMessage`, `IncomingMsgType`). This is the backbone of the type-safe communication, eliminating "magic strings".
-    *   **`client/events/` module**: The `events` module now provides a fully type-safe representation of Home Assistant events.
-        *   **`events/mod.rs`**: The core `Event` enum and public re-exports for the module.
-        *   **`events/attributes.rs`**: Defines all attribute-related structs and enums (e.g., `AttributeSet`, `ClimateAttributes`) for both live and historical data.
-        *   **`events/helpers.rs`**: Contains utility functions, primarily for deserializing timestamps.
-        *   **`events/state.rs`**: Defines the `State` and `HistoricalState` structs, and internal parsing structs like `HistoricalStateWire` and `StateChangedData`.
-    *   **`client/handler/` module**: This new module centralizes the handling of all incoming WebSocket messages and outgoing commands.
-        *   **`handler/mod.rs`**: Declares the `command` and `incoming` sub-modules.
-        *   **`handler/command.rs`**: Contains the logic to process internal `HandlerCommand` messages sent from `HAClient` handles and serialize them into WebSocket messages for Home Assistant.
-        *   **`handler/incoming.rs`**: Contains the logic to deserialize incoming WebSocket messages from Home Assistant (events, results), dispatch them to appropriate internal structures, and trigger callbacks.
-    *   **`client/subscription.rs`**: Defines the public API data structures for managing event subscriptions.
-    *   **`client/context_helpers/` module**: Provides user-friendly helper methods on `HAClient` (e.g., `set_number`, `turn_on`), organized by Home Assistant domain.
-    *   **`client/state/` module**: Provides strongly-typed Rust enums for Home Assistant states. The central `HaState` enum delegates to domain-specific enums (`LockState`, `HvacMode`, etc.) to ensure type safety and modularity.
-    *   **`client/pending.rs`**: Defines structs used to track in-flight API calls.
-
-## How it Works
-
-The client's architecture is designed for concurrency, type-safety, and ease of use. It is built on a "Handle/Runner" pattern.
-
-1.  **`HAClient` Handle & `ClientRunner` Background Task**:
-    *   When you create a client, you get a lightweight `HAClient` handle. This handle is cloneable and is the primary way you interact with the client (e.g., subscribing to events, getting state, calling services).
-    *   The `HAClient::run()` method spawns a background `tokio` task, the `ClientRunner`, which owns the WebSocket connection and the main event loop.
-
-2.  **Shared Command Channel**:
-    *   The `HAClient` handle and the `ClientRunner` communicate over an `mpsc` (multi-producer, single-consumer) channel.
-    *   To allow multiple `HAClient` handles to send commands to the single `ClientRunner`, the sending side of the channel (`mpsc::Sender`) is wrapped in an `Arc`.
-
-3.  **Central Event Loop**:
-    *   The `ClientRunner::run_loop` method contains the master event loop. It uses a `tokio::select!` macro to simultaneously process messages from two sources:
-        *   **WebSocket Messages**: Incoming data from Home Assistant.
-        *   **Handler Commands**: Internal commands sent from `HAClient` handles.
-
-4.  **Type-Safe, Concurrent Event Handling with a Client Handle**:
-    *   **Deserialization**: When a message arrives from Home Assistant, `runner.rs` delegates it to `handler/incoming.rs`. The `handle_event_message` function inspects the `event_type` string (e.g., "state_changed", "call_service"). Based on this string, it attempts to deserialize the event's `data` payload into a specific, strongly-typed struct (e.g., `StateChangedData`, `ServiceCalledEvent`). This struct is then wrapped in the appropriate variant of the main `events::Event` enum, which is then passed to the callback. If deserialization into a specific type fails or the event type is unknown, it gracefully falls back to a generic `Event::Generic` variant.
-    *   **Async Callbacks with Client Handle**: The `EventCallback` is an `async` function that receives a clone of the `HAClient` handle and the typed `events::Event` enum.
-    *   **Concurrent Operations**: Because the callback receives a full `HAClient` handle, it can make its own API calls back to Home Assistant without causing deadlocks.
-    *   **Error Handling**: Callbacks return `Result<()>`, allowing the use of the `?` operator. If a callback returns an `Err`, the `ClientRunner`'s main event loop catches and logs it.
-
-5.  **Request-Response Flow**:
-    The client handles two main types of request-response interactions.
-    *   **General Commands (e.g., `call_service`, `get_states`)**:
-        *   A method on an `HAClient` handle creates a `HandlerCommand` and a temporary `oneshot` channel for the response.
-        *   This is sent to the `ClientRunner`, which serializes a strongly-typed command (e.g., `protocol::CallServiceMessage`) and sends it to Home Assistant with a unique ID.
-        *   The `responder` part of the `oneshot` channel is stored in the `pending_api_calls` map, keyed by the command ID.
-        *   When Home Assistant sends back a `result` message with the same ID, the `ClientRunner` finds the pending call, deserializes the payload if necessary (e.g., a `Vec<State>` for `get_states`), sends the outcome back via the `responder`, and the `await` on the `HAClient` handle completes.
-    *   **Optimized State Fetching (`get_state`)**:
-        *   To avoid fetching all states, `get_state` uses an efficient one-shot subscription model based on the (undocumented) `subscribe_entities` command.
-        *   The client sends a `subscribe_entities` command for a single entity. The `responder` for the `get_state` call is stored in a dedicated `pending_one_shot_gets` map.
-        *   Home Assistant sends back two messages in response:
-            1. A `result` message with `success: true` and a `null` result. This acts as an acknowledgment, and the client ignores it.
-            2. An `event` message containing the entity's current state in a special format.
-        *   When the `event` message arrives, the `ClientRunner` finds the pending `responder` using the message ID. It parses the state from the special event payload, sends the state back, and immediately dispatches an `unsubscribe_events` command to tear down the temporary subscription. This ensures minimal overhead and network traffic.
-
-This design makes the client highly resilient and ergonomic, enabling complex, chained automations where one event can trigger a series of queries and actions.
-
-## Ergonomic Subscriptions
-
-The client features a highly ergonomic API for managing event subscriptions. The subscription methods are generic, meaning you can pass an `async` function or closure directly as a callback without worrying about manual boxing and pinning (`Arc`, `Box::pin`). The library handles the boilerplate internally.
-
-### Example: Subscribing to State Changes
-
-```rust
-// An async function to handle state change events
-async fn handle_state_changes(
-    _client: ha_client::HAClient,
-    event: ha_client::events::Event,
-) -> anyhow::Result<()> {
-    log::info!("State Change Event: {:?}", event);
-    Ok(())
-}
-
-// In your main async function:
-client.subscribe_entity("sensor.my_sensor", handle_state_changes).await?;
-```
-
-### Example: Subscribing to Service Calls
-
-```rust
-// An async function to handle service call events
-async fn handle_service_calls(
-    _client: ha_client::HAClient,
-    event: ha_client::events::Event,
-) -> anyhow::Result<()> {
-    if let ha_client::events::Event::ServiceCalled(service_event) = event {
-        log::info!(
-            "Service Called: {}.{}",
-            service_event.domain,
-            service_event.service
-        );
-    }
-    Ok(())
-}
-
-// In your main async function:
-client.subscribe_service_calls(handle_service_calls).await?;
-```
-
-### Example: Subscribing to a State Trigger
-
-The client also supports subscribing to Home Assistant's powerful automation triggers.
-
-```rust
-// An async function to handle trigger events
-async fn handle_trigger_fired(
-    _client: ha_client::HAClient,
-    event: ha_client::events::Event,
-) -> anyhow::Result<()> {
-    if let ha_client::events::Event::TriggerFired(trigger_event) = event {
-        log::info!(
-            "Trigger Fired: {} - {}",
-            trigger_event.name,
-            trigger_event.description
-        );
-    }
-    Ok(())
-}
-
-// In your main async function:
-client.subscribe_state_trigger(
-    "switch.my_switch",
-    Some(ha_client::state::HaState::On),
-    None,
-    Some(std::time::Duration::from_secs(5)),
-    handle_trigger_fired
-).await?;
-```
+*   Usage and API: [README.md](README.md) and [HA_CORE_CLIENT_SKILL.md](HA_CORE_CLIENT_SKILL.md).
+*   Internals: [ARCHITECTURE.md](ARCHITECTURE.md).
+*   Changes and migration: [CHANGELOG.md](CHANGELOG.md).
+*   Trigger platforms reference: [TRIGGERS_OVERVIEW.md](TRIGGERS_OVERVIEW.md).
 
 ## Future Work / Planned Features
 
@@ -195,7 +14,7 @@ Below is a list of Home Assistant WebSocket API features that are not yet implem
 **Note: Do not begin implementation of these features without a specific command to do so.**
 
 ### Core Commands
-*   **`unsubscribe_events`**: Відписується від подій, на які раніше була оформлена підписка. Це дія, протилежна до `subscribe_events`.
+*   **~~`unsubscribe_events`~~**: (Implemented) Відписується від подій, на які раніше була оформлена підписка. Це дія, протилежна до `subscribe_events`.
 *   **`fire_event`**: Дозволяє ініціювати (викликати) власну подію в системній шині подій Home Assistant.
 *   **~~`subscribe_trigger`~~**: (Implemented) Підписується на спрацювання одного або кількох тригерів, аналогічно до того, як це працює в автоматизаціях Home Assistant.
 
@@ -222,6 +41,19 @@ Below is a list of Home Assistant WebSocket API features that are not yet implem
 ***Disclaimer: The features listed above are planned for future development. Do not implement any of these features without a direct and explicit command.***
 
 ## Current Development State
+
+### October 28, 2026 (0.2.0: Production Hardening)
+
+**Goal:** Make the library reliable enough for production use, based on a code review and on tests against a live Home Assistant 2026.9 instance.
+
+**Summary of Changes:**
+*   The runner now owns the connection directly: reconnect with exponential backoff, fresh per-connection message ids, subscriptions restored in order, `ping`/`pong` keep-alive, request timeouts, typed `Error`, observable `ConnectionState`.
+*   Wire-format fixes: trigger `to`/`from` states, `HH:MM:SS` durations and negative sun offsets, `homeassistant` domain, preset names, compressed state contexts, trigger event payloads.
+*   Tolerant parsing: string enums gain `Other(String)`; malformed attributes fall back to untyped.
+*   `subscribe_entity` filters server-side through a `state` trigger; callbacks run in order per subscription.
+*   Unit tests built from live payload shapes, and end-to-end tests against a mock server (`tests/client.rs`).
+
+See [CHANGELOG.md](CHANGELOG.md) for the full list and the migration guide.
 
 ### December 28, 2025 (Trigger Subscriptions)
 

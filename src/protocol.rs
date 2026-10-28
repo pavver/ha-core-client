@@ -1,130 +1,138 @@
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+//! Wire format of the Home Assistant WebSocket API.
+
 use chrono::{DateTime, Utc};
-use crate::triggers::Trigger;
+use serde::Deserialize;
+use serde_json::{json, Value};
 
-// Outgoing Messages
+use crate::error::Error;
 
-#[derive(Debug, Serialize)]
-pub(crate) struct AuthMessage<'a> {
-    #[serde(rename = "type")]
-    pub msg_type: OutgoingMsgType,
-    pub access_token: &'a str,
+/// A command body without its `id`; the runner assigns ids per connection.
+pub(crate) type Request = Value;
+
+pub(crate) fn auth(token: &str) -> String {
+    json!({ "type": "auth", "access_token": token }).to_string()
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct CommandMessage<T> {
-    pub id: u64,
-    #[serde(flatten)]
-    pub payload: T,
+pub(crate) fn with_id(id: u64, mut request: Request) -> String {
+    request["id"] = id.into();
+    request.to_string()
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct SubscribeEventsMessage {
-    #[serde(rename = "type")]
-    pub msg_type: OutgoingMsgType,
-    pub event_type: String,
+pub(crate) fn ping() -> Request {
+    json!({ "type": "ping" })
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct SubscribeTriggerMessage {
-    #[serde(rename = "type")]
-    pub msg_type: OutgoingMsgType,
-    #[serde(flatten)]
-    pub trigger: Trigger,
+pub(crate) fn subscribe_events(event_type: &str) -> Request {
+    json!({ "type": "subscribe_events", "event_type": event_type })
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct SubscribeEntitiesMessage<'a> {
-    #[serde(rename = "type")]
-    pub msg_type: OutgoingMsgType,
-    pub entity_ids: Vec<&'a str>,
+pub(crate) fn subscribe_trigger(trigger: &Value) -> Request {
+    json!({ "type": "subscribe_trigger", "trigger": trigger })
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct UnsubscribeMessage {
-    #[serde(rename = "type")]
-    pub msg_type: OutgoingMsgType,
-    pub subscription: u64,
+pub(crate) fn subscribe_entities(entity_ids: &[&str]) -> Request {
+    json!({ "type": "subscribe_entities", "entity_ids": entity_ids })
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct CallServiceMessage {
-    #[serde(rename = "type")]
-    pub msg_type: OutgoingMsgType,
-    pub domain: String,
-    pub service: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_data: Option<Value>,
+pub(crate) fn unsubscribe(subscription: u64) -> Request {
+    json!({ "type": "unsubscribe_events", "subscription": subscription })
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct GetHistoryMessage<'a> {
-    #[serde(rename = "type")]
-    pub msg_type: OutgoingMsgType,
-    pub entity_ids: Vec<&'a str>,
-    pub start_time: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub end_time: Option<DateTime<Utc>>,
-    pub significant_changes_only: bool,
+pub(crate) fn get_states() -> Request {
+    json!({ "type": "get_states" })
 }
 
+pub(crate) fn call_service(
+    domain: &str,
+    service: &str,
+    entity_id: Option<&str>,
+    service_data: Option<Value>,
+    return_response: bool,
+) -> Request {
+    let mut msg = json!({ "type": "call_service", "domain": domain, "service": service });
+    if let Some(data) = service_data {
+        msg["service_data"] = data;
+    }
+    if let Some(entity_id) = entity_id {
+        msg["target"] = json!({ "entity_id": entity_id });
+    }
+    if return_response {
+        msg["return_response"] = true.into();
+    }
+    msg
+}
 
-// Incoming Messages
+pub(crate) fn history_during_period(
+    entity_id: &str,
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
+    significant_changes_only: bool,
+) -> Request {
+    json!({
+        "type": "history/history_during_period",
+        "entity_ids": [entity_id],
+        "start_time": start_time,
+        "end_time": end_time,
+        "significant_changes_only": significant_changes_only,
+    })
+}
 
+/// Any message sent by Home Assistant.
 #[derive(Debug, Deserialize)]
-pub(crate) struct BaseMessage {
+pub(crate) struct Incoming {
     #[serde(rename = "type")]
-    pub msg_type: IncomingMsgType,
+    pub msg_type: String,
     #[serde(default)]
-    pub id: u64,
+    pub id: Option<u64>,
+    #[serde(default)]
+    pub success: Option<bool>,
+    #[serde(default)]
+    pub result: Option<Value>,
+    #[serde(default)]
+    pub error: Option<HaError>,
+    #[serde(default)]
+    pub event: Option<Value>,
+    /// Set on `auth_invalid`.
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct EventMessage {
-    pub id: u64,
-    pub event: Value,
+pub(crate) struct HaError {
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub message: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct ResultMessage<T> {
-    pub id: u64,
-    pub success: bool,
-    pub result: Option<T>,
-    pub error: Option<Value>,
+impl From<HaError> for Error {
+    fn from(e: HaError) -> Self {
+        Error::Ha { code: e.code, message: e.message }
+    }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[derive(Debug, Serialize, PartialEq, Eq, Clone, Copy)]
-pub(crate) enum OutgoingMsgType {
-    #[serde(rename = "auth")]
-    Auth,
-    #[serde(rename = "subscribe_events")]
-    SubscribeEvents,
-    #[serde(rename = "subscribe_triggers")]
-    SubscribeTriggers,
-    #[serde(rename = "subscribe_entities")]
-    SubscribeEntities,
-    #[serde(rename = "unsubscribe_events")]
-    UnsubscribeEvents,
-    #[serde(rename = "call_service")]
-    CallService,
-    #[serde(rename = "get_states")]
-    GetStates,
-    #[serde(rename = "history/history_during_period")]
-    GetHistory,
-}
+    #[test]
+    fn call_service_uses_target() {
+        let v = call_service("light", "turn_on", Some("light.a"), Some(json!({"brightness": 10})), true);
+        assert_eq!(
+            v,
+            json!({"type": "call_service", "domain": "light", "service": "turn_on",
+                   "service_data": {"brightness": 10}, "target": {"entity_id": "light.a"},
+                   "return_response": true})
+        );
+    }
 
-#[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy)]
-pub(crate) enum IncomingMsgType {
-    #[serde(rename = "auth_required")]
-    AuthRequired,
-    #[serde(rename = "auth_ok")]
-    AuthOk,
-    #[serde(rename = "auth_invalid")]
-    AuthInvalid,
-    #[serde(rename = "event")]
-    Event,
-    #[serde(rename = "result")]
-    Result,
+    #[test]
+    fn parses_error_result() {
+        let m: Incoming = serde_json::from_str(
+            r#"{"id":5,"type":"result","success":false,"error":{"code":"invalid_format","message":"bad"}}"#,
+        )
+        .unwrap();
+        assert_eq!(m.id, Some(5));
+        assert!(matches!(Error::from(m.error.unwrap()), Error::Ha { code, .. } if code == "invalid_format"));
+    }
 }

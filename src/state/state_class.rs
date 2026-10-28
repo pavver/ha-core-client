@@ -1,11 +1,11 @@
-use serde::{Deserialize, Serialize};
-use strum::{AsRefStr, Display, EnumString};
+use super::string_enum;
 
-#[derive(Debug, PartialEq, Clone, Copy, Deserialize, EnumString, Display, AsRefStr, Serialize)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
-pub enum StateClass {
-    Measurement,
-    Total,
-    TotalIncreasing,
+string_enum! {
+    /// State class of a sensor entity.
+    pub enum StateClass {
+        Measurement => "measurement",
+        MeasurementAngle => "measurement_angle",
+        Total => "total",
+        TotalIncreasing => "total_increasing",
+    }
 }

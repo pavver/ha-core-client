@@ -6,5 +6,6 @@ use serde_json::Value;
 pub struct ServiceCalledEvent {
     pub domain: String,
     pub service: String,
+    #[serde(default)]
     pub service_data: Value,
 }

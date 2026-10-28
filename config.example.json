@@ -1,0 +1,5 @@
+{
+  "HA_URL": "ws://homeassistant.local:8123/api/websocket",
+  "HA_TOKEN": "YOUR_LONG_LIVED_ACCESS_TOKEN",
+  "DEMO_ENTITY": "sensor.example"
+}

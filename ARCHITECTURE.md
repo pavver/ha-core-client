@@ -5,31 +5,31 @@ This library is designed with type safety, asynchronicity, and resilience to net
 ## Core Components
 
 ### 1. Handle/Runner Pattern (Actor Model)
-The architecture decouples the user-facing interface from the network state management:
-*   **`HAClient` (Handle)**: A lightweight structure containing only the communication channels (`mpsc::Sender`) to the background process. It implements `Clone`, allowing it to be easily passed into different async tasks or callbacks.
-*   **`ClientRunner` (Runner/Actor)**: The central hub running in its own background task. It sequentially processes:
-    *   Incoming commands from `HAClient`.
-    *   Incoming WebSocket messages (events, API results).
-    *   Shutdown signals.
-    This design eliminates the need for complex locking mechanisms (`Mutex`/`RwLock`) for the client's shared state.
+*   **`HAClient` (Handle, `src/lib.rs`)**: holds an `mpsc::Sender<Command>` and an `Arc<Shared>` (config, shutdown signal, connection-state `watch`). Cloning is cheap. Every method sends a `Command` (`src/subscription.rs`) carrying a `oneshot` responder and awaits it with the request timeout.
+*   **`Runner` (Actor, `src/runner.rs`)**: a single background task that owns the WebSocket and all state (subscriptions, in-flight requests, per-connection message ids). No locks are needed.
+*   The runner keeps only a *weak* sender, so it shuts down when every user handle is dropped. Callbacks get a temporary strong handle while they run.
 
-### 2. Connection Management (`WsConnection`)
-A dedicated module manages the WebSocket lifecycle:
-*   **Auto-Reconnection**: Upon connection loss, `WsConnection` attempts to reconnect with an exponential backoff strategy.
-*   **Authentication State**: Handles the initial handshake and authentication using Long-Lived Access Tokens.
-*   **Subscription Recovery**: On successful reconnection, the `ClientRunner` automatically resubscribes to all previously registered event handlers and triggers.
+### 2. Connection Lifecycle
+*   `HAClient::connect` performs the first connect and authentication itself (`src/connection.rs`), so a wrong URL or token is returned to the caller instead of being retried.
+*   A **session** runs while connected: `select!` over shutdown, incoming frames, commands and a housekeeping tick.
+*   A session ends on a `Close` frame, read/write error, or a missing `pong`. All in-flight requests then fail with `ConnectionLost`, and the runner enters the **offline** phase: exponential backoff with jitter, then reconnect. While offline, commands are answered immediately with `NotConnected`.
+*   `auth_invalid` during a reconnect is terminal (`ConnectionState::AuthFailed`), because retrying a revoked token only risks an IP ban.
 
-### 3. Type-Safe Protocol
-*   **`protocol.rs`**: Defines strongly-typed structures for all Home Assistant WebSocket API messages. No raw JSON manipulation is used for core logic—everything is serialized and deserialized through these structures.
-*   **`state/`**: Contains enums for domains, services, and entity states. Leveraging the `strum` crate, these enums are seamlessly converted to strings for the HA API.
-*   **`events/`**: Implements intelligent deserialization for events, where attribute structures are automatically determined based on the entity's domain.
+### 3. Message Ids and Subscriptions
+*   Home Assistant requires message ids to strictly increase per connection, so ids restart at 1 on each connection.
+*   Each subscription has a stable client-side id (the `Subscription` handle) plus the Home Assistant message id on the current connection. A `routes` map translates the latter back to the former.
+*   On reconnect, all subscriptions are re-sent in creation order (a `BTreeMap`). A re-subscription that Home Assistant rejects is logged and dropped.
+*   `subscribe_*` calls complete when Home Assistant acknowledges them, so configuration errors reach the caller.
 
-### 4. Subscription & Callback System
-The library utilizes generalized async callbacks:
-*   Users can provide any closure or function that returns a `Future`.
-*   Callbacks receive their own clone of `HAClient`, enabling "reaction" logic (e.g., turning on a light in response to a motion sensor) without creating circular dependencies or deadlocks.
+### 4. Request Bookkeeping
+*   Every sent request has a `Pending` entry with a deadline. The housekeeping tick expires overdue entries (`Timeout`) and drives the `ping`/`pong` keep-alive.
+*   `get_state` uses a one-shot `subscribe_entities`: the ack is followed by an event with the compressed state, after which the client unsubscribes.
 
-## Architectural Benefits
-*   **Resilience**: The client automatically recovers even if the Home Assistant instance restarts.
-*   **Ease of Use**: A high-level API hides the complexity of the underlying WebSocket protocol.
-*   **Safety**: Rust's ownership model and the actor pattern guarantee the absence of memory errors and race conditions.
+### 5. Type-Safe Protocol
+*   **`protocol.rs`**: builders for outgoing messages and one `Incoming` struct for everything Home Assistant sends.
+*   **`state/`**: enums for domains, services, entity states and attribute values. String-valued enums are generated by `string_enum!` with an `Other(String)` fallback, so unknown values round-trip instead of failing.
+*   **`events/`**: `Event` conversion per subscription kind: bus events, entity state triggers (as `StateChanged`) and other triggers (as `TriggerFired`). Attribute parsing never fails; values that do not fit the typed schema are kept untyped.
+
+### 6. Callbacks
+*   Each subscription has a worker task that runs its callbacks one at a time, in event order. Each callback runs in its own spawned task, so a panic is contained and logged.
+*   Callbacks receive an `HAClient` handle, so they can call Home Assistant themselves without deadlocking the runner.

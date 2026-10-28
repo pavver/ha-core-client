@@ -1,5 +1,4 @@
-use anyhow::{anyhow, Result};
-use std::str::FromStr;
+use crate::{Error, Result};
 
 use crate::{
     state::{Domain, Service},
@@ -7,42 +6,25 @@ use crate::{
 };
 
 impl HAClient {
-    /// Turns on an entity (switch, light, etc.).
+    /// Calls `service` in the entity's own domain (e.g. `light.turn_on` for `light.kitchen`).
+    async fn call_entity_service(&self, entity_id: &str, service: Service) -> Result<()> {
+        let domain = Domain::of_entity(entity_id)
+            .ok_or_else(|| Error::InvalidInput(format!("invalid entity_id: {entity_id}")))?;
+        self.call_service(domain, service, Some(entity_id), None).await
+    }
+
+    /// Turns on an entity (switch, light, fan, …).
     pub async fn turn_on(&self, entity_id: &str) -> Result<()> {
-        let domain_str = entity_id
-            .split('.')
-            .next()
-            .ok_or_else(|| anyhow!("Invalid entity_id: {}", entity_id))?;
-        let domain =
-            Domain::from_str(domain_str).map_err(|_| anyhow!("Unknown domain: {}", domain_str))?;
-
-        self.call_service(domain, Service::TurnOn, Some(entity_id), None)
-            .await
+        self.call_entity_service(entity_id, Service::TurnOn).await
     }
 
-    /// Turns off an entity (switch, light, etc.).
+    /// Turns off an entity (switch, light, fan, …).
     pub async fn turn_off(&self, entity_id: &str) -> Result<()> {
-        let domain_str = entity_id
-            .split('.')
-            .next()
-            .ok_or_else(|| anyhow!("Invalid entity_id: {}", entity_id))?;
-        let domain =
-            Domain::from_str(domain_str).map_err(|_| anyhow!("Unknown domain: {}", domain_str))?;
-
-        self.call_service(domain, Service::TurnOff, Some(entity_id), None)
-            .await
+        self.call_entity_service(entity_id, Service::TurnOff).await
     }
 
-    /// Toggles an entity (switch, light, etc.).
+    /// Toggles an entity (switch, light, fan, …).
     pub async fn toggle(&self, entity_id: &str) -> Result<()> {
-        let domain_str = entity_id
-            .split('.')
-            .next()
-            .ok_or_else(|| anyhow!("Invalid entity_id: {}", entity_id))?;
-        let domain =
-            Domain::from_str(domain_str).map_err(|_| anyhow!("Unknown domain: {}", domain_str))?;
-
-        self.call_service(domain, Service::Toggle, Some(entity_id), None)
-            .await
+        self.call_entity_service(entity_id, Service::Toggle).await
     }
 }

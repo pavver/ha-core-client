@@ -1,8 +1,9 @@
 use strum::{EnumString, Display};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Represents the state of a Lock entity.
-#[derive(Debug, PartialEq, Clone, Copy, EnumString, Display, Serialize)]
+#[derive(Debug, PartialEq, Clone, Copy, EnumString, Display, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum LockState {
     Locked,
@@ -10,4 +11,6 @@ pub enum LockState {
     Locking,
     Unlocking,
     Jammed,
+    Open,
+    Opening,
 }

@@ -2,6 +2,8 @@
 
 This document provides a comprehensive overview of all available triggers in Home Assistant automations. This list can be used as a reference for implementing type-safe trigger subscription helpers in the client.
 
+> **Using these platforms:** the typed helpers cover `state`, `numeric_state`, `sun`, `time`, `time_pattern`, `template` and `zone`. Every platform below can be used through `HAClient::subscribe_trigger_raw`, e.g. `subscribe_trigger_raw(json!({"platform": "event", "event_type": "my_event"}), cb)`. Durations and offsets use the `HH:MM:SS` format.
+
 > **Note on WebSocket API Compatibility:**
 > According to the official Home Assistant developer documentation, the `subscribe_trigger` command in the WebSocket API supports the same trigger platforms and syntax as defined here for automations. This list is therefore considered accurate and complete for the purpose of creating WebSocket-based trigger subscriptions.
 

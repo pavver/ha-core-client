@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use strum::{EnumString, Display, AsRefStr};
 
+use super::string_enum;
+
 /// Represents the possible HVAC modes for a climate entity.
 #[derive(Debug, PartialEq, Clone, Copy, Deserialize, EnumString, Display, AsRefStr, Serialize)]
 #[serde(rename_all = "snake_case")] // Keep for serde deserialization
@@ -15,77 +17,57 @@ pub enum HvacMode {
     FanOnly,
 }
 
-/// Represents the fan modes for a climate entity.
-#[derive(Debug, PartialEq, Clone, Copy, Deserialize, EnumString, Display, AsRefStr, Serialize)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
-pub enum FanMode {
-    Auto,
-    Low,
-    Medium,
-    High,
-}
-
-/// Represents the swing modes for a climate entity.
-#[derive(Debug, PartialEq, Clone, Copy, Deserialize, EnumString, Display, AsRefStr, Serialize)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
-pub enum SwingMode {
-    On,
-    Off,
-    Vertical,
-    Horizontal,
-    Both,
-}
-/// Represents common preset modes, with a fallback for custom presets.
-#[derive(Debug, PartialEq, Clone, Display, AsRefStr)]
-pub enum PresetMode {
-    Eco,
-    Away,
-    Boost,
-    Comfort,
-    Home,
-    Sleep,
-    Activity,
-    Custom(String),
-}
-
-impl<'de> Deserialize<'de> for PresetMode {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        Ok(match s.as_str() {
-            "eco" => PresetMode::Eco,
-            "away" => PresetMode::Away,
-            "boost" => PresetMode::Boost,
-            "comfort" => PresetMode::Comfort,
-            "home" => PresetMode::Home,
-            "sleep" => PresetMode::Sleep,
-            "activity" => PresetMode::Activity,
-            _ => PresetMode::Custom(s),
-        })
+string_enum! {
+    /// Fan modes of a climate entity. Integrations often define their own
+    /// (`quiet`, `turbo`, …), which end up in `Other`.
+    pub enum FanMode {
+        On => "on",
+        Off => "off",
+        Auto => "auto",
+        Low => "low",
+        Medium => "medium",
+        Middle => "middle",
+        High => "high",
+        Focus => "focus",
+        Diffuse => "diffuse",
+        Top => "top",
     }
 }
 
-impl Serialize for PresetMode {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        match self {
-            PresetMode::Eco => serializer.serialize_str("eco"),
-            PresetMode::Away => serializer.serialize_str("away"),
-            PresetMode::Boost => serializer.serialize_str("boost"),
-            PresetMode::Comfort => serializer.serialize_str("comfort"),
-            PresetMode::Home => serializer.serialize_str("home"),
-            PresetMode::Sleep => serializer.serialize_str("sleep"),
-            PresetMode::Activity => serializer.serialize_str("activity"),
-            PresetMode::Custom(s) => serializer.serialize_str(s),
-        }
+string_enum! {
+    /// Swing modes of a climate entity.
+    pub enum SwingMode {
+        On => "on",
+        Off => "off",
+        Vertical => "vertical",
+        Horizontal => "horizontal",
+        Both => "both",
     }
 }
 
+string_enum! {
+    /// Preset modes of a climate entity, with a fallback for custom presets.
+    pub enum PresetMode {
+        None => "none",
+        Eco => "eco",
+        Away => "away",
+        Boost => "boost",
+        Comfort => "comfort",
+        Home => "home",
+        Sleep => "sleep",
+        Activity => "activity",
+    }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn modes_use_wire_strings() {
+        assert_eq!(PresetMode::Eco.to_string(), "eco");
+        assert_eq!(PresetMode::from("my_preset").to_string(), "my_preset");
+        let fans: Vec<FanMode> = serde_json::from_str(r#"["auto","quiet","turbo"]"#).unwrap();
+        assert_eq!(fans, vec![FanMode::Auto, FanMode::Other("quiet".into()), FanMode::Other("turbo".into())]);
+    }
+}
