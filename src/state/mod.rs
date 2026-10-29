@@ -1,11 +1,17 @@
 mod macros;
 
 pub mod alarm;
+pub mod automation;
 pub mod climate;
 pub mod common;
 pub mod cover;
 pub mod device_class;
+pub mod device_tracker;
+pub mod fan;
+pub mod light;
 pub mod lock;
+pub mod media_player;
+pub mod number;
 pub mod state_class;
 
 pub(crate) use macros::string_enum;

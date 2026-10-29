@@ -58,6 +58,16 @@ async fn main() -> anyhow::Result<()> {
 
 Keep at least one `HAClient` handle alive: when every handle is dropped, the client shuts down. A callback receives its own handle while it runs; if it needs one outside that, capture a `WeakClient` (`client.downgrade()`, `weak.upgrade()`) so the subscription does not keep the client alive.
 
+Entity attributes are typed by domain (`light`, `cover`, `fan`, `media_player`, `sensor`, `climate`, `weather`, `person`, …); anything else, or attributes that do not match the schema, comes as `Generic`. Use the `as_*` accessors and `get`/`get_as` for any key:
+
+```rust,ignore
+let state = client.get_state("light.kitchen").await?;
+if let Some(light) = state.attributes.as_light() {
+    println!("brightness: {:?}, color mode: {:?}", light.brightness, light.color_mode);
+}
+let battery: Option<u8> = state.attributes.get_as("battery_level");
+```
+
 Callbacks return `ha_core_client::CallbackResult` (`Result<(), Box<dyn Error + Send + Sync>>`): end with `Ok(())`, and `?` works on any error type, including `anyhow::Error`. Returned errors are logged.
 
 ## Configuration

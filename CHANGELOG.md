@@ -26,6 +26,7 @@
 
 *   `subscribe_events` always delivers `BusEvent`; `state_changed` and `call_service` are no longer special-cased.
 *   A `watch_silence` template render error (and an entity-subscription payload that cannot be parsed) is logged and skipped instead of being delivered as another event type.
+*   `AttributeSet` has new variants (`Sensor`, `BinarySensor`, `Light`, `Cover`, `Fan`, `MediaPlayer`, `Number`, `Select`, `Update`, `Weather`, `Sun`, `Person`, `DeviceTracker`, `Zone`, `Automation`). Code matching only `Climate`/`Generic` must add a wildcard arm, and entities of these domains no longer come as `Generic` (attributes that do not match the schema still do). Typed fields moved out of `rest` for these entities.
 
 ### Fixed
 
@@ -42,6 +43,7 @@
 
 ### Added
 
+*   Typed attribute structs per domain (`SensorAttributes`, `BinarySensorAttributes`, `LightAttributes`, `CoverAttributes`, `FanAttributes`, `MediaPlayerAttributes`, `NumberAttributes`, `SelectAttributes`, `UpdateAttributes`, `WeatherAttributes`, `SunAttributes`, `PersonAttributes`, `DeviceTrackerAttributes`, `ZoneAttributes`, `AutomationAttributes`) and the enums `ColorMode`, `FanDirection`, `RepeatMode`, `NumberMode`, `SourceType`, `RunMode`. `AttributeSet` gained `icon()`, `get_as::<T>(key)` and one `as_*` accessor per variant.
 *   `Target`: what a service call acts on (entities, devices, areas, floors, labels), with `From` impls for entity ids.
 *   `HaErrorCode`: typed Home Assistant error codes with an `Other(String)` fallback.
 *   `Source<T>` (`Source::entity`, `entity_with`, `state_changes`, `service_calls`, `events`, `trigger`, `trigger_raw`, `template`, `template_as`, `silence`) and `HAClient::subscribe(source, callback)`: the general form of the `subscribe_*` methods.

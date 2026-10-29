@@ -3,7 +3,7 @@ pub(crate) mod helpers;
 pub mod state;
 pub mod service;
 
-pub use attributes::{AttributeSet, ClimateAttributes, GenericAttributes};
+pub use attributes::*;
 pub use state::{HistoricalState, State};
 pub use service::ServiceCall;
 pub use state::StateChange;
