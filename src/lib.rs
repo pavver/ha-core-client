@@ -53,7 +53,8 @@ use std::time::Duration;
 use chrono::{DateTime, TimeDelta, Utc};
 use log::debug;
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -207,7 +208,7 @@ impl HAClient {
         tokio::time::timeout(timeout, call).await.unwrap_or(Err(Error::Timeout))
     }
 
-    async fn request(&self, request: protocol::Request) -> Result<Value> {
+    async fn request(&self, request: protocol::Request) -> Result<Box<RawValue>> {
         self.call(|responder| Command::Request { request, responder }).await
     }
 
@@ -228,13 +229,13 @@ impl HAClient {
     pub async fn get_states(&self) -> Result<Vec<State>> {
         debug!("Requesting all states");
         let result = self.request(protocol::get_states()).await?;
-        let Value::Array(items) = result else {
+        let Ok(items) = serde_json::from_str::<Vec<Box<RawValue>>>(result.get()) else {
             return Err(Error::Protocol("get_states did not return a list".into()));
         };
         Ok(items
             .into_iter()
             .filter_map(|item| {
-                serde_json::from_value::<State>(item)
+                serde_json::from_str::<State>(item.get())
                     .inspect_err(|e| log::warn!("Skipping entity with unparsable state: {e}"))
                     .ok()
             })
@@ -253,7 +254,7 @@ impl HAClient {
     ) -> Result<Vec<HistoricalState>> {
         let request = protocol::history_during_period(entity_id, start_time, end_time, significant_changes_only);
         let result = self.request(request).await?;
-        Ok(parse_history(result, entity_id)?)
+        Ok(parse_history(&result, entity_id)?)
     }
 
     /// Finds the state of an entity at a specific point in time in the past.
@@ -330,9 +331,9 @@ impl HAClient {
         target: impl Into<Target>,
         data: impl Serialize,
     ) -> Result<R> {
-        let mut result = self.service_call(domain.into(), service.into(), target.into(), data, true).await?;
-        let response = result.get_mut("response").map(Value::take).unwrap_or(Value::Null);
-        Ok(serde_json::from_value(response)?)
+        let result = self.service_call(domain.into(), service.into(), target.into(), data, true).await?;
+        let wrapper: ServiceResponse = serde_json::from_str(result.get())?;
+        Ok(serde_json::from_str(wrapper.response.map_or("null", RawValue::get))?)
     }
 
     async fn service_call(
@@ -342,7 +343,7 @@ impl HAClient {
         target: Target,
         data: impl Serialize,
         return_response: bool,
-    ) -> Result<Value> {
+    ) -> Result<Box<RawValue>> {
         let service_data = match serde_json::to_value(data) {
             Ok(Value::Null) => None,
             Ok(data @ Value::Object(_)) => Some(data),
@@ -615,16 +616,22 @@ impl HAClient {
     }
 }
 
+#[derive(Deserialize)]
+struct ServiceResponse<'a> {
+    #[serde(borrow, default)]
+    response: Option<&'a RawValue>,
+}
+
 /// Parses the `history_during_period` result for `entity_id`, skipping entries that do
 /// not parse, so one bad record does not lose the whole history.
-fn parse_history(result: Value, entity_id: &str) -> serde_json::Result<Vec<HistoricalState>> {
-    let mut by_entity: HashMap<String, Vec<Value>> = serde_json::from_value(result)?;
+fn parse_history(result: &RawValue, entity_id: &str) -> serde_json::Result<Vec<HistoricalState>> {
+    let mut by_entity: HashMap<String, Vec<Box<RawValue>>> = serde_json::from_str(result.get())?;
     Ok(by_entity
         .remove(entity_id)
         .unwrap_or_default()
         .into_iter()
         .filter_map(|item| {
-            serde_json::from_value::<events::state::HistoricalStateWire>(item)
+            serde_json::from_str::<events::state::HistoricalStateWire>(item.get())
                 .inspect_err(|e| log::warn!("Skipping unparsable history entry of {entity_id}: {e}"))
                 .ok()
         })
@@ -638,13 +645,13 @@ mod tests {
 
     #[test]
     fn history_skips_bad_entries() {
-        let result = serde_json::json!({"sensor.t": [
+        let result = serde_json::value::to_raw_value(&serde_json::json!({"sensor.t": [
             {"s": "1", "a": {}, "lu": 100.0},
             {"s": "2", "lu": "not a timestamp"},
             {"s": "3", "lu": 300.0}
-        ]});
-        let states: Vec<_> = parse_history(result, "sensor.t").unwrap().into_iter().map(|h| h.state).collect();
+        ]})).unwrap();
+        let states: Vec<_> = parse_history(&result, "sensor.t").unwrap().into_iter().map(|h| h.state).collect();
         assert_eq!(states, ["1", "3"]);
-        assert!(parse_history(serde_json::json!({}), "sensor.t").unwrap().is_empty());
+        assert!(parse_history(&serde_json::value::to_raw_value(&serde_json::json!({})).unwrap(), "sensor.t").unwrap().is_empty());
     }
 }

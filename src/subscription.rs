@@ -8,6 +8,7 @@ use tokio::sync::oneshot;
 use crate::error::Result;
 use crate::events::{State, SubEvent};
 use crate::protocol::Request;
+use serde_json::value::RawValue;
 use crate::queue::QueueRx;
 use crate::HAClient;
 
@@ -151,7 +152,7 @@ pub(crate) enum Command {
     /// A request whose raw `result` is returned to the caller.
     Request {
         request: Request,
-        responder: oneshot::Sender<Result<Value>>,
+        responder: oneshot::Sender<Result<Box<RawValue>>>,
     },
     GetStateOnce {
         entity_id: String,

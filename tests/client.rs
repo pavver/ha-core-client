@@ -615,6 +615,23 @@ async fn requests_fail_fast_while_disconnected() {
 }
 
 #[tokio::test]
+async fn get_states_skips_bad_entities_from_raw_result() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let req = tokio::spawn({
+        let client = client.clone();
+        async move { client.get_states().await }
+    });
+    let msg = conn.recv_type("get_states").await;
+    let mut bad = state("sensor.bad", "1");
+    bad["last_changed"] = json!(5);
+    conn.ok(&msg["id"], json!([state("sensor.ok", "1"), bad])).await;
+    let states = req.await.unwrap().unwrap();
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].entity_id, "sensor.ok");
+}
+
+#[tokio::test]
 async fn in_flight_request_fails_when_connection_drops() {
     let ha = MockHa::start().await;
     let (client, mut conn) = ha.connect(ha.config()).await;

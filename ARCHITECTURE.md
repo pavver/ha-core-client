@@ -6,7 +6,7 @@ This library is designed with type safety, asynchronicity, and resilience to net
 
 ### 1. Handle/Runner Pattern (Actor Model)
 *   **`HAClient` (Handle, `src/lib.rs`)**: holds an `mpsc::Sender<Command>` and an `Arc<Shared>` (config, shutdown signal, connection-state `watch`). Cloning is cheap. Every method sends a `Command` (`src/subscription.rs`) carrying a `oneshot` responder and awaits it with the request timeout.
-*   **`Runner` (Actor, `src/runner.rs`)**: a single background task that owns the WebSocket and all state (subscriptions, in-flight requests, per-connection message ids). No locks are needed.
+*   **`Runner` (Actor, `src/runner.rs`)**: a single background task that owns the WebSocket and all state (subscriptions, in-flight requests, per-connection message ids). No locks are needed. Request results stay raw JSON (`RawValue`) in the runner and are decoded by the calling task, so a huge `get_states` answer does not stall events or pings.
 *   The runner keeps only a *weak* sender, so it shuts down when every user handle is dropped. Callbacks get a temporary strong handle while they run.
 
 ### 2. Connection Lifecycle

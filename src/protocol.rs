@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use serde_json::{json, Value};
 
 use crate::error::Error;
@@ -94,7 +95,7 @@ pub(crate) struct Incoming {
     #[serde(default)]
     pub success: Option<bool>,
     #[serde(default)]
-    pub result: Option<Value>,
+    pub result: Option<Box<RawValue>>,
     #[serde(default)]
     pub error: Option<HaError>,
     #[serde(default)]
@@ -124,6 +125,15 @@ impl From<HaError> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incoming_keeps_result_verbatim() {
+        let text = r#"{"id":3,"type":"result","success":true,"result":{"a":[1, 2],"b": {"c":null}}}"#;
+        let msg: Incoming = serde_json::from_str(text).unwrap();
+        assert_eq!(msg.result.unwrap().get(), r#"{"a":[1, 2],"b": {"c":null}}"#);
+        let msg: Incoming = serde_json::from_str(r#"{"id":4,"type":"result","success":true}"#).unwrap();
+        assert!(msg.result.is_none());
+    }
 
     #[test]
     fn call_service_uses_target() {

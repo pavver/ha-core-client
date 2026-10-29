@@ -14,6 +14,7 @@ use crate::connection::{connect_and_auth, WsStream};
 use crate::error::{Error, HaErrorCode, Result};
 use crate::events::{State, StateChange, SubEvent, SubscriptionStatus};
 use crate::protocol::{self, Incoming, Request};
+use serde_json::value::RawValue;
 use crate::queue::{self, QueueRx, QueueTx};
 use crate::subscription::{Command, Delivery, EntityChanges, EventCallback, SubKind, Subscribed, Subscription};
 use crate::{ConnectionState, HAClient};
@@ -65,8 +66,12 @@ struct SubEntry {
     early: Vec<SubEvent>,
 }
 
+fn null_result() -> Box<RawValue> {
+    RawValue::from_string("null".into()).expect("null is valid JSON")
+}
+
 enum PendingKind {
-    Request(oneshot::Sender<Result<Value>>),
+    Request(oneshot::Sender<Result<Box<RawValue>>>),
     /// `responder` is `None` for re-subscriptions after a reconnect.
     Subscribe {
         sub_id: u64,
@@ -543,7 +548,7 @@ impl Runner {
         match msg.msg_type.as_str() {
             "result" => {
                 let outcome = if msg.success == Some(true) {
-                    Ok(msg.result.unwrap_or(Value::Null))
+                    Ok(msg.result.unwrap_or_else(null_result))
                 } else {
                     Err(msg.error.map(Error::from).unwrap_or_else(|| {
                         Error::Protocol("request failed without an error message".into())
@@ -565,7 +570,7 @@ impl Runner {
         }
     }
 
-    async fn handle_result(&mut self, ws: &mut WsStream, id: u64, outcome: Result<Value>) -> Result<(), String> {
+    async fn handle_result(&mut self, ws: &mut WsStream, id: u64, outcome: Result<Box<RawValue>>) -> Result<(), String> {
         let Some(pending) = self.pending.remove(&id) else {
             log::debug!("Result for unknown or expired request id {id}");
             return Ok(());
@@ -576,7 +581,7 @@ impl Runner {
                 // Home Assistant sends nothing more for it after this answer.
                 self.orphans.remove(&ha_id);
                 match (responder, outcome) {
-                    (Some(r), outcome) => drop(r.send(outcome)),
+                    (Some(r), outcome) => drop(r.send(outcome.map(|_| Value::Null))),
                     (None, Err(e)) => log::debug!("Unsubscribing {ha_id} failed: {e}"),
                     (None, Ok(_)) => {}
                 }

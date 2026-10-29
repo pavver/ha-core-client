@@ -40,6 +40,7 @@
 *   A re-subscription that Home Assistant did not confirm within `request_timeout` ended the connection, interrupting every subscription; one that never got an answer kept the client reconnecting forever. It is now sent again on the same connection, and the others stay active.
 *   The reconnect jitter came from the clock's nanoseconds, which on platforms with a coarse clock gave only a few distinct delays. It now uses a random value.
 *   `AttributeSet::get` serialized all attributes on every call; it now looks up the one key.
+*   Large results (`get_states`, history) no longer block event delivery and pings while being parsed: the runner keeps them as raw JSON and the caller decodes them.
 
 ### Added
 
