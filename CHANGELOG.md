@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+*   **Sans-IO core `Session`** (`ha_core_client::session`, also re-exported at the crate root): the whole protocol (authentication, message ids, subscriptions with re-subscription and state resync after a reconnect, request timeouts, keep-alive, reconnect backoff) as a synchronous state machine with no network, clock or runtime. The host opens the WebSocket and feeds it (`on_connected`, `on_disconnected`, `on_frame`, `tick`, with `now: Instant` passed in) and writes out what it queues (`poll_transmit`, `poll_action` for `Connect`/`Close`). Requests (`command`, `get_states`, `get_state`, `get_services`, `call_service`, `unsubscribe`) return a pollable `Reply<T>`; `subscribe(Source)` returns a `PendingSubscription<T>` that yields `SessionEvents<T>`, drained with `try_next`/`drain`. Statuses (`Interrupted`, `Restored`, `Rejected`, `Lagged`, ...) arrive in order with the data, as for callbacks. `ClientConfig::for_session(token)` builds a config without a URL.
+*   Cargo feature `runtime` (default): `HAClient` and everything that needs Tokio's runtime or the network. `--no-default-features` leaves the sans-IO core and the state/event/trigger types; it depends on Tokio only for its `sync` primitives and builds for `wasm32-wasip2`. The TLS features imply `runtime`. `ClientConfig::tls_connector` and `TlsConnector` exist only with `runtime`.
+
+### Changed
+
+*   Internal: `HAClient` is now a thin Tokio transport over `Session` (the protocol logic moved from `runner.rs` to `session.rs`, `HAClient` to `client.rs`). Behaviour and public `HAClient` API are unchanged. One visible difference: the connection state becomes `Connected` when authentication completes, slightly before the re-sent subscriptions are written.
+
 ## 0.4.0
 
 ### License

@@ -1,8 +1,6 @@
 use std::fmt;
 use std::time::Duration;
 
-use crate::TlsConnector;
-
 /// Upper bound for every configured duration, so arithmetic on deadlines cannot overflow.
 /// Larger values (e.g. `Duration::MAX` meaning "never") are clamped to this.
 const MAX_DURATION: Duration = Duration::from_secs(365 * 24 * 3600);
@@ -30,7 +28,8 @@ pub struct ClientConfig {
     pub(crate) slow_callback_warning: Duration,
     pub(crate) max_message_size: usize,
     pub(crate) wait_for_connection: Duration,
-    pub(crate) tls_connector: Option<TlsConnector>,
+    #[cfg(feature = "runtime")]
+    pub(crate) tls_connector: Option<crate::TlsConnector>,
 }
 
 impl ClientConfig {
@@ -52,6 +51,7 @@ impl ClientConfig {
             slow_callback_warning: Duration::from_secs(5),
             max_message_size: 64 << 20,
             wait_for_connection: Duration::ZERO,
+            #[cfg(feature = "runtime")]
             tls_connector: None,
         }
     }
@@ -131,6 +131,12 @@ impl ClientConfig {
         self
     }
 
+    /// Creates a config for the sans-IO [`Session`](crate::Session), which never connects
+    /// itself and so needs no URL. Only the token and the timeouts matter.
+    pub fn for_session(token: impl Into<String>) -> Self {
+        Self::new("", token)
+    }
+
     /// Uses a custom TLS connector for `wss://` URLs, e.g. to trust a private CA or a
     /// self-signed certificate. Default: the system trust store.
     ///
@@ -141,7 +147,8 @@ impl ClientConfig {
     /// let config = ClientConfig::new("wss://ha.lan:8123/api/websocket", "TOKEN")
     ///     .tls_connector(ha_core_client::TlsConnector::NativeTls(tls));
     /// ```
-    pub fn tls_connector(mut self, connector: TlsConnector) -> Self {
+    #[cfg(feature = "runtime")]
+    pub fn tls_connector(mut self, connector: crate::TlsConnector) -> Self {
         self.tls_connector = Some(connector);
         self
     }
@@ -149,7 +156,8 @@ impl ClientConfig {
 
 impl fmt::Debug for ClientConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ClientConfig")
+        let mut f = f.debug_struct("ClientConfig");
+        f
             .field("url", &self.url)
             .field("token", &"<redacted>")
             .field("connect_timeout", &self.connect_timeout)
@@ -161,9 +169,10 @@ impl fmt::Debug for ClientConfig {
             .field("subscription_queue_size", &self.subscription_queue_size)
             .field("slow_callback_warning", &self.slow_callback_warning)
             .field("max_message_size", &self.max_message_size)
-            .field("wait_for_connection", &self.wait_for_connection)
-            .field("tls_connector", &if self.tls_connector.is_some() { "custom" } else { "default" })
-            .finish()
+            .field("wait_for_connection", &self.wait_for_connection);
+        #[cfg(feature = "runtime")]
+        f.field("tls_connector", &if self.tls_connector.is_some() { "custom" } else { "default" });
+        f.finish()
     }
 }
 
@@ -177,6 +186,7 @@ mod tests {
         let s = format!("{cfg:?}");
         assert!(!s.contains("secret-token"));
         assert!(s.contains("<redacted>"));
+        #[cfg(feature = "runtime")]
         assert!(s.contains("tls_connector: \"default\""));
         assert!(s.contains("wait_for_connection: 0ns"));
     }

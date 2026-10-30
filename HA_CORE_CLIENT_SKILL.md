@@ -110,6 +110,14 @@ while let Some(update) = stream.next().await {
 }
 ```
 
+### Sans-IO `Session` (no Tokio, e.g. WASM components)
+
+With `default-features = false` there is no `HAClient`; use `ha_core_client::Session` (feature `runtime` provides `HAClient`). The host owns the WebSocket and drives the session synchronously, passing `now: std::time::Instant`:
+- `Session::new(ClientConfig::for_session(token))`; each tick: `while let Some(a) = session.poll_action(now)` (`Action::Connect`: open the socket then `on_connected(now)`; `Action::Close`: drop it), `on_frame(now, &text)` per text frame, `on_disconnected(now, reason)` on socket failure/close/failed write, `tick(now)`, then `while let Some(f) = session.poll_transmit()` write each frame.
+- `subscribe(now, Source) -> PendingSubscription<T>`; `poll()` gives `Some(Ok(SessionEvents<T>))`; `events.drain()`/`try_next()` yield `Update<T>` (data and `Update::Status`). `unsubscribe(now, &sub)`.
+- Requests return `Reply<T>` to `poll()` later: `get_states`, `get_state`, `get_services`, `call_service`, `command` (raw JSON result).
+- Not available there: `get_history`, `call_service_with_response`, domain helpers, `EventStream` (use `command`).
+
 ## 5. Automation Triggers
 
 All fire `TriggerFired`. After a reconnect, triggers are re-created in Home Assistant, so a pending `for` countdown restarts.

@@ -1,16 +1,11 @@
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-
 use serde_json::Value;
+use serde_json::value::RawValue;
 use tokio::sync::oneshot;
 
 use crate::error::Result;
 use crate::events::{State, SubEvent};
 use crate::protocol::Request;
-use serde_json::value::RawValue;
 use crate::queue::QueueRx;
-use crate::HAClient;
 
 /// The error type callbacks return. Any `std::error::Error + Send + Sync` (including
 /// [`Error`](crate::Error)) and `anyhow::Error` convert into it with `?`.
@@ -19,7 +14,8 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// What a subscription callback returns. Errors are logged, with their source chain.
 pub type CallbackResult = std::result::Result<(), BoxError>;
 
-/// A handle to an active subscription, used with [`HAClient::unsubscribe`].
+/// A handle to an active subscription, used with `HAClient::unsubscribe` or
+/// [`Session::unsubscribe`](crate::Session::unsubscribe).
 ///
 /// The id is assigned by the client and stays the same across reconnects.
 /// Dropping it does not unsubscribe; use [`guard`](Self::guard) for that.
@@ -37,20 +33,23 @@ impl Subscription {
     }
 
     /// Wraps the subscription in a guard that unsubscribes when dropped.
-    pub fn guard(self, client: &HAClient) -> SubscriptionGuard {
+    #[cfg(feature = "runtime")]
+    pub fn guard(self, client: &crate::HAClient) -> SubscriptionGuard {
         SubscriptionGuard { client: client.clone(), subscription: Some(self) }
     }
 }
 
 /// Unsubscribes when dropped. Created by [`Subscription::guard`].
 ///
-/// The guard holds an [`HAClient`] handle, so it keeps the client running.
+/// The guard holds an `HAClient` handle, so it keeps the client running.
+#[cfg(feature = "runtime")]
 #[must_use = "dropping the guard unsubscribes immediately"]
 pub struct SubscriptionGuard {
-    client: HAClient,
+    client: crate::HAClient,
     subscription: Option<Subscription>,
 }
 
+#[cfg(feature = "runtime")]
 impl SubscriptionGuard {
     pub fn subscription(&self) -> &Subscription {
         self.subscription.as_ref().expect("present until dropped")
@@ -68,6 +67,7 @@ impl SubscriptionGuard {
     }
 }
 
+#[cfg(feature = "runtime")]
 impl Drop for SubscriptionGuard {
     fn drop(&mut self) {
         if let Some(subscription) = self.subscription.take() {
@@ -78,14 +78,20 @@ impl Drop for SubscriptionGuard {
 
 /// Runs a subscription's callback for one event. The last argument is the subscription id
 /// (for log messages); the conversion into the user's type happens inside, in the worker.
-pub(crate) type EventCallback =
-    Arc<dyn Fn(HAClient, SubEvent, u64) -> Pin<Box<dyn Future<Output = CallbackResult> + Send>> + Send + Sync>;
+#[cfg(feature = "runtime")]
+pub(crate) type EventCallback = std::sync::Arc<
+    dyn Fn(crate::HAClient, SubEvent, u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = CallbackResult> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// How the events of a subscription reach the user.
 pub(crate) enum Delivery {
-    /// A worker task runs the callback for each event.
-    Callback(EventCallback),
-    /// The queue's receiving end is handed to the caller (an [`EventStream`](crate::EventStream)).
+    /// The queue's receiving end is handed to this function when the subscription is
+    /// registered; `HAClient` starts a worker task that runs the callbacks.
+    Worker(Box<dyn FnOnce(QueueRx) + Send>),
+    /// The queue's receiving end is handed to the caller (an `EventStream`, or
+    /// [`SessionEvents`](crate::SessionEvents)).
     Stream,
 }
 
@@ -96,7 +102,7 @@ pub(crate) struct Subscribed {
     pub(crate) rx: Option<QueueRx>,
 }
 
-/// Which updates of an entity [`HAClient::subscribe_entity_with`] delivers.
+/// Which updates of an entity `HAClient::subscribe_entity_with` delivers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum EntityChanges {
@@ -105,7 +111,7 @@ pub enum EntityChanges {
     ///
     /// A sensor reporting an unchanged value with unchanged attributes is not an update:
     /// Home Assistant only refreshes `last_reported` and sends nothing to WebSocket clients;
-    /// use [`HAClient::watch_silence`] to detect a sensor that stopped reporting.
+    /// use `HAClient::watch_silence` to detect a sensor that stopped reporting.
     #[default]
     Any,
     /// Only changes of the state string (`on` → `off`, `21.5` → `22`); attribute-only
@@ -151,7 +157,7 @@ impl SubKind {
     }
 }
 
-/// Messages from [`HAClient`] handles to the runner task.
+/// Messages from `HAClient` handles to the runner task.
 pub(crate) enum Command {
     /// A request whose raw `result` is returned to the caller.
     Request {

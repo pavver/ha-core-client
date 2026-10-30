@@ -12,23 +12,31 @@ categories = ["api-bindings", "asynchronous", "network-programming"]
 exclude = [".github/", "CLAUDE.md", "CONTRIBUTING.md"]
 
 [features]
-default = ["native-tls"]
+default = ["runtime", "native-tls"]
+# `HAClient`: the Tokio-based client that owns the WebSocket. Without it only the sans-IO
+# core remains (`Session`, state/event/trigger types), which has no network or runtime
+# dependency and builds for `wasm32-wasip2`.
+runtime = ["dep:tokio-tungstenite", "dep:futures-util", "tokio/rt", "tokio/time", "tokio/net", "tokio/macros"]
 # TLS backend for `wss://` URLs. Plain `ws://` works without either.
-native-tls = ["tokio-tungstenite/native-tls"]
-rustls-tls = ["tokio-tungstenite/rustls-tls-native-roots"]
+native-tls = ["runtime", "tokio-tungstenite/native-tls"]
+rustls-tls = ["runtime", "tokio-tungstenite/rustls-tls-native-roots"]
 
 [dependencies]
-tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
-tokio = { version = "1.48.0", features = ["rt", "sync", "time", "macros", "net"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"], optional = true }
+tokio = { version = "1.48.0", features = ["sync"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.145", features = ["raw_value"] }
 thiserror = "2.0.17"
 chrono = { version = "0.4.42", features = ["serde"] }
 log = "0.4.29"
 strum = { version = "0.28.0", features = ["derive"] }
-futures-util = { version = "0.3.31", default-features = false, features = ["sink", "std"] }
+futures-util = { version = "0.3.31", default-features = false, features = ["sink", "std"], optional = true }
 
 [dev-dependencies]
 anyhow = "1.0.100"
 tokio = { version = "1.48.0", features = ["full"] }
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
+
+[[example]]
+name = "demo"
+required-features = ["runtime"]

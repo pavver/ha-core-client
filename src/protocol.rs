@@ -104,6 +104,23 @@ pub(crate) fn call_service(
     msg
 }
 
+/// A `call_service` request. `data` must serialize to a JSON object (`()`/`null`: none).
+pub(crate) fn service_request(
+    domain: &crate::state::Domain,
+    service: &crate::state::Service,
+    target: &Target,
+    data: impl serde::Serialize,
+    return_response: bool,
+) -> Result<Request, Error> {
+    let service_data = match serde_json::to_value(data) {
+        Ok(Value::Null) => None,
+        Ok(data @ Value::Object(_)) => Some(data),
+        Ok(other) => return Err(Error::InvalidInput(format!("service data must be a JSON object, got {other}"))),
+        Err(e) => return Err(Error::InvalidInput(format!("service data cannot be serialized: {e}"))),
+    };
+    Ok(call_service(domain.as_str(), service.as_str(), target, service_data, return_response))
+}
+
 pub(crate) fn history_during_period(
     entity_id: &str,
     start_time: DateTime<Utc>,

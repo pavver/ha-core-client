@@ -15,6 +15,8 @@ A strongly-typed, ergonomic, and resilient asynchronous Rust client for the Home
 *   **Templates**: subscribe to a template rendered by Home Assistant, and detect sensors that stopped reporting (`watch_silence`) without polling.
 *   **History**: entity history and the state at a past point in time.
 
+*   **Sans-IO core**: the protocol logic is a synchronous `Session` with no network or runtime, so it can run where Tokio cannot (for example in a WebAssembly component); see [Sans-IO use](#sans-io-use).
+
 ## Supported Home Assistant versions
 
 Home Assistant **2024.10 or newer**: triggers are sent with the `trigger` key (older versions only accept `platform`).
@@ -200,10 +202,48 @@ Helpers take `impl Into<Target>`: an entity id (`"light.x"`), a list of ids, or 
 *   **Lock**: `lock`, `unlock`.
 *   **Input**: `set_number`, `set_text`, `select_option` (`input_*` or `number`/`text`/`select` entities).
 
+## Sans-IO use
+
+The default `runtime` feature provides `HAClient` (Tokio and a WebSocket). Without it
+(`default-features = false`) only the sans-IO core remains: `Session`, plus the state, event and
+trigger types. It does no I/O and never reads the clock; the host opens the WebSocket, passes in
+what happens and the current time, and writes out what the session queues:
+
+```rust
+use std::time::Instant;
+use ha_core_client::{Action, ClientConfig, Session, Source};
+
+let mut session = Session::new(ClientConfig::for_session("TOKEN"));
+let mut pending = session.subscribe(Instant::now(), Source::entity("light.kitchen"));
+let mut events = None;
+
+// Once per tick (say every 100 ms), plus whenever a frame arrives:
+let now = Instant::now();
+while let Some(action) = session.poll_action(now) {
+    match action {
+        Action::Connect => { /* open the WebSocket, then session.on_connected(now) */ }
+        Action::Close => { /* drop the socket */ }
+        _ => {}
+    }
+}
+// on a text frame:          session.on_frame(now, &text);
+// on a socket error/close:  session.on_disconnected(now, "reason");
+session.tick(now);
+while let Some(frame) = session.poll_transmit() { /* write it to the socket */ }
+
+events = events.or_else(|| pending.poll().and_then(Result::ok));
+for update in events.iter_mut().flat_map(|e| e.drain()) { /* Update::Event / Update::Status */ }
+```
+
+Requests (`get_states`, `call_service`, `command`, ...) return a `Reply` to poll on a later tick.
+It builds for `wasm32-wasip2` with `cargo build --no-default-features --target wasm32-wasip2`.
+See `ARCHITECTURE.md` for details.
+
 ## Development
 
 ```bash
 cargo test                       # unit tests + end-to-end tests against a mock Home Assistant
+cargo build --no-default-features --target wasm32-wasip2   # sans-IO core only
 cargo run --example demo         # read-only tour against a real instance
 ```
 

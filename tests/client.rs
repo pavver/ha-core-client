@@ -1,3 +1,4 @@
+#![cfg(feature = "runtime")]
 //! End-to-end tests against a scripted mock of the Home Assistant WebSocket API.
 
 use std::time::Duration;

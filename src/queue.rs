@@ -54,6 +54,15 @@ impl Inner {
     }
 }
 
+/// Why [`QueueRx::try_recv`] returned nothing.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TryRecvError {
+    /// Nothing queued right now.
+    Empty,
+    /// Closed and drained: nothing will ever arrive.
+    Closed,
+}
+
 /// The runner's end. Dropping it closes the queue; the worker drains what is left.
 pub(crate) struct QueueTx(Arc<Inner>);
 
@@ -155,30 +164,42 @@ fn merge_into_last(items: &mut VecDeque<SubEvent>, event: SubEvent) -> Option<Su
 }
 
 impl QueueRx {
-    /// The next event, or `None` once the queue is closed and drained. A pending
-    /// `Lagged` status is handed out before the events that follow the loss.
+    /// The next event without waiting. A pending `Lagged` status is handed out before the
+    /// events that follow the loss.
+    pub(crate) fn try_recv(&self) -> Result<SubEvent, TryRecvError> {
+        let mut st = self.inner.lock();
+        if st.lagged > 0 {
+            let dropped = std::mem::take(&mut st.lagged);
+            let status = SubscriptionStatus::Lagged { dropped };
+            return Ok(SubEvent::Status { subscription: self.inner.subscription.clone(), status });
+        }
+        if let Some(event) = st.items.pop_front() {
+            if !matches!(event, SubEvent::Status { .. }) {
+                st.data_len -= 1;
+            }
+            return Ok(event);
+        }
+        if st.closed { Err(TryRecvError::Closed) } else { Err(TryRecvError::Empty) }
+    }
+
+    /// The next event, or `None` once the queue is closed and drained.
+    #[cfg_attr(not(feature = "runtime"), allow(dead_code))]
     pub(crate) async fn recv(&self) -> Option<SubEvent> {
         loop {
-            {
-                let mut st = self.inner.lock();
-                if st.lagged > 0 {
-                    let dropped = std::mem::take(&mut st.lagged);
-                    let status = SubscriptionStatus::Lagged { dropped };
-                    return Some(SubEvent::Status { subscription: self.inner.subscription.clone(), status });
-                }
-                if let Some(event) = st.items.pop_front() {
-                    if !matches!(event, SubEvent::Status { .. }) {
-                        st.data_len -= 1;
-                    }
-                    return Some(event);
-                }
-                if st.closed {
-                    return None;
-                }
+            match self.try_recv() {
+                Ok(event) => return Some(event),
+                Err(TryRecvError::Closed) => return None,
+                Err(TryRecvError::Empty) => {}
             }
             // `notify_one` stores a permit if nobody is waiting, so no wakeup is lost.
             self.inner.notify.notified().await;
         }
+    }
+
+    /// Closed and drained: nothing will ever arrive.
+    pub(crate) fn is_finished(&self) -> bool {
+        let st = self.inner.lock();
+        st.closed && st.items.is_empty() && st.lagged == 0
     }
 
     pub(crate) fn sub_id(&self) -> u64 {
