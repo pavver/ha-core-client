@@ -3,7 +3,7 @@ use log::{debug, info, warn};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{connect_async_tls_with_config, MaybeTlsStream, WebSocketStream};
 
 use crate::config::ClientConfig;
 use crate::error::{Error, Result};
@@ -23,7 +23,7 @@ async fn handshake(config: &ClientConfig) -> Result<WsStream> {
     // Answers arrive as one frame each, so frames may be as large as messages.
     let limit = Some(config.max_message_size);
     let ws_config = WebSocketConfig::default().max_message_size(limit).max_frame_size(limit);
-    let (mut ws, _) = connect_async_with_config(config.url.as_str(), Some(ws_config), false)
+    let (mut ws, _) = connect_async_tls_with_config(config.url.as_str(), Some(ws_config), false, config.tls_connector.clone())
         .await
         .map_err(|e| Error::Connection(format!("failed to connect to {}: {e}", config.url)))?;
 

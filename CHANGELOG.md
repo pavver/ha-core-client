@@ -4,6 +4,7 @@
 
 ### Breaking
 
+*   New `ConnectionState::Connecting` variant (the enum is `non_exhaustive`, so matches that already have a `_` arm are unaffected; exhaustive-in-spirit matches should handle it). It is only seen after `connect_lazy`. Nothing else changes for existing code; `Runner` internals are not public.
 *   `call_service(domain, service, target, data)`: `target` is `impl Into<Target>` and `data` is `impl Serialize`. Migrate `call_service(d, s, Some("light.x"), None)` to `call_service(d, s, "light.x", ())`, `Some(json!(..))` data to plain `json!(..)`, and a `None` target to `()`. Data must serialize to a JSON object (or `()`/`null` for none), otherwise `Error::InvalidInput`.
 *   `call_service_with_response` is generic: `call_service_with_response::<R>(..) -> Result<R>` decodes the `response` field (`Value` gives the old behaviour; decode failures are `Error::Decode`).
 *   The `target` sent to Home Assistant now lists entity ids (`{"entity_id": ["light.x"]}`) instead of a bare string.
@@ -50,6 +51,10 @@
 *   `Context { id, parent_id, user_id }` (also in `events`) with `is_user()` and `is_automated()`; parsing accepts the object form and the bare id string of compressed states, and never fails.
 *   `ServiceCall::context: Option<Context>`, taken from the `call_service` bus event.
 *   `HaErrorTranslation { domain, key, placeholders }` in `Error::Ha`, filled from the `translation_key`, `translation_domain` and `translation_placeholders` that Home Assistant sends with e.g. `service_validation_error`.
+*   `HAClient::connect_lazy(config)`: returns at once (inside a Tokio runtime) and connects in the background, first attempt immediately in `ConnectionState::Connecting`, then with backoff. Requests fail with `NotConnected` and subscriptions start `Interrupted` until connected; a rejected token ends in `AuthFailed`.
+*   `HAClient::connected()`: waits until connected; `Err(Error::Auth)` / `Err(Error::Stopped)` on a terminal state.
+*   `ClientConfig::wait_for_connection(Duration)` (default `ZERO`): request-style calls wait up to this long for the connection instead of failing at once with `NotConnected` (nothing is sent while waiting).
+*   `ClientConfig::tls_connector(TlsConnector)` and the re-export `TlsConnector` (`tokio_tungstenite::Connector`): custom TLS setup, e.g. a private CA or a self-signed certificate.
 *   Typed attribute structs per domain (`SensorAttributes`, `BinarySensorAttributes`, `LightAttributes`, `CoverAttributes`, `FanAttributes`, `MediaPlayerAttributes`, `NumberAttributes`, `SelectAttributes`, `UpdateAttributes`, `WeatherAttributes`, `SunAttributes`, `PersonAttributes`, `DeviceTrackerAttributes`, `ZoneAttributes`, `AutomationAttributes`) and the enums `ColorMode`, `FanDirection`, `RepeatMode`, `NumberMode`, `SourceType`, `RunMode`. `AttributeSet` gained `icon()`, `get_as::<T>(key)` and one `as_*` accessor per variant.
 *   `Target`: what a service call acts on (entities, devices, areas, floors, labels), with `From` impls for entity ids.
 *   `HaErrorCode`: typed Home Assistant error codes with an `Other(String)` fallback.

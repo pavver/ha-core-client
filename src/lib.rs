@@ -37,6 +37,7 @@ mod target;
 pub mod triggers;
 
 pub use config::ClientConfig;
+pub use tokio_tungstenite::Connector as TlsConnector;
 pub use error::{Error, HaErrorCode, HaErrorTranslation, Result};
 pub use target::Target;
 pub use events::{BusEvent, Context, ServiceCall, Silence, State, StateChange, SubscriptionStatus, TemplateUpdate, TriggerFired, Update};
@@ -71,6 +72,10 @@ const STOP_CALLBACKS_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConnectionState {
+    /// The first connection has not been established yet ([`HAClient::connect_lazy`]).
+    /// Requests fail with [`Error::NotConnected`]; subscriptions are accepted and start
+    /// `Interrupted`. A failed first attempt continues as `Reconnecting`.
+    Connecting,
     /// Connected and authenticated. After a reconnect, subscriptions are re-sent at this
     /// point; each one is active again once it reports [`SubscriptionStatus::Restored`].
     Connected,
@@ -79,7 +84,7 @@ pub enum ConnectionState {
     /// backoff delay, at most a minute), so a connection that keeps dropping right after
     /// connecting backs off instead of retrying at the shortest delay.
     Reconnecting { attempt: u32 },
-    /// Home Assistant rejected the token while reconnecting. Terminal.
+    /// Home Assistant rejected the token (while connecting or reconnecting). Terminal.
     AuthFailed(String),
     /// The client was stopped. Terminal.
     Stopped,
@@ -138,9 +143,28 @@ impl HAClient {
         connection::check_url(&config.url)?;
         let ws = connection::connect_and_auth(&config).await?;
 
+        Ok(Self::spawn(config, Some(ws), ConnectionState::Connected))
+    }
+
+    /// Creates the client without waiting for the first connection; must be called inside
+    /// a Tokio runtime.
+    ///
+    /// The background task starts connecting at once, in [`ConnectionState::Connecting`]; a
+    /// failed attempt is retried with backoff like a lost connection. Until connected,
+    /// requests fail with [`Error::NotConnected`] (see
+    /// [`ClientConfig::wait_for_connection`]) and subscriptions are accepted, start
+    /// `Interrupted` and are restored once connected. Use [`connected`](Self::connected) to
+    /// wait for the connection. A wrong token ends in `AuthFailed`. Only a URL that is not
+    /// `ws://` or `wss://` fails here, with [`Error::InvalidInput`].
+    pub fn connect_lazy(config: ClientConfig) -> Result<Self> {
+        connection::check_url(&config.url)?;
+        Ok(Self::spawn(config, None, ConnectionState::Connecting))
+    }
+
+    fn spawn(config: ClientConfig, ws: Option<connection::WsStream>, state: ConnectionState) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (state_tx, _) = watch::channel(ConnectionState::Connected);
+        let (state_tx, _) = watch::channel(state);
         let (workers, _) = watch::channel(0);
         static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
         let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
@@ -149,7 +173,26 @@ impl HAClient {
         let runner = Runner::new(shared.clone(), cmd_tx.downgrade());
         tokio::spawn(runner.run(ws, cmd_rx, shutdown_rx));
 
-        Ok(Self { cmd_tx, shared })
+        Self { cmd_tx, shared }
+    }
+
+    /// Waits until the client is connected. There is no timeout of its own; wrap it in
+    /// [`tokio::time::timeout`] if needed.
+    ///
+    /// Fails with [`Error::Auth`] if Home Assistant rejected the token, or
+    /// [`Error::Stopped`] if the client was stopped.
+    pub async fn connected(&self) -> Result<()> {
+        let mut rx = self.watch_connection_state();
+        let state = rx
+            .wait_for(|s| *s == ConnectionState::Connected || s.is_terminal())
+            .await
+            .map(|s| s.clone())
+            .unwrap_or(ConnectionState::Stopped);
+        match state {
+            ConnectionState::AuthFailed(message) => Err(Error::Auth(message)),
+            ConnectionState::Stopped => Err(Error::Stopped),
+            _ => Ok(()),
+        }
     }
 
     /// A handle that does not keep the client running. Capture it in callbacks instead of an
@@ -209,8 +252,34 @@ impl HAClient {
         tokio::time::timeout(timeout, call).await.unwrap_or(Err(Error::Timeout))
     }
 
+    /// Like [`call`](Self::call), but waits up to `wait_for_connection` for the connection
+    /// instead of failing at once with `NotConnected`. Nothing is sent while it waits.
+    async fn call_waiting<T>(&self, make: impl Fn(oneshot::Sender<Result<T>>) -> Command) -> Result<T> {
+        let wait = self.shared.config.wait_for_connection;
+        if wait.is_zero() {
+            return self.call(make).await;
+        }
+        let deadline = tokio::time::Instant::now() + wait;
+        let mut state = self.watch_connection_state();
+        loop {
+            let ready = tokio::time::timeout_at(deadline, state.wait_for(|s| *s == ConnectionState::Connected || s.is_terminal()));
+            match ready.await {
+                Err(_) => return Err(Error::NotConnected),
+                Ok(Err(_)) => return Err(Error::Stopped),
+                Ok(Ok(_)) => {}
+            }
+            match self.call(&make).await {
+                // The connection dropped again before the runner got the request.
+                Err(Error::NotConnected) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                result => return result,
+            }
+        }
+    }
+
     async fn request(&self, request: protocol::Request) -> Result<Box<RawValue>> {
-        self.call(|responder| Command::Request { request, responder }).await
+        self.call_waiting(|responder| Command::Request { request: request.clone(), responder }).await
     }
 
     // --- States ---
@@ -220,8 +289,7 @@ impl HAClient {
     /// Fails with [`Error::Ha`] (code `not_found`) if the entity does not exist.
     pub async fn get_state(&self, entity_id: &str) -> Result<State> {
         debug!("Requesting state for entity: {}", entity_id);
-        let entity_id = entity_id.to_string();
-        self.call(|responder| Command::GetStateOnce { entity_id, responder }).await
+        self.call_waiting(|responder| Command::GetStateOnce { entity_id: entity_id.to_string(), responder }).await
     }
 
     /// Fetches the current state of all entities.
