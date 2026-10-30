@@ -123,8 +123,9 @@ pub(crate) enum SubKind {
     /// `subscribe_events` for `call_service`, reported as `SubEvent::ServiceCall`.
     ServiceCallEvents,
     /// `subscribe_trigger` with a `state` trigger, reported as `SubEvent::StateChanged`.
-    /// The entity's state is re-read after every reconnect.
-    EntityState { entity_id: String, changes: EntityChanges },
+    /// The entity's state is re-read after every reconnect. `merge`: the queue merges
+    /// changes that pile up behind a slow callback (`Source::without_merging` turns it off).
+    EntityState { entity_id: String, changes: EntityChanges, merge: bool },
     /// Any other `subscribe_trigger`, reported as `SubEvent::TriggerFired`.
     Trigger,
     /// `render_template`, reported as `SubEvent::TemplateRendered`.

@@ -54,6 +54,26 @@ pub(crate) fn into_update<T>(convert: fn(SubEvent) -> Option<T>, event: SubEvent
     }
 }
 
+impl<T> Source<T> {
+    /// Keeps every change of an entity subscription when the callback falls behind.
+    ///
+    /// By default the queue merges consecutive changes of the entity (the first
+    /// `old_state` with the last `new_state`) and reports them as
+    /// [`Lagged`](crate::SubscriptionStatus::Lagged). Without merging, the queue behaves
+    /// like that of other subscriptions: past
+    /// [`subscription_queue_size`](crate::ClientConfig::subscription_queue_size) it drops
+    /// the oldest events, also reporting `Lagged`. With [`EntityChanges::State`],
+    /// attribute-only changes are still dropped.
+    ///
+    /// Has no effect on sources that are not entity subscriptions.
+    pub fn without_merging(mut self) -> Self {
+        if let SubKind::EntityState { merge, .. } = &mut self.kind {
+            *merge = false;
+        }
+        self
+    }
+}
+
 impl Source<StateChange> {
     /// Changes of one entity (state and attributes). See
     /// [`subscribe_entity`](crate::HAClient::subscribe_entity).
@@ -74,7 +94,7 @@ impl Source<StateChange> {
         }
         Source {
             request: protocol::subscribe_trigger(&trigger),
-            kind: SubKind::EntityState { entity_id, changes },
+            kind: SubKind::EntityState { entity_id, changes, merge: true },
             convert: |event| match event {
                 SubEvent::StateChanged(change) => Some(change),
                 _ => None,

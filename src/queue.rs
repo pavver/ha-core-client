@@ -1,9 +1,10 @@
 //! Per-subscription event queue between the runner and the subscription's worker task.
 //!
 //! Bounded for data events; status events are never dropped. When the callback falls
-//! behind, entity subscriptions merge consecutive state changes and other subscriptions
-//! drop their oldest events. Either way the callback is told with `SubscriptionStatus::Lagged`.
-//! `Filter::StateChanges` also drops state changes that keep the state string.
+//! behind, entity subscriptions merge consecutive state changes (unless merging is turned
+//! off) and other subscriptions drop their oldest events. Either way the callback is told
+//! with `SubscriptionStatus::Lagged`. `Filter::state_only` also drops state changes that
+//! keep the state string.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -32,13 +33,18 @@ struct Inner {
 
 /// What the queue does with `StateChanged` events.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Filter {
+pub(crate) struct Filter {
+    /// Consecutive changes of the same entity are merged; a merge that cancels out
+    /// (`A → B → A`) is dropped when `state_only` is also set. Without it the oldest
+    /// data events are dropped when full.
+    pub merge: bool,
+    /// Changes that keep the state string are dropped.
+    pub state_only: bool,
+}
+
+impl Filter {
     /// Nothing special: the oldest events are dropped when full.
-    None,
-    /// Consecutive changes of the same entity are merged.
-    Merge,
-    /// Merged, and changes that keep the state string are dropped.
-    StateChanges,
+    pub const NONE: Filter = Filter { merge: false, state_only: false };
 }
 
 impl Inner {
@@ -72,19 +78,18 @@ impl QueueTx {
     pub(crate) fn push(&self, event: SubEvent) {
         let inner = &self.0;
         let mut st = inner.lock();
-        let state_changes = inner.filter == Filter::StateChanges;
+        let Filter { merge, state_only } = inner.filter;
         if matches!(event, SubEvent::Status { .. }) {
             st.items.push_back(event);
-        } else if state_changes && keeps_state(&event) {
+        } else if state_only && keeps_state(&event) {
             // Not a change of the state; filtered, not lost.
         } else {
-            let unmerged =
-                if inner.filter == Filter::None { Some(event) } else { merge_into_last(&mut st.items, event) };
+            let unmerged = if merge { merge_into_last(&mut st.items, event) } else { Some(event) };
             match unmerged {
                 Some(event) => push_data(&mut st, event, inner.capacity),
                 None => {
                     st.lagged += 1;
-                    if state_changes && st.items.back().is_some_and(keeps_state) {
+                    if state_only && st.items.back().is_some_and(keeps_state) {
                         // The merged changes cancel out (`A → B`, `B → A`): nothing to deliver.
                         st.items.pop_back();
                         st.data_len -= 1;
@@ -192,6 +197,9 @@ mod tests {
     use crate::events::{BusEvent, State as EntityState};
     use serde_json::json;
 
+    const MERGE: Filter = Filter { merge: true, state_only: false };
+    const STATE_CHANGES: Filter = Filter { merge: true, state_only: true };
+
     fn change(entity: &str, from: &str, to: &str) -> SubEvent {
         let s = |v: &str| Some(EntityState::from_compressed(entity, &json!({"s": v, "lc": 1.0})).unwrap());
         SubEvent::StateChanged(StateChange { entity_id: entity.into(), old_state: s(from), new_state: s(to) })
@@ -228,7 +236,7 @@ mod tests {
 
     #[tokio::test]
     async fn merges_consecutive_changes_of_one_entity() {
-        let (tx, rx) = channel(Subscription { id: 1, client: 0 }, 10, Filter::Merge);
+        let (tx, rx) = channel(Subscription { id: 1, client: 0 }, 10, MERGE);
         tx.push(change("a", "1", "2"));
         tx.push(change("a", "2", "3"));
         tx.push(change("a", "3", "4"));
@@ -239,7 +247,7 @@ mod tests {
 
     #[tokio::test]
     async fn different_entities_are_not_merged() {
-        let (tx, rx) = channel(Subscription { id: 1, client: 0 }, 10, Filter::Merge);
+        let (tx, rx) = channel(Subscription { id: 1, client: 0 }, 10, MERGE);
         tx.push(change("a", "1", "2"));
         tx.push(change("b", "1", "2"));
         assert_eq!(drain(&rx).await, ["a:1->2", "b:1->2"]);
@@ -247,7 +255,7 @@ mod tests {
 
     #[tokio::test]
     async fn drops_oldest_data_but_keeps_statuses() {
-        let (tx, rx) = channel(Subscription { id: 1, client: 0 }, 2, Filter::None);
+        let (tx, rx) = channel(Subscription { id: 1, client: 0 }, 2, Filter::NONE);
         tx.push(generic(1));
         tx.push(status(SubscriptionStatus::Interrupted));
         tx.push(generic(2));
@@ -258,7 +266,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_filter_skips_kept_states_and_cancelled_changes() {
-        let (tx, rx) = channel(Subscription { id: 1, client: 0 }, 10, Filter::StateChanges);
+        let (tx, rx) = channel(Subscription { id: 1, client: 0 }, 10, STATE_CHANGES);
         tx.push(change("a", "1", "1"));
         tx.push(change("a", "1", "2"));
         tx.push(change("a", "2", "1"));
@@ -268,8 +276,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn without_merging_keeps_every_change() {
+        let (tx, rx) = channel(Subscription { id: 1, client: 0 }, 10, Filter { merge: false, state_only: false });
+        tx.push(change("a", "1", "2"));
+        tx.push(change("a", "2", "3"));
+        tx.push(change("a", "3", "3"));
+        tx.push(change("a", "3", "2"));
+        assert_eq!(drain(&rx).await, ["a:1->2", "a:2->3", "a:3->3", "a:3->2"]);
+    }
+
+    #[tokio::test]
+    async fn without_merging_state_only_drops_kept_states_but_does_not_merge() {
+        let (tx, rx) = channel(Subscription { id: 1, client: 0 }, 10, Filter { merge: false, state_only: true });
+        tx.push(change("a", "1", "2"));
+        tx.push(change("a", "2", "2"));
+        tx.push(change("a", "2", "1"));
+        assert_eq!(drain(&rx).await, ["a:1->2", "a:2->1"]);
+    }
+
+    #[tokio::test]
+    async fn without_merging_overflow_drops_oldest_and_reports_lagged() {
+        let (tx, rx) = channel(Subscription { id: 1, client: 0 }, 2, Filter { merge: false, state_only: false });
+        tx.push(change("a", "1", "2"));
+        tx.push(change("a", "2", "3"));
+        tx.push(change("a", "3", "4"));
+        assert_eq!(drain(&rx).await, ["Lagged { dropped: 1 }", "a:2->3", "a:3->4"]);
+    }
+
+    #[tokio::test]
     async fn closes_after_draining() {
-        let (tx, rx) = channel(Subscription { id: 1, client: 0 }, 2, Filter::None);
+        let (tx, rx) = channel(Subscription { id: 1, client: 0 }, 2, Filter::NONE);
         tx.push(generic(1));
         drop(tx);
         assert_eq!(describe(&rx.recv().await.unwrap()), "e1");
@@ -278,7 +314,7 @@ mod tests {
 
     #[tokio::test]
     async fn wakes_a_waiting_receiver() {
-        let (tx, rx) = channel(Subscription { id: 1, client: 0 }, 2, Filter::None);
+        let (tx, rx) = channel(Subscription { id: 1, client: 0 }, 2, Filter::NONE);
         let waiter = tokio::spawn(async move { rx.recv().await.map(|e| describe(&e)) });
         tokio::task::yield_now().await;
         tx.push(generic(7));

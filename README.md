@@ -145,7 +145,7 @@ while let Some(update) = stream.next().await {
 
 Dropping the stream unsubscribes; it ends after the subscription's last status (`Closed`, `Unsubscribed`, `Rejected`). It holds an `HAClient`, so it keeps the client running, like a `SubscriptionGuard`.
 
-Callbacks of one subscription run one after another. If a callback falls behind, `subscribe_entity` merges the waiting state changes into one (from the last delivered state to the newest), and other subscriptions drop their oldest events beyond `subscription_queue_size`; the callback is told with `SubscriptionStatus::Lagged { dropped }`. To process events concurrently, `tokio::spawn` inside the callback.
+Callbacks of one subscription run one after another. If a callback falls behind, `subscribe_entity` merges the waiting state changes into one (from the last delivered state to the newest), and other subscriptions drop their oldest events beyond `subscription_queue_size` (`Source::entity(..).without_merging()` makes an entity subscription do the same, keeping every change); the callback is told with `SubscriptionStatus::Lagged { dropped }`. To process events concurrently, `tokio::spawn` inside the callback.
 
 After a reconnect, `subscribe_entity` re-reads the entity: if it changed while disconnected, one `StateChange` (last known → current state) arrives right before `Restored`, and live changes follow only after it. A handler can also `client.unsubscribe(subscription)` on `Interrupted`, which works while offline.
 

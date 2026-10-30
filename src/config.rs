@@ -92,8 +92,8 @@ impl ClientConfig {
     /// Maximum number of events waiting for one subscription's callback. Default: 1024.
     ///
     /// Callbacks of a subscription run one at a time. When one falls behind, entity
-    /// subscriptions merge consecutive state changes (so they never queue more than one),
-    /// and other subscriptions drop their oldest events once this limit is reached. Either
+    /// subscriptions merge consecutive state changes (so they never queue more than one;
+    /// `Source::without_merging` turns this off), and other subscriptions drop their oldest events once this limit is reached. Either
     /// way the callback then receives `SubscriptionStatus::Lagged`. Status events are never
     /// dropped and don't count towards the limit.
     pub fn subscription_queue_size(mut self, size: usize) -> Self {
