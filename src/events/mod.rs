@@ -141,7 +141,7 @@ pub struct BusEvent {
 }
 
 impl BusEvent {
-    /// Decodes `data` into `T`. Fails with [`Error::Decode`].
+    /// Decodes `data` into `T`. Fails with [`Error::Decode`](crate::Error::Decode).
     pub fn data_as<T: DeserializeOwned>(&self) -> Result<T> {
         Ok(serde_json::from_value(self.data.clone())?)
     }

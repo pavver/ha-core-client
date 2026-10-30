@@ -548,15 +548,47 @@ async fn unconfirmed_resubscription_is_retried_without_reconnecting() {
     assert_eq!(client.connection_state(), ConnectionState::Connected);
 
     // A late answer to the first request creates a duplicate in Home Assistant,
-    // which is cancelled on its first event.
+    // which is cancelled at once, without waiting for an event.
     conn.ok(&first["id"], Value::Null).await;
-    conn.event(&first["id"], time_pattern_event(1)).await;
     let unsub = conn.recv_type("unsubscribe_events").await;
     assert_eq!(unsub["subscription"], first["id"]);
     conn.event(&retry["id"], time_pattern_event(2)).await;
     conn.event(&second["id"], time_pattern_event(3)).await;
     assert_eq!(recv_within(&mut rx_a).await, "trigger 2");
     assert_eq!(recv_within(&mut rx_b).await, "trigger 3");
+}
+
+#[tokio::test]
+async fn unconfirmed_entity_resubscription_does_not_block_the_others() {
+    let ha = MockHa::start().await;
+    let config = ha.config().request_timeout(Duration::from_millis(300));
+    let (client, mut conn) = ha.connect(config).await;
+    let (mut rx_a, _) = subscribe_collecting(&client, &mut conn, "sensor.a").await;
+    let (mut rx_b, _) = subscribe_collecting(&client, &mut conn, "sensor.b").await;
+    conn.ws.close(None).await.unwrap();
+    assert_eq!(recv_within(&mut rx_a).await, "Interrupted");
+    assert_eq!(recv_within(&mut rx_b).await, "Interrupted");
+
+    let mut conn = ha.accept().await;
+    let first = conn.recv_type("subscribe_trigger").await;
+    let second = conn.recv_type("subscribe_trigger").await;
+    conn.ok(&second["id"], Value::Null).await;
+    conn.event(&second["id"], entity_trigger_event("sensor.b", "2", "3")).await;
+    // `first` is not confirmed in time: the read of `sensor.b` goes ahead without it,
+    // followed by the retry of `first`.
+    let read = conn.recv_type("subscribe_entities").await;
+    let retry = conn.recv_type("subscribe_trigger").await;
+    assert_eq!(retry["trigger"], first["trigger"]);
+    answer_read(&mut conn, &read, "sensor.b", "2", 200.0).await;
+    assert_eq!(conn.recv_type("unsubscribe_events").await["subscription"], read["id"]);
+    assert_eq!(recv_within(&mut rx_b).await, "1->2");
+    assert_eq!(recv_within(&mut rx_b).await, "Restored");
+    assert_eq!(recv_within(&mut rx_b).await, "2->3");
+
+    conn.ok(&retry["id"], Value::Null).await;
+    answer_batch_read(&mut conn, &[("sensor.a", "1", 100.0)]).await;
+    assert_eq!(recv_within(&mut rx_a).await, "Restored");
+    assert_eq!(client.connection_state(), ConnectionState::Connected);
 }
 
 #[tokio::test]

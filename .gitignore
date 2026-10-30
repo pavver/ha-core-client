@@ -2,3 +2,4 @@
 /.idea
 /.gemini
 /config.json
+.claude/worktrees/

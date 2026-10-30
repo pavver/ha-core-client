@@ -125,6 +125,10 @@ pub(crate) struct Runner {
     routes: HashMap<u64, u64>,
     /// Server-side subscriptions we unsubscribed from; late events for them are ignored.
     orphans: HashSet<u64>,
+    /// Requests that create a server-side subscription and timed out unanswered. Should
+    /// Home Assistant still accept one, it is unsubscribed at once, not only at its first
+    /// event (a rarely firing trigger would otherwise stay until the connection ends).
+    expired_subscribes: HashSet<u64>,
     /// Entity subscriptions whose re-subscription is not yet answered.
     restoring: BTreeSet<u64>,
     /// Entity subscriptions re-subscribed and waiting (their events held) for the batched
@@ -156,6 +160,7 @@ impl Runner {
             pending: HashMap::new(),
             routes: HashMap::new(),
             orphans: HashSet::new(),
+            expired_subscribes: HashSet::new(),
             restoring: BTreeSet::new(),
             restore_acked: Vec::new(),
             last_rx: Instant::now(),
@@ -469,6 +474,7 @@ impl Runner {
         }
         self.routes.clear();
         self.orphans.clear();
+        self.expired_subscribes.clear();
         self.restoring.clear();
         self.restore_acked.clear();
         self.ping = None;
@@ -657,6 +663,10 @@ impl Runner {
 
     async fn process_result(&mut self, ws: &mut WsStream, id: u64, outcome: Result<Box<RawValue>>) -> Result<(), String> {
         let Some(pending) = self.pending.remove(&id) else {
+            if self.expired_subscribes.remove(&id) && outcome.is_ok() && !self.orphans.contains(&id) {
+                log::debug!("Late acknowledgement of expired subscription request {id}; unsubscribing");
+                return self.unsubscribe_orphan(ws, id).await;
+            }
             log::debug!("Result for unknown or expired request id {id}");
             return Ok(());
         };
@@ -906,6 +916,9 @@ impl Runner {
         let mut abandoned = Vec::new();
         for id in expired {
             let Some(pending) = self.pending.remove(&id) else { continue };
+            if !matches!(pending.kind, PendingKind::Request(_) | PendingKind::Unsubscribe { .. }) {
+                self.expired_subscribes.insert(id);
+            }
             match pending.kind {
                 PendingKind::Request(r) => drop(r.send(Err(Error::Timeout))),
                 PendingKind::StateOnce { responder, .. } => drop(responder.send(Err(Error::Timeout))),
@@ -915,8 +928,13 @@ impl Runner {
                 }
                 // Retried on this connection rather than by reconnecting, which would
                 // interrupt every other subscription too. Should Home Assistant still
-                // answer the old request, its events are unsubscribed as unknown.
-                PendingKind::Subscribe { sub_id, responder: None } => retry.push(sub_id),
+                // accept the old request, it is unsubscribed (`expired_subscribes`).
+                // The batched state read of the other restored entity subscriptions does not
+                // wait for it: it gets its own once acknowledged.
+                PendingKind::Subscribe { sub_id, responder: None } => {
+                    self.restoring.remove(&sub_id);
+                    retry.push(sub_id);
+                }
                 PendingKind::Resync { sub_id, responder: Some(r), .. } => {
                     abandoned.extend(self.remove_subscription(sub_id));
                     let _ = r.send(Err(Error::Timeout));
