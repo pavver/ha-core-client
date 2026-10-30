@@ -1,6 +1,6 @@
 # AI Skill: Home Assistant Core Client (`ha-core-client`)
 
-This document serves as a comprehensive technical guide for AI agents to write applications using the `ha-core-client` library (version 0.3). It contains all public API signatures, data models, and architectural patterns.
+This document serves as a comprehensive technical guide for AI agents to write applications using the `ha-core-client` library (version 0.4). It contains all public API signatures, data models, and architectural patterns.
 
 ## 1. Core Architecture: Handle/Runner Pattern
 
@@ -130,7 +130,9 @@ client.subscribe_triggers([StateTrigger::new("a.x").id("x"), StateTrigger::new("
 *   `StateTrigger`: `new(id)`, `entities(iter)`, `and_entity(id)` (entity_id is a list); `to(s)`, `to_any_of(iter)`, `to_any_state()` (sends `to: null`: any state change, not attribute-only changes); same for `from*`; `not_to(iter)`, `not_from(iter)`; `for_duration`, `attribute`.
 *   `NumericStateTrigger`: `new`/`entities`/`and_entity`; `above(f64)`, `above_entity(id)`, `below(f64)`, `below_entity(id)`, `value_template`, `for_duration`, `attribute`.
 *   `TimeTrigger`: `new(at)`, `and_at(at)`; `at` is `HH:MM[:SS]`, an `input_datetime` or a timestamp-sensor entity id.
-*   New platforms: `EventTrigger::new(type)`/`any_of(iter)` + `event_data(impl Serialize) -> Result<Self>`; `HomeAssistantTrigger::new(HomeAssistantEvent::Start|Shutdown)`; `MqttTrigger::new(topic)` + `payload`, `value_template`, `encoding`, `qos`; `WebhookTrigger::new(id)` + `allowed_methods([WebhookMethod::..])`, `local_only(bool)`; `CalendarTrigger::new(entity, CalendarEvent::Start|End)` + signed `offset(TimeDelta)`; `TagTrigger::new(tag)` + `and_tag`, `device`; `ConversationTrigger::new(sentence)` + `and_command`.
+*   `TimePatternTrigger`: `new()` + `hours(p)`, `minutes(p)`, `seconds(p)` (`"/5"`, `"30"`, `"*"`).
+*   Public fields can be read: `StateTrigger::to`/`from` are `Option<StateMatch>` (`Any`, `One(HaState)`, `AnyOf(Vec<HaState>)`), `NumericStateTrigger::above`/`below` are `Option<Threshold>` (`Value(f64)`, `Entity(String)`).
+*   Other platforms: `EventTrigger::new(type)`/`any_of(iter)` + `event_data(impl Serialize) -> Result<Self>`; `HomeAssistantTrigger::new(HomeAssistantEvent::Start|Shutdown)`; `MqttTrigger::new(topic)` + `payload`, `value_template`, `encoding`, `qos`; `WebhookTrigger::new(id)` + `allowed_methods([WebhookMethod::..])`, `local_only(bool)`; `CalendarTrigger::new(entity, CalendarEvent::Start|End)` + signed `offset(TimeDelta)`; `TagTrigger::new(tag)` + `and_tag`, `device`; `ConversationTrigger::new(sentence)` + `and_command`.
 *   Event `context` filters, `geo_location`, `device`, `persistent_notification` and `time` `weekday` are not modelled: use `subscribe_trigger_raw(serde_json::json!({"trigger": "mqtt", "topic": "x"}), cb)` (see `TRIGGERS_OVERVIEW.md`).
 
 ## 6. Domain Helpers (Recommended)
@@ -147,8 +149,8 @@ Use these instead of `call_service` for cleaner code. All return `Result<()>`. W
 ## 7. Important Types & Enums
 
 ### `ha_core_client::state`
-*   `Domain`, `Service`: known variants (`Domain::Light`, `Domain::HomeAssistant`, …, `Service::TurnOn`, `Service::Reload`, …) plus `Other(String)`. `From<&str>`, `Display` gives the wire string, `Domain::of_entity("light.x")`. Equality uses the wire string, so `Domain::Other("light".into()) == Domain::Light`.
-*   `HaState`: `On`, `Off`, `Unavailable`, `Unknown`, `Home`, `NotHome`, `Alarm(AlarmState)`, `Climate(HvacMode)`, `Cover(CoverState)`, `Lock(LockState)`, `Number(f64)`, `String(String)`. `HaState::from_string(&str)` (domain-agnostic), `HaState::parse_for_domain(&Domain, &str)` (resolves e.g. `open` for lock vs cover); `State::ha_state()` uses the entity's domain. Parsing is exact and case-sensitive like Home Assistant states (`"on"` is `On`, `"On"` is `String("On")`), so a parsed `HaState` (and `.to("Home")` in a trigger) prints back exactly the original string. A climate entity's `"off"` is `Climate(HvacMode::Off)`, not `Off`. Serializes as the plain state string. `Number(f64)` only when the string prints back unchanged (`"21"`, `"21.5"`); `"21.0"`, `"1e3"`, `"nan"` stay `String`, so for numeric logic parse `state.state` with `.parse::<f64>()`.
+*   `Domain`, `Service`: known variants (`Domain::Light`, `Domain::HomeAssistant`, …, `Service::TurnOn`, `Service::Reload`, …) plus `Other(String)`. `From<&str>`, `as_str()` and `Display` give the wire string, `Domain::of_entity("light.x")`. Equality uses the wire string, so `Domain::Other("light".into()) == Domain::Light`.
+*   `HaState`: `On`, `Off`, `Unavailable`, `Unknown`, `Home`, `NotHome`, `Alarm(AlarmState)`, `Climate(HvacMode)`, `Cover(CoverState)`, `Lock(LockState)`, `Number(f64)`, `String(String)`. `HaState::from_string(&str)` (domain-agnostic; `from_value(&Value)` for JSON), `HaState::parse_for_domain(&Domain, &str)` (resolves e.g. `open` for lock vs cover); `State::ha_state()` uses the entity's domain. Parsing is exact and case-sensitive like Home Assistant states (`"on"` is `On`, `"On"` is `String("On")`), so a parsed `HaState` (and `.to("Home")` in a trigger) prints back exactly the original string. A climate entity's `"off"` is `Climate(HvacMode::Off)`, not `Off`. Serializes as the plain state string. `Number(f64)` only when the string prints back unchanged (`"21"`, `"21.5"`); `"21.0"`, `"1e3"`, `"nan"` stay `String`, so for numeric logic parse `state.state` with `.parse::<f64>()`.
 *   `climate::{HvacMode, HvacAction, FanMode, SwingMode, PresetMode}`. `HvacMode` is closed (Home Assistant's fixed set); the others have `Other(String)`.
 *   `device_class::DeviceClass`, `state_class::StateClass`, `common::UnitOfMeasurement`: all with `Other(String)`.
 *   All string enums are `#[non_exhaustive]`: `match` needs a wildcard arm.
@@ -190,7 +192,7 @@ Use these instead of `call_service` for cleaner code. All return `Result<()>`. W
     *   `Zone(ZoneAttributes)` (`zone`), `as_zone`: `latitude`, `longitude`, `radius: f64`, `passive: bool`, `persons: Vec<String>`, `editable`.
     *   `Automation(AutomationAttributes)` (`automation`), `as_automation`: `id: String`, `last_triggered: DateTime<Utc>`, `mode: RunMode`, `current: u32`, `max: u32`.
     *   `Generic(GenericAttributes { friendly_name, unit_of_measurement, device_class, state_class, rest })` (everything else), `as_generic`.
-    *   New `string_enum!` types in `ha_core_client::state::{light, fan, media_player, number, device_tracker, automation}`: `ColorMode`, `FanDirection`, `RepeatMode`, `NumberMode`, `SourceType`, `RunMode` (each with `Other(String)`).
+    *   Attribute enums in `ha_core_client::state::{light, fan, media_player, number, device_tracker, automation}`: `ColorMode`, `FanDirection`, `RepeatMode`, `NumberMode`, `SourceType`, `RunMode` (each with `Other(String)`).
     *   Methods: `friendly_name()`, `icon()`, `get(key) -> Option<Value>` (any attribute as JSON, `None` if missing or null), `get_as::<T>(key) -> Option<T>` (decoded, `None` if missing or another type). Example: `state.attributes.as_light().and_then(|l| l.brightness)`.
 *   `ClimateAttributes { friendly_name, hvac_modes: Option<Vec<HvacMode>> (unknown modes skipped), hvac_action: Option<HvacAction>, current_temperature, current_humidity, temperature, target_temp_low, target_temp_high, target_temp_step, min_temp, max_temp, fan_mode, fan_modes, preset_mode, preset_modes, swing_mode, swing_modes, rest }`. The current HVAC mode is the state (`State::ha_state()`). Structs are `#[non_exhaustive]`: read fields, do not build literals.
 *   `HistoricalState { entity_id, state, attributes: AttributeSet, last_changed, last_updated }`; `State::from(historical)`.

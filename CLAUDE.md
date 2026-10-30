@@ -40,4 +40,4 @@ Conventions:
 
 ## Docs to keep in sync
 
-`HA_CORE_CLIENT_SKILL.md` is the API reference for AI agents *consuming* this library: update it with any public API change, along with `README.md` and `CHANGELOG.md`. `ARCHITECTURE.md` describes internals. `PROJECT_OVERVIEW.md` holds the planned-features list and a dated development log. Some docs and comments are in Ukrainian.
+`HA_CORE_CLIENT_SKILL.md` is the API reference for AI agents *consuming* this library: update it with any public API change, along with `README.md` and `CHANGELOG.md`. `ARCHITECTURE.md` describes internals. Some docs and comments are in Ukrainian.

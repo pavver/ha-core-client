@@ -9,7 +9,7 @@ repository = "https://github.com/pavver/ha-core-client"
 readme = "README.md"
 keywords = ["home-assistant", "hass", "websocket", "async", "home-automation"]
 categories = ["api-bindings", "asynchronous", "network-programming"]
-exclude = [".github/", "CLAUDE.md", "PROJECT_OVERVIEW.md", "CONTRIBUTING.md"]
+exclude = [".github/", "CLAUDE.md", "CONTRIBUTING.md"]
 
 [features]
 default = ["native-tls"]
