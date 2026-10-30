@@ -13,6 +13,40 @@ use crate::target::Target;
 /// A command body without its `id`; the runner assigns ids per connection.
 pub(crate) type Request = Value;
 
+/// Checks a user-supplied command: a JSON object with a string `type` and no `id`, and not
+/// `auth` or `unsubscribe_events` (which would break the client's own bookkeeping).
+pub(crate) fn user_request(request: impl serde::Serialize) -> Result<Request, Error> {
+    let request = serde_json::to_value(request)
+        .map_err(|e| Error::InvalidInput(format!("the request cannot be serialized: {e}")))?;
+    let Some(object) = request.as_object() else {
+        return Err(Error::InvalidInput(format!("a command must be a JSON object, got {request}")));
+    };
+    if object.contains_key("id") {
+        return Err(Error::InvalidInput("a command must not contain `id`: the client assigns ids".into()));
+    }
+    match object.get("type").and_then(Value::as_str) {
+        None => Err(Error::InvalidInput("a command needs a string field `type`".into())),
+        Some("auth") => Err(Error::InvalidInput("`auth` is handled by the client".into())),
+        Some("unsubscribe_events") => {
+            Err(Error::InvalidInput("`unsubscribe_events` is not allowed; use HAClient::unsubscribe".into()))
+        }
+        Some(_) => Ok(request),
+    }
+}
+
+/// Like [`user_request`] for a one-shot command: also rejects commands that create a
+/// server-side subscription, whose events nobody would route.
+pub(crate) fn user_command(request: impl serde::Serialize) -> Result<Request, Error> {
+    let request = user_request(request)?;
+    let kind = request["type"].as_str().unwrap_or_default();
+    if kind.starts_with("subscribe_") || kind == "render_template" {
+        return Err(Error::InvalidInput(format!(
+            "`{kind}` creates a subscription; use Source::raw with HAClient::subscribe"
+        )));
+    }
+    Ok(request)
+}
+
 pub(crate) fn auth(token: &str) -> String {
     json!({ "type": "auth", "access_token": token }).to_string()
 }
@@ -146,6 +180,31 @@ impl From<HaError> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_requests_are_validated() {
+        assert!(user_request(json!({"type": "get_config"})).is_ok());
+        assert!(user_request(json!({"type": "subscribe_events"})).is_ok());
+        for bad in [
+            json!({"event_type": "x"}),
+            json!({"type": 5}),
+            json!(["get_config"]),
+            json!("get_config"),
+            json!({"type": "get_config", "id": 3}),
+            json!({"type": "auth", "access_token": "t"}),
+            json!({"type": "unsubscribe_events", "subscription": 1}),
+        ] {
+            assert!(matches!(user_request(&bad), Err(Error::InvalidInput(_))), "{bad}");
+        }
+    }
+
+    #[test]
+    fn user_commands_reject_subscriptions() {
+        assert!(user_command(json!({"type": "fire_event", "event_type": "x"})).is_ok());
+        for bad in ["subscribe_events", "subscribe_trigger", "subscribe_custom", "render_template"] {
+            assert!(matches!(user_command(json!({"type": bad})), Err(Error::InvalidInput(_))), "{bad}");
+        }
+    }
 
     #[test]
     fn incoming_keeps_result_verbatim() {

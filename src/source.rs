@@ -229,6 +229,38 @@ fn convert_template<T: DeserializeOwned>(event: SubEvent) -> Option<TemplateUpda
     }
 }
 
+impl Source<Value> {
+    /// A subscription made with an arbitrary subscribe-style command, for events and
+    /// commands not modelled by this crate (including those of custom integrations). Each
+    /// `event` payload arrives unchanged as [`Update::Event`]. The command is sent again
+    /// after a reconnect, like every other subscription.
+    ///
+    /// `request` must be a JSON object with a string `type` and without `id` (ids are
+    /// assigned by the client). Fails with [`Error::InvalidInput`] otherwise, and for the
+    /// types `auth` and `unsubscribe_events`; use
+    /// [`HAClient::unsubscribe`](crate::HAClient::unsubscribe) to cancel a subscription.
+    ///
+    /// ```no_run
+    /// # use ha_core_client::{HAClient, Source};
+    /// # use serde_json::json;
+    /// # async fn example(client: HAClient) -> ha_core_client::Result<()> {
+    /// let source = Source::raw(json!({"type": "subscribe_events", "event_type": "my_event"}))?;
+    /// let _stream = client.stream(source).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn raw(request: Value) -> Result<Self> {
+        Ok(Source {
+            request: protocol::user_request(request)?,
+            kind: SubKind::Raw,
+            convert: |event| match event {
+                SubEvent::Raw(payload) => Some(payload),
+                _ => None,
+            },
+        })
+    }
+}
+
 impl Source<Silence> {
     /// Whether an entity keeps reporting. See [`watch_silence`](crate::HAClient::watch_silence).
     ///
@@ -317,6 +349,18 @@ mod tests {
             })
         );
         assert!(matches!(Source::trigger(TimePatternTrigger::new()).variables(json!([1])), Err(Error::InvalidInput(_))));
+    }
+
+    #[test]
+    fn raw_source_validates_and_keeps_the_request() {
+        let request = json!({"type": "subscribe_events", "event_type": "x"});
+        let source = Source::raw(request.clone()).unwrap();
+        assert_eq!(source.request, request);
+        assert!(matches!(source.kind, SubKind::Raw));
+        for bad in [json!({"event_type": "x"}), json!([]), json!({"type": "t", "id": 1}), json!({"type": "unsubscribe_events"})] {
+            assert!(matches!(Source::raw(bad), Err(Error::InvalidInput(_))));
+        }
+        assert_eq!((source.convert)(SubEvent::Raw(json!({"a": 1}))), Some(json!({"a": 1})));
     }
 
     #[test]

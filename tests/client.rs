@@ -1968,3 +1968,78 @@ async fn waiting_for_the_connection_is_bounded() {
     let elapsed = started.elapsed();
     assert!(elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(2), "{elapsed:?}");
 }
+
+impl Describe for Value {
+    fn describe(&self) -> String {
+        self.to_string()
+    }
+}
+
+#[tokio::test]
+async fn command_sends_the_request_and_decodes_the_result() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+
+    let call = tokio::spawn({
+        let client = client.clone();
+        async move {
+            let config = client.command::<Value>(json!({"type": "get_config", "extra": [1]})).await;
+            let wrong = client.command::<Vec<u32>>(json!({"type": "get_config"})).await;
+            let denied = client.command::<Value>(json!({"type": "fire_event", "event_type": "x"})).await;
+            (config, wrong, denied)
+        }
+    });
+    let msg = conn.recv_type("get_config").await;
+    assert_eq!(msg, json!({"id": msg["id"], "type": "get_config", "extra": [1]}));
+    conn.ok(&msg["id"], json!({"location_name": "Home"})).await;
+    let msg = conn.recv_type("get_config").await;
+    conn.ok(&msg["id"], json!({"location_name": "Home"})).await;
+    let msg = conn.recv_type("fire_event").await;
+    conn.send(json!({"id": msg["id"], "type": "result", "success": false,
+        "error": {"code": "unauthorized", "message": "admin only"}}))
+        .await;
+
+    let (config, wrong, denied) = call.await.unwrap();
+    assert_eq!(config.unwrap(), json!({"location_name": "Home"}));
+    assert!(matches!(wrong, Err(Error::Decode(_))), "{wrong:?}");
+    assert!(matches!(denied, Err(Error::Ha { ref code, .. }) if *code == HaErrorCode::Unauthorized), "{denied:?}");
+
+    for bad in [json!({"type": "subscribe_events"}), json!({"type": "auth"}), json!({"type": "x", "id": 1}), json!({})] {
+        assert!(matches!(client.command::<Value>(bad).await, Err(Error::InvalidInput(_))));
+    }
+}
+
+#[tokio::test]
+async fn raw_source_delivers_payloads_and_is_resubscribed() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+
+    let (callback, mut rx) = collector();
+    let request = json!({"type": "subscribe_events", "event_type": "my_event"});
+    let sub = tokio::spawn({
+        let client = client.clone();
+        let request = request.clone();
+        async move { client.subscribe_raw(request, callback).await }
+    });
+    let msg = conn.recv_type("subscribe_events").await;
+    assert_eq!(msg, json!({"id": msg["id"], "type": "subscribe_events", "event_type": "my_event"}));
+    conn.ok(&msg["id"], Value::Null).await;
+    sub.await.unwrap().unwrap();
+
+    conn.event(&msg["id"], json!({"event_type": "my_event", "data": {"n": 1}})).await;
+    assert_eq!(recv_within(&mut rx).await, r#"{"data":{"n":1},"event_type":"my_event"}"#);
+
+    conn.ws.close(None).await.unwrap();
+    drop(conn);
+    assert_eq!(recv_within(&mut rx).await, "Interrupted");
+    let mut conn = ha.accept().await;
+    let again = conn.recv_type("subscribe_events").await;
+    assert_eq!(again["id"], 1);
+    assert_eq!(again["event_type"], "my_event");
+    conn.ok(&again["id"], Value::Null).await;
+    assert_eq!(recv_within(&mut rx).await, "Restored");
+    conn.event(&again["id"], json!({"n": 2})).await;
+    assert_eq!(recv_within(&mut rx).await, r#"{"n":2}"#);
+
+    assert!(matches!(Source::raw(json!({"event_type": "x"})), Err(Error::InvalidInput(_))));
+}

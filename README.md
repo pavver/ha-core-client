@@ -169,6 +169,7 @@ While reconnecting, requests fail fast with `Error::NotConnected` (unless `wait_
     client.call_service("light", "turn_off", Target::area("kitchen").and_entity("light.porch"), ()).await?;
     ```
 *   `call_service_with_response::<R>(...)`: for services that return data, such as `weather.get_forecasts`; the `response` is decoded into `R` (`serde_json::Value` works).
+*   `command::<R>(json!({"type": "get_config"}))`: any WebSocket command this crate has no method for; the `result` is decoded into `R` (`Value` works). `subscribe_raw(json!({"type": "subscribe_events", "event_type": "x"}), callback)` (or `Source::raw`) is the same for subscriptions and delivers raw event payloads.
 *   Errors from Home Assistant carry a typed `HaErrorCode` (`Error::Ha { code, message, translation }`, `SubscriptionStatus::Rejected`), with `Other(String)` for unknown codes. `translation` (`HaErrorTranslation`) is set when Home Assistant sends a `translation_key`. State, event and trigger `context` is a typed `Context` (`id`, `parent_id`, `user_id`).
 
 ### Subscriptions

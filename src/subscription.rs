@@ -132,6 +132,8 @@ pub(crate) enum SubKind {
     Template,
     /// The `render_template` of `watch_silence`, reported as `SubEvent::Silence`.
     Silence { entity_id: String },
+    /// Any subscribe-style command given by the user, reported as `SubEvent::Raw`.
+    Raw,
 }
 
 impl SubKind {
@@ -144,6 +146,7 @@ impl SubKind {
             SubKind::Trigger => SubEvent::TriggerFired(crate::events::TriggerFired::from_payload(payload)),
             SubKind::Template => SubEvent::from_template(payload),
             SubKind::Silence { entity_id } => SubEvent::from_silence(entity_id, payload),
+            SubKind::Raw => SubEvent::Raw(payload),
         }
     }
 }

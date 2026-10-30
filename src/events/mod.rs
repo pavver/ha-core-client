@@ -205,6 +205,8 @@ pub(crate) enum SubEvent {
     TemplateRendered { result: Value },
     TemplateError { message: String, level: TemplateErrorLevel },
     Silence(Silence),
+    /// An `event` payload of a [`Source::raw`](crate::Source::raw) subscription, unchanged.
+    Raw(Value),
     Status { subscription: Subscription, status: SubscriptionStatus },
 }
 

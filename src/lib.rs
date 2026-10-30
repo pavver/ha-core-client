@@ -405,6 +405,36 @@ impl HAClient {
         Ok(serde_json::from_str(wrapper.response.map_or("null", RawValue::get))?)
     }
 
+    /// Sends any WebSocket command and decodes its `result` into `R` (`Value` gives it
+    /// raw). An escape hatch for commands this crate has no method for.
+    ///
+    /// `request` must serialize to a JSON object with a string `type` and without `id`
+    /// (ids are assigned by the client); otherwise [`Error::InvalidInput`]. So are `auth`,
+    /// `unsubscribe_events` (use [`unsubscribe`](Self::unsubscribe)) and commands that
+    /// create a subscription (`subscribe_*`, `render_template`; use
+    /// [`Source::raw`](crate::Source::raw)). A `result` that does not fit `R` fails with
+    /// [`Error::Decode`]; an error reply from Home Assistant with [`Error::Ha`].
+    ///
+    /// ```no_run
+    /// # use ha_core_client::HAClient;
+    /// # use serde_json::{json, Value};
+    /// # async fn example(client: HAClient) -> ha_core_client::Result<()> {
+    /// let config = client.command::<Value>(json!({"type": "get_config"})).await?;
+    /// client
+    ///     .command::<Value>(json!({
+    ///         "type": "fire_event",
+    ///         "event_type": "my_event",
+    ///         "event_data": {"answer": 42},
+    ///     }))
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn command<R: DeserializeOwned>(&self, request: impl Serialize) -> Result<R> {
+        let result = self.request(protocol::user_command(request)?).await?;
+        Ok(serde_json::from_str(result.get())?)
+    }
+
     async fn service_call(
         &self,
         domain: Domain,
@@ -602,6 +632,18 @@ impl HAClient {
         Fut: Future<Output = CallbackResult> + Send + 'static,
     {
         self.subscribe(Source::trigger_raw(trigger)?, callback).await
+    }
+
+    /// Subscribes with an arbitrary subscribe-style command; the callback receives each
+    /// `event` payload unchanged. See [`Source::raw`] for the rules `request` must follow.
+    ///
+    /// Fails with [`Error::InvalidInput`] if `request` is not acceptable.
+    pub async fn subscribe_raw<F, Fut>(&self, request: Value, callback: F) -> Result<Subscription>
+    where
+        F: Fn(HAClient, Update<Value>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = CallbackResult> + Send + 'static,
+    {
+        self.subscribe(Source::raw(request)?, callback).await
     }
 
     /// Subscribes to a template rendered by Home Assistant. The callback receives
