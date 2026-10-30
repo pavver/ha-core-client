@@ -892,6 +892,8 @@ async fn service_calls_use_wire_names_and_target() {
         async move {
             client.turn_on("fan.bedroom").await?;
             client.call_service(Domain::HomeAssistant, Service::Reload, (), ()).await?;
+            client.open_cover(Target::area("kitchen")).await?;
+            client.turn_on(["light.a", "switch.b"]).await?;
             client.call_service_with_response::<Value>("weather", "get_forecasts", "weather.home", json!({"type": "daily"})).await
         }
     });
@@ -904,6 +906,18 @@ async fn service_calls_use_wire_names_and_target() {
     let m = conn.recv_type("call_service").await;
     assert_eq!(m["domain"], "homeassistant");
     assert!(m.get("target").is_none());
+    conn.ok(&m["id"], json!({"context": {}, "response": null})).await;
+
+    // A helper accepts any target kind.
+    let m = conn.recv_type("call_service").await;
+    assert_eq!((m["domain"].as_str(), m["service"].as_str()), (Some("cover"), Some("open_cover")));
+    assert_eq!(m["target"], json!({"area_id": ["kitchen"]}));
+    conn.ok(&m["id"], json!({"context": {}, "response": null})).await;
+
+    // Entities of mixed domains go through `homeassistant`.
+    let m = conn.recv_type("call_service").await;
+    assert_eq!((m["domain"].as_str(), m["service"].as_str()), (Some("homeassistant"), Some("turn_on")));
+    assert_eq!(m["target"], json!({"entity_id": ["light.a", "switch.b"]}));
     conn.ok(&m["id"], json!({"context": {}, "response": null})).await;
 
     let m = conn.recv_type("call_service").await;

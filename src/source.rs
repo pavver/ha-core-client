@@ -153,6 +153,32 @@ impl Source<TriggerFired> {
         Self::trigger_object(trigger)
     }
 
+    /// Several triggers in one subscription (any of them fires it). Tell them apart with
+    /// [`TriggerFired::id`](crate::TriggerFired::id), set through the platform's `.id(..)`.
+    pub fn triggers<I, T>(triggers: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<Trigger>,
+    {
+        let triggers: Vec<Trigger> = triggers.into_iter().map(Into::into).collect();
+        let triggers = serde_json::to_value(triggers).expect("Triggers always serialize to JSON objects");
+        Self::trigger_object(triggers)
+    }
+
+    /// Variables available to the templates of the trigger (`variables` of `subscribe_trigger`).
+    ///
+    /// Fails with [`Error::InvalidInput`] if `vars` does not serialize to a JSON object.
+    pub fn variables(mut self, vars: impl serde::Serialize) -> Result<Self> {
+        match serde_json::to_value(vars) {
+            Ok(vars @ Value::Object(_)) => {
+                self.request["variables"] = vars;
+                Ok(self)
+            }
+            Ok(other) => Err(Error::InvalidInput(format!("trigger variables must be a JSON object, got {other}"))),
+            Err(e) => Err(Error::InvalidInput(format!("trigger variables do not serialize: {e}"))),
+        }
+    }
+
     /// A trigger given as raw JSON, for platforms and options not modelled by [`Trigger`].
     ///
     /// Fails with [`Error::InvalidInput`] if `trigger` is not a JSON object.
@@ -268,6 +294,29 @@ mod tests {
     fn raw_trigger_must_be_an_object() {
         assert!(matches!(Source::trigger_raw(json!(["mqtt"])), Err(Error::InvalidInput(_))));
         assert!(Source::trigger_raw(json!({"trigger": "mqtt", "topic": "t"})).is_ok());
+    }
+
+    #[test]
+    fn several_triggers_and_variables() {
+        use crate::triggers::{StateTrigger, TimePatternTrigger};
+        let source = Source::triggers([
+            Trigger::from(StateTrigger::new("sensor.a").id("a")),
+            TimePatternTrigger::new().minutes("/5").id("tick").into(),
+        ])
+        .variables(json!({"room": "kitchen"}))
+        .unwrap();
+        assert_eq!(
+            source.request,
+            json!({
+                "type": "subscribe_trigger",
+                "trigger": [
+                    {"trigger": "state", "entity_id": ["sensor.a"], "id": "a"},
+                    {"trigger": "time_pattern", "minutes": "/5", "id": "tick"}
+                ],
+                "variables": {"room": "kitchen"}
+            })
+        );
+        assert!(matches!(Source::trigger(TimePatternTrigger::new()).variables(json!([1])), Err(Error::InvalidInput(_))));
     }
 
     #[test]

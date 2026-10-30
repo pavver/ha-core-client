@@ -4,7 +4,9 @@
 
 ### Breaking
 
-*   New `ConnectionState::Connecting` variant (the enum is `non_exhaustive`, so matches that already have a `_` arm are unaffected; exhaustive-in-spirit matches should handle it). It is only seen after `connect_lazy`. Nothing else changes for existing code; `Runner` internals are not public.
+*   New `ConnectionState::Connecting` variant, seen only after `connect_lazy`. The enum is `non_exhaustive`, so every `match` already has a `_` arm and still compiles; code that treats `_` as "connected" or "reconnecting" should handle `Connecting` explicitly.
+*   Trigger platform structs (`StateTrigger`, …) and `Trigger` are `#[non_exhaustive]`: construct them with `new` and builders, not struct literals. `StateTrigger::entity_id`, `NumericStateTrigger::entity_id` and `TimeTrigger::at` are now `Vec<String>` (still built with `new(..)`); `StateTrigger::to`/`from` are `Option<StateMatch>` and `NumericStateTrigger::above`/`below` are `Option<Threshold>`; all platforms have a new `id` field. The wire format of `entity_id`/`at` is a JSON list.
+*   Domain helpers (`turn_on`, `set_temperature`, `open_cover`, `lock`, `set_number`, …) take `impl Into<Target>` instead of `&str`; `&str` still works, so most callers are unaffected. `turn_on`/`turn_off`/`toggle` with a target that is not entity ids of a single domain (areas, devices, floors, labels, mixed domains, empty) call `homeassistant.<service>`. `set_number`/`set_text`/`select_option` reject entity ids of different domains with `Error::InvalidInput`.
 *   `call_service(domain, service, target, data)`: `target` is `impl Into<Target>` and `data` is `impl Serialize`. Migrate `call_service(d, s, Some("light.x"), None)` to `call_service(d, s, "light.x", ())`, `Some(json!(..))` data to plain `json!(..)`, and a `None` target to `()`. Data must serialize to a JSON object (or `()`/`null` for none), otherwise `Error::InvalidInput`.
 *   `call_service_with_response` is generic: `call_service_with_response::<R>(..) -> Result<R>` decodes the `response` field (`Value` gives the old behaviour; decode failures are `Error::Decode`).
 *   The `target` sent to Home Assistant now lists entity ids (`{"entity_id": ["light.x"]}`) instead of a bare string.
@@ -55,6 +57,9 @@
 *   `HAClient::connected()`: waits until connected; `Err(Error::Auth)` / `Err(Error::Stopped)` on a terminal state.
 *   `ClientConfig::wait_for_connection(Duration)` (default `ZERO`): request-style calls wait up to this long for the connection instead of failing at once with `NotConnected` (nothing is sent while waiting).
 *   `ClientConfig::tls_connector(TlsConnector)` and the re-export `TlsConnector` (`tokio_tungstenite::Connector`): custom TLS setup, e.g. a private CA or a self-signed certificate.
+*   Trigger platforms `EventTrigger`, `HomeAssistantTrigger`, `MqttTrigger`, `WebhookTrigger`, `CalendarTrigger`, `TagTrigger`, `ConversationTrigger`.
+*   Trigger options: `id` on every platform; `StateTrigger` `entities`/`and_entity`, `to_any_of`/`from_any_of`, `to_any_state`/`from_any_state` (explicit `null`), `not_to`/`not_from`; `NumericStateTrigger` `entities`/`and_entity`, `above_entity`/`below_entity`, `value_template`; `TimeTrigger::and_at`.
+*   `Source::triggers` and `HAClient::subscribe_triggers` (several triggers in one subscription), `Source<TriggerFired>::variables`, `TriggerFired::id`.
 *   Typed attribute structs per domain (`SensorAttributes`, `BinarySensorAttributes`, `LightAttributes`, `CoverAttributes`, `FanAttributes`, `MediaPlayerAttributes`, `NumberAttributes`, `SelectAttributes`, `UpdateAttributes`, `WeatherAttributes`, `SunAttributes`, `PersonAttributes`, `DeviceTrackerAttributes`, `ZoneAttributes`, `AutomationAttributes`) and the enums `ColorMode`, `FanDirection`, `RepeatMode`, `NumberMode`, `SourceType`, `RunMode`. `AttributeSet` gained `icon()`, `get_as::<T>(key)` and one `as_*` accessor per variant.
 *   `Target`: what a service call acts on (entities, devices, areas, floors, labels), with `From` impls for entity ids.
 *   `HaErrorCode`: typed Home Assistant error codes with an `Other(String)` fallback.

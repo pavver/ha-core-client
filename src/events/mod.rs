@@ -41,6 +41,12 @@ impl TriggerFired {
         self.trigger.get("platform").and_then(Value::as_str)
     }
 
+    /// The `id` of the trigger that fired (see the platforms' `.id(..)`); Home Assistant
+    /// uses the trigger's position in the list when none was set.
+    pub fn id(&self) -> Option<&str> {
+        self.trigger.get("id").and_then(Value::as_str)
+    }
+
     /// Human-readable description Home Assistant generated for the trigger.
     pub fn description(&self) -> Option<&str> {
         self.trigger.get("description").and_then(Value::as_str)

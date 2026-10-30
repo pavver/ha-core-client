@@ -3,7 +3,7 @@ use serde_json::json;
 
 use crate::{
     state::{Domain, Service},
-    HAClient,
+    HAClient, Target,
 };
 
 impl HAClient {
@@ -12,7 +12,7 @@ impl HAClient {
     /// Helper to call lock services, optionally with a code.
     async fn call_lock_service(
         &self,
-        entity_id: &str,
+        target: impl Into<Target>,
         service: Service,
         code: Option<&str>,
     ) -> Result<()> {
@@ -20,17 +20,17 @@ impl HAClient {
         self.call_service(
             Domain::Lock,
             service,
-            entity_id,
+            target,
             service_data,
         )
         .await
     }
 
-    pub async fn lock(&self, entity_id: &str, code: Option<&str>) -> Result<()> {
-        self.call_lock_service(entity_id, Service::Lock, code).await
+    pub async fn lock(&self, target: impl Into<Target>, code: Option<&str>) -> Result<()> {
+        self.call_lock_service(target, Service::Lock, code).await
     }
 
-    pub async fn unlock(&self, entity_id: &str, code: Option<&str>) -> Result<()> {
-        self.call_lock_service(entity_id, Service::Unlock, code).await
+    pub async fn unlock(&self, target: impl Into<Target>, code: Option<&str>) -> Result<()> {
+        self.call_lock_service(target, Service::Unlock, code).await
     }
 }

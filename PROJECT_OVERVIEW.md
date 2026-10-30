@@ -38,6 +38,15 @@ Below is a list of Home Assistant WebSocket API features that are not yet implem
 
 ## Current Development State
 
+### October 30, 2026 (Third Review: API Changes)
+
+Done in four parallel parts (see `CHANGELOG.md`, Unreleased, for the API and migration):
+*   Connection: `HAClient::connect_lazy` + `ConnectionState::Connecting` (start without HA being up), `HAClient::connected()`, `ClientConfig::wait_for_connection` (requests wait for the connection instead of `NotConnected`), `ClientConfig::tls_connector`.
+*   Runner/queue: `Source::without_merging` (entity subscriptions keep every change); one batched `subscribe_entities` read for all entity subscriptions after a reconnect (`PendingKind::ResyncBatch`) instead of one read per subscription.
+*   Model: typed `Context` (in `State`, `BusEvent`, `TriggerFired`, `ServiceCall`); `Error::Ha` carries `HaErrorTranslation`.
+*   Triggers: lists, `not_to`/`not_from`, explicit `null` match, `id`, entity thresholds, `value_template`, platforms event/homeassistant/mqtt/webhook/calendar/tag/conversation, several triggers and `variables` in one subscription. Domain helpers take `impl Into<Target>`; `turn_on`/`turn_off`/`toggle` fall back to `homeassistant.*` for non-entity or mixed targets.
+*   Still open from the review: a raw command/subscription API (`command`, `Source::raw`) and the uncovered HA commands (`fire_event`, `get_config`, `get_services`, registries, …).
+
 ### October 30, 2026 (Third Review: Fixes)
 
 *   Runner: a `Request`/`GetStateOnce` whose caller gave up while it was queued is not sent (a timed-out `call_service` no longer runs later). Scenario `request_abandoned_while_queued_is_not_sent`.
