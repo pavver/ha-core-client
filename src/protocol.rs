@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use serde_json::{json, Value};
 
-use crate::error::Error;
+use crate::error::{Error, HaErrorTranslation};
 #[cfg(test)]
 use crate::error::HaErrorCode;
 use crate::target::Target;
@@ -114,11 +114,32 @@ pub(crate) struct HaError {
     pub code: String,
     #[serde(default)]
     pub message: String,
+    // Kept as raw values so an odd shape cannot fail the whole message.
+    #[serde(default)]
+    pub translation_key: Value,
+    #[serde(default)]
+    pub translation_domain: Value,
+    #[serde(default)]
+    pub translation_placeholders: Value,
 }
 
 impl From<HaError> for Error {
     fn from(e: HaError) -> Self {
-        Error::Ha { code: e.code.into(), message: e.message }
+        let translation = match e.translation_key {
+            Value::String(key) => Some(Box::new(HaErrorTranslation {
+                domain: match e.translation_domain {
+                    Value::String(domain) => Some(domain),
+                    _ => None,
+                },
+                key,
+                placeholders: match e.translation_placeholders {
+                    Value::Object(map) => map,
+                    _ => Default::default(),
+                },
+            })),
+            _ => None,
+        };
+        Error::Ha { code: e.code.into(), message: e.message, translation }
     }
 }
 
@@ -160,5 +181,46 @@ mod tests {
         .unwrap();
         assert_eq!(m.id, Some(5));
         assert!(matches!(Error::from(m.error.unwrap()), Error::Ha { code, .. } if code == HaErrorCode::InvalidFormat));
+    }
+
+    fn parse_error(text: &str) -> Error {
+        let m: Incoming = serde_json::from_str(text).unwrap();
+        Error::from(m.error.unwrap())
+    }
+
+    #[test]
+    fn error_carries_translation() {
+        let err = parse_error(
+            r#"{"id":7,"type":"result","success":false,"error":{"code":"service_validation_error",
+            "message":"Validation error: Entity light.x does not support brightness",
+            "translation_key":"entity_not_supported","translation_domain":"homeassistant",
+            "translation_placeholders":{"entity_id":"light.x"}}}"#,
+        );
+        let Error::Ha { code, translation, .. } = err else { panic!("{err:?}") };
+        assert_eq!(code, HaErrorCode::ServiceValidationError);
+        let t = translation.unwrap();
+        assert_eq!(t.domain.as_deref(), Some("homeassistant"));
+        assert_eq!(t.key, "entity_not_supported");
+        assert_eq!(t.placeholders["entity_id"], "light.x");
+    }
+
+    #[test]
+    fn error_without_translation_or_with_odd_fields() {
+        let err = parse_error(r#"{"id":7,"type":"result","success":false,"error":{"code":"not_found","message":"x"}}"#);
+        assert!(matches!(err, Error::Ha { translation: None, .. }));
+        // Odd types never fail the message: no usable key means no translation.
+        let err = parse_error(
+            r#"{"id":7,"type":"result","success":false,"error":{"code":"x","message":"m",
+            "translation_key":5,"translation_domain":[],"translation_placeholders":"a"}}"#,
+        );
+        assert!(matches!(err, Error::Ha { translation: None, .. }));
+        // A key with odd companions still yields a translation.
+        let err = parse_error(
+            r#"{"id":7,"type":"result","success":false,"error":{"code":"x","message":"m",
+            "translation_key":"k","translation_domain":null,"translation_placeholders":"a"}}"#,
+        );
+        let Error::Ha { translation, .. } = err else { panic!() };
+        let t = translation.unwrap();
+        assert!(t.domain.is_none() && t.placeholders.is_empty());
     }
 }

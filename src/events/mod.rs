@@ -1,9 +1,11 @@
 pub mod attributes;
+pub mod context;
 pub(crate) mod helpers;
 pub mod state;
 pub mod service;
 
 pub use attributes::*;
+pub use context::Context;
 pub use state::{HistoricalState, State};
 pub use service::ServiceCall;
 pub use state::StateChange;
@@ -16,6 +18,10 @@ use crate::error::Result;
 
 use crate::subscription::Subscription;
 
+fn parse_context(value: Value) -> Context {
+    serde_json::from_value(value).unwrap_or_default()
+}
+
 /// A trigger firing from a `subscribe_trigger` subscription (also the item of `Source::trigger`).
 ///
 /// Home Assistant sends `{"variables": {"trigger": {...}}, "context": ...}`; the
@@ -26,7 +32,7 @@ pub struct TriggerFired {
     /// The `variables.trigger` object.
     pub trigger: Value,
     /// The context of the change that fired the trigger, if any.
-    pub context: Option<Value>,
+    pub context: Option<Context>,
 }
 
 impl TriggerFired {
@@ -72,7 +78,7 @@ impl TriggerFired {
             .and_then(|v| v.get_mut("trigger"))
             .map(Value::take)
             .unwrap_or(Value::Null);
-        let context = payload.get_mut("context").map(Value::take).filter(|c| !c.is_null());
+        let context = payload.get_mut("context").map(Value::take).filter(|c| !c.is_null()).map(parse_context);
         Self { trigger, context }
     }
 }
@@ -125,7 +131,7 @@ pub struct BusEvent {
     pub origin: Option<String>,
     /// When the event was fired; `None` if absent or unparsable.
     pub time_fired: Option<DateTime<Utc>>,
-    pub context: Option<Value>,
+    pub context: Option<Context>,
 }
 
 impl BusEvent {
@@ -144,7 +150,7 @@ impl BusEvent {
             .and_then(Value::as_str)
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|t| t.with_timezone(&Utc));
-        let context = payload.get_mut("context").map(Value::take).filter(|c| !c.is_null());
+        let context = payload.get_mut("context").map(Value::take).filter(|c| !c.is_null()).map(parse_context);
         Self { event_type, data, origin, time_fired, context }
     }
 }
@@ -247,7 +253,10 @@ impl SubEvent {
     pub(crate) fn from_service_call(payload: Value) -> SubEvent {
         let bus = BusEvent::from_payload(payload);
         match serde_json::from_value::<ServiceCall>(bus.data.clone()) {
-            Ok(call) => SubEvent::ServiceCall(call),
+            Ok(mut call) => {
+                call.context = bus.context;
+                SubEvent::ServiceCall(call)
+            }
             Err(e) => {
                 log::warn!("Failed to deserialize call_service event data: {e}");
                 SubEvent::Bus(bus)
@@ -360,6 +369,17 @@ mod tests {
         }));
         assert!(matches!(e, SubEvent::ServiceCall(ref s) if s.service == crate::state::Service::TurnOn));
 
+        // The context sits on the event, not in its data.
+        let e = SubEvent::from_service_call(json!({
+            "event_type": "call_service",
+            "data": {"domain": "light", "service": "turn_on", "service_data": {}},
+            "context": {"id": "01Y", "parent_id": null, "user_id": "abc"}
+        }));
+        match e {
+            SubEvent::ServiceCall(s) => assert_eq!(s.context.unwrap().user_id.as_deref(), Some("abc")),
+            other => panic!("unexpected {other:?}"),
+        }
+
         // Data of the wrong shape stays a plain bus event.
         let e = SubEvent::from_service_call(json!({"event_type": "call_service", "data": {"x": 1}}));
         assert!(matches!(e, SubEvent::Bus(_)));
@@ -379,6 +399,16 @@ mod tests {
     }
 
     #[test]
+    fn bus_event_context_is_lenient() {
+        let mut p = bus_payload();
+        p["context"] = json!(42);
+        assert_eq!(BusEvent::from_payload(p).context, Some(Context::default()));
+        let mut p = bus_payload();
+        p["context"] = json!("01ABC");
+        assert_eq!(BusEvent::from_payload(p).context.unwrap().id, "01ABC");
+    }
+
+    #[test]
     fn bus_event_fields_and_data_as() {
         #[derive(serde::Deserialize, Debug, PartialEq)]
         struct MyData {
@@ -389,7 +419,7 @@ mod tests {
         assert_eq!(e.event_type, "my_event");
         assert_eq!(e.origin.as_deref(), Some("LOCAL"));
         assert_eq!(e.time_fired.unwrap().timestamp_micros(), 1793198709185007);
-        assert_eq!(e.context.as_ref().unwrap()["id"], "01X");
+        assert_eq!(e.context.as_ref().unwrap().id, "01X");
         assert_eq!(e.data_as::<MyData>().unwrap(), MyData { x: 1, name: "a".into() });
         assert!(matches!(e.data_as::<Vec<u32>>(), Err(Error::Decode(_))));
     }

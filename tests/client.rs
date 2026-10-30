@@ -771,7 +771,7 @@ async fn get_state_reads_compressed_state() {
     .await;
     let state = req.await.unwrap().unwrap();
     assert_eq!(state.state, "off");
-    assert_eq!(state.context["user_id"], "abc");
+    assert_eq!(state.context.user_id.as_deref(), Some("abc"));
     // The one-shot subscription is cleaned up.
     let unsub = conn.recv_type("unsubscribe_events").await;
     assert_eq!(unsub["subscription"], msg["id"]);

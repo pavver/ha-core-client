@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use crate::events::attributes::AttributeSet;
+use crate::events::context::Context;
 use crate::events::helpers::de_helpers;
 use crate::state::{Domain, HaState};
 
@@ -16,8 +17,7 @@ pub struct State {
     pub last_changed: DateTime<Utc>,
     pub last_updated: DateTime<Utc>,
     pub last_reported: Option<DateTime<Utc>>,
-    /// `{"id": ..., "parent_id": ..., "user_id": ...}`
-    pub context: Value,
+    pub context: Context,
 }
 
 #[derive(Deserialize)]
@@ -33,7 +33,7 @@ struct StateWire {
     #[serde(default, deserialize_with = "de_helpers::deserialize_optional_rfc3339_string")]
     last_reported: Option<DateTime<Utc>>,
     #[serde(default)]
-    context: Value,
+    context: Context,
 }
 
 impl From<StateWire> for State {
@@ -75,11 +75,6 @@ impl State {
     /// (`{"s": ..., "a": ..., "c": ..., "lc": ..., "lu": ...}`).
     pub(crate) fn from_compressed(entity_id: &str, value: &Value) -> serde_json::Result<State> {
         let wire = CompressedStateWire::deserialize(value)?;
-        let context = match wire.context {
-            // Home Assistant sends only the id when there is no parent/user.
-            Value::String(id) => json!({ "id": id, "parent_id": null, "user_id": null }),
-            other => other,
-        };
         Ok(State {
             entity_id: entity_id.to_string(),
             state: wire.state,
@@ -87,7 +82,7 @@ impl State {
             last_changed: wire.last_changed,
             last_updated: wire.last_updated.unwrap_or(wire.last_changed),
             last_reported: None,
-            context,
+            context: wire.context,
         })
     }
 }
@@ -99,7 +94,7 @@ struct CompressedStateWire {
     #[serde(rename = "a", default)]
     attributes: Value,
     #[serde(rename = "c", default)]
-    context: Value,
+    context: Context,
     #[serde(rename = "lc", deserialize_with = "de_helpers::deserialize_f64_unix_timestamp")]
     last_changed: DateTime<Utc>,
     #[serde(rename = "lu", default, deserialize_with = "de_helpers::deserialize_optional_f64_unix_timestamp")]
@@ -154,7 +149,7 @@ impl From<HistoricalState> for State {
             last_changed: historical.last_changed,
             last_updated: historical.last_updated,
             last_reported: None,
-            context: json!({}),
+            context: Context::default(),
         }
     }
 }
@@ -198,6 +193,7 @@ impl StateChange {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn last_seen_prefers_last_reported() {
@@ -213,7 +209,7 @@ mod tests {
     fn compressed_state_with_string_and_object_context() {
         let plain = json!({"s": "on", "a": {"friendly_name": "Lamp"}, "c": "01ABC", "lc": 1792706118.1049175});
         let s = State::from_compressed("light.lamp", &plain).unwrap();
-        assert_eq!(s.context["id"], "01ABC");
+        assert_eq!(s.context.id, "01ABC");
         assert_eq!(s.last_updated, s.last_changed);
         assert_eq!(s.last_changed.timestamp_micros(), 1792706118104918);
 
@@ -223,7 +219,7 @@ mod tests {
             "lc": 1792706118.0, "lu": 1792706119.5
         });
         let s = State::from_compressed("switch.pump", &with_user).unwrap();
-        assert_eq!(s.context["user_id"], "u1");
+        assert_eq!(s.context.user_id.as_deref(), Some("u1"));
         assert_eq!(s.last_updated.timestamp_millis(), 1792706119500);
     }
 
