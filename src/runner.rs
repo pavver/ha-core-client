@@ -153,13 +153,22 @@ impl Runner {
         }
     }
 
+    /// Runs until stopped. Without an initial connection (`ws` is `None`, see
+    /// `HAClient::connect_lazy`) it starts with an immediate connect attempt.
     pub(crate) async fn run(
         mut self,
-        mut ws: WsStream,
+        ws: Option<WsStream>,
         mut cmd_rx: mpsc::Receiver<Command>,
         mut shutdown_rx: watch::Receiver<bool>,
     ) {
         let mut attempt = 0u32;
+        let mut ws = match ws {
+            Some(ws) => ws,
+            None => match self.reconnect(&mut attempt, true, &mut cmd_rx, &mut shutdown_rx).await {
+                Ok(ws) => ws,
+                Err(state) => return self.finish(state),
+            },
+        };
         loop {
             let started = Instant::now();
             let end = self.session(&mut ws, &mut cmd_rx, &mut shutdown_rx).await;
@@ -178,33 +187,51 @@ impl Runner {
                 SessionEnd::Lost(reason) => log::warn!("Connection to Home Assistant lost: {reason}"),
             }
 
-            loop {
-                attempt += 1;
-                self.set_state(ConnectionState::Reconnecting { attempt });
-                let delay = backoff(&self.shared.config, attempt);
-                log::info!("Reconnecting in {delay:?} (attempt {attempt})...");
-                if self.offline(tokio::time::sleep(delay), &mut cmd_rx, &mut shutdown_rx).await.is_none() {
-                    return self.finish(ConnectionState::Stopped);
-                }
-
-                let shared = self.shared.clone();
-                let connect = async move { connect_and_auth(&shared.config).await };
-                match self.offline(connect, &mut cmd_rx, &mut shutdown_rx).await {
-                    None => return self.finish(ConnectionState::Stopped),
-                    Some(Ok(new_ws)) => {
-                        ws = new_ws;
-                        break;
-                    }
-                    Some(Err(Error::Auth(message))) => {
-                        // Retrying a rejected token only risks an IP ban.
-                        log::error!("Home Assistant rejected the access token: {message}. Giving up.");
-                        return self.finish(ConnectionState::AuthFailed(message));
-                    }
-                    Some(Err(e)) => log::warn!("Reconnect attempt {attempt} failed: {e}"),
-                }
-            }
+            ws = match self.reconnect(&mut attempt, false, &mut cmd_rx, &mut shutdown_rx).await {
+                Ok(ws) => ws,
+                Err(state) => return self.finish(state),
+            };
         }
         self.finish(ConnectionState::Stopped);
+    }
+
+    /// Connects with backoff until it succeeds. With `initial`, the first attempt is made at
+    /// once, in [`ConnectionState::Connecting`]. `Err` carries the terminal state to finish with.
+    async fn reconnect(
+        &mut self,
+        attempt: &mut u32,
+        mut initial: bool,
+        cmd_rx: &mut mpsc::Receiver<Command>,
+        shutdown_rx: &mut watch::Receiver<bool>,
+    ) -> Result<WsStream, ConnectionState> {
+        loop {
+            if initial {
+                self.set_state(ConnectionState::Connecting);
+            } else {
+                *attempt += 1;
+                self.set_state(ConnectionState::Reconnecting { attempt: *attempt });
+                let delay = backoff(&self.shared.config, *attempt);
+                log::info!("Reconnecting in {delay:?} (attempt {attempt})...");
+                if self.offline(tokio::time::sleep(delay), cmd_rx, shutdown_rx).await.is_none() {
+                    return Err(ConnectionState::Stopped);
+                }
+            }
+
+            let shared = self.shared.clone();
+            let connect = async move { connect_and_auth(&shared.config).await };
+            match self.offline(connect, cmd_rx, shutdown_rx).await {
+                None => return Err(ConnectionState::Stopped),
+                Some(Ok(ws)) => return Ok(ws),
+                Some(Err(Error::Auth(message))) => {
+                    // Retrying a rejected token only risks an IP ban.
+                    log::error!("Home Assistant rejected the access token: {message}. Giving up.");
+                    return Err(ConnectionState::AuthFailed(message));
+                }
+                Some(Err(e)) if initial => log::warn!("Initial connect attempt failed: {e}"),
+                Some(Err(e)) => log::warn!("Reconnect attempt {attempt} failed: {e}"),
+            }
+            initial = false;
+        }
     }
 
     fn finish(&mut self, state: ConnectionState) {

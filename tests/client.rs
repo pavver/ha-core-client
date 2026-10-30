@@ -1699,3 +1699,91 @@ async fn weak_client_does_not_keep_the_client_alive() {
     assert!(weak.upgrade().is_none());
     conn.expect_close().await;
 }
+
+#[tokio::test]
+async fn connect_lazy_returns_at_once_and_connects_later() {
+    let ha = MockHa::start().await;
+    let client = HAClient::connect_lazy(ha.config()).unwrap();
+    assert_eq!(client.connection_state(), ConnectionState::Connecting);
+    assert!(matches!(client.get_states().await, Err(Error::NotConnected)));
+
+    let (callback, mut rx) = collector();
+    client.subscribe_trigger(TimePatternTrigger::new().seconds("/5"), callback).await.unwrap();
+    assert_eq!(recv_within(&mut rx).await, "Interrupted");
+
+    let mut conn = ha.accept().await;
+    tokio::time::timeout(WAIT, client.connected()).await.expect("not connected").unwrap();
+    assert_eq!(client.connection_state(), ConnectionState::Connected);
+    let msg = conn.recv_type("subscribe_trigger").await;
+    conn.ok(&msg["id"], Value::Null).await;
+    assert_eq!(recv_within(&mut rx).await, "Restored");
+    round_trip(&client, &mut conn).await;
+}
+
+#[tokio::test]
+async fn connect_lazy_retries_a_failed_first_attempt() {
+    let ha = MockHa::start().await;
+    let client = HAClient::connect_lazy(ha.config()).unwrap();
+    // Close the first attempt before the handshake.
+    let (tcp, _) = ha.listener.accept().await.unwrap();
+    drop(tcp);
+    wait_state(&client, |s| matches!(s, ConnectionState::Reconnecting { attempt: 1 })).await;
+    let _conn = ha.accept().await;
+    tokio::time::timeout(WAIT, client.connected()).await.expect("not connected").unwrap();
+}
+
+#[tokio::test]
+async fn connect_lazy_reports_a_rejected_token() {
+    let ha = MockHa::start().await;
+    let client = HAClient::connect_lazy(ha.config()).unwrap();
+    let mut conn = ha.accept_unauthed().await;
+    conn.send(json!({"type": "auth_invalid", "message": "Invalid access token"})).await;
+    let err = tokio::time::timeout(WAIT, client.connected()).await.expect("no result").unwrap_err();
+    assert!(matches!(&err, Error::Auth(message) if message == "Invalid access token"), "{err:?}");
+    assert!(matches!(client.connection_state(), ConnectionState::AuthFailed(_)));
+}
+
+#[tokio::test]
+async fn connect_lazy_rejects_http_urls() {
+    let err = HAClient::connect_lazy(ClientConfig::new("http://localhost:8123", TOKEN)).err().unwrap();
+    assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn connected_fails_after_stop() {
+    let ha = MockHa::start().await;
+    let client = HAClient::connect_lazy(ha.config()).unwrap();
+    client.stop().await;
+    assert!(matches!(client.connected().await, Err(Error::Stopped)));
+}
+
+#[tokio::test]
+async fn requests_wait_for_the_connection() {
+    let ha = MockHa::start().await;
+    let config = ha.config().wait_for_connection(Duration::from_secs(2)).reconnect_delay(Duration::from_millis(200), Duration::from_millis(200));
+    let (client, mut conn) = ha.connect(config).await;
+    conn.ws.close(None).await.unwrap();
+    wait_state(&client, |s| matches!(s, ConnectionState::Reconnecting { .. })).await;
+
+    let req = tokio::spawn({
+        let client = client.clone();
+        async move { client.get_states().await }
+    });
+    let mut conn = ha.accept().await;
+    let msg = conn.recv_type("get_states").await;
+    conn.ok(&msg["id"], json!([state("light.a", "on")])).await;
+    let states = req.await.unwrap().unwrap();
+    assert_eq!(states.len(), 1);
+}
+
+#[tokio::test]
+async fn waiting_for_the_connection_is_bounded() {
+    let ha = MockHa::start().await;
+    let config = ha.config().wait_for_connection(Duration::from_millis(300));
+    let client = HAClient::connect_lazy(config).unwrap();
+    // The mock never accepts, so the connection never comes up.
+    let started = std::time::Instant::now();
+    assert!(matches!(client.get_states().await, Err(Error::NotConnected)));
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(2), "{elapsed:?}");
+}

@@ -86,11 +86,14 @@ let config = ClientConfig::new("wss://ha.example.com/api/websocket", "TOKEN")
     .reconnect_delay(Duration::from_secs(1), Duration::from_secs(60)) // backoff bounds
     .subscription_queue_size(1024)              // events waiting per subscription
     .slow_callback_warning(Duration::from_secs(5)) // log callbacks that run this long
-    .max_message_size(64 << 20);                // largest accepted message, default 64 MiB
+    .max_message_size(64 << 20)                 // largest accepted message, default 64 MiB
+    .wait_for_connection(Duration::from_secs(5)); // requests wait this long for a down connection, default 0 (fail fast)
 let client = HAClient::connect_with(config).await?;
 ```
 
-TLS for `wss://` uses `native-tls` by default; enable the `rustls-tls` feature (with `default-features = false`) to use rustls instead.
+TLS for `wss://` uses `native-tls` by default; enable the `rustls-tls` feature (with `default-features = false`) to use rustls instead. For a private CA or self-signed certificate, build a connector with your own `native-tls`/`rustls` dependency and pass it with `ClientConfig::tls_connector(TlsConnector::NativeTls(..))`.
+
+`HAClient::connect_lazy(config)` does not wait for the first connection: it returns at once and connects in the background (state `Connecting`, then `Reconnecting` with backoff). Await `client.connected()` if you need the connection, e.g. to start a service before Home Assistant is up.
 
 ## Connection State
 
@@ -100,6 +103,7 @@ use ha_core_client::ConnectionState;
 let mut states = client.watch_connection_state();
 while states.changed().await.is_ok() {
     match &*states.borrow() {
+        ConnectionState::Connecting => println!("connecting (first connection)"),
         ConnectionState::Connected => println!("connected"),
         ConnectionState::Reconnecting { attempt } => println!("reconnecting (attempt {attempt})"),
         ConnectionState::AuthFailed(reason) => println!("token rejected: {reason}"),
@@ -147,7 +151,7 @@ After a reconnect, `subscribe_entity` re-reads the entity: if it changed while d
 
 `unsubscribe` ends with `SubscriptionStatus::Unsubscribed`; `stop()` waits (up to 5s) for callbacks to handle what is queued, ending with `Closed`.
 
-While reconnecting, requests fail fast with `Error::NotConnected`, but new subscriptions are accepted: they start as `Interrupted` and are sent once the connection is back. After a reconnect, triggers are re-created in Home Assistant, so a pending `for` countdown starts over. If Home Assistant rejects the token during a reconnect, the client stops with `ConnectionState::AuthFailed` instead of retrying (repeated failed logins can get the client's IP banned).
+While reconnecting, requests fail fast with `Error::NotConnected` (unless `wait_for_connection` is set; then they wait for the connection up to that long and fail with it if it is not back, never having been sent), but new subscriptions are accepted: they start as `Interrupted` and are sent once the connection is back. After a reconnect, triggers are re-created in Home Assistant, so a pending `for` countdown starts over. If Home Assistant rejects the token during a reconnect, the client stops with `ConnectionState::AuthFailed` instead of retrying (repeated failed logins can get the client's IP banned).
 
 ## API Overview
 

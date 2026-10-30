@@ -1,6 +1,8 @@
 use std::fmt;
 use std::time::Duration;
 
+use crate::TlsConnector;
+
 /// Upper bound for every configured duration, so arithmetic on deadlines cannot overflow.
 /// Larger values (e.g. `Duration::MAX` meaning "never") are clamped to this.
 const MAX_DURATION: Duration = Duration::from_secs(365 * 24 * 3600);
@@ -27,6 +29,8 @@ pub struct ClientConfig {
     pub(crate) subscription_queue_size: usize,
     pub(crate) slow_callback_warning: Duration,
     pub(crate) max_message_size: usize,
+    pub(crate) wait_for_connection: Duration,
+    pub(crate) tls_connector: Option<TlsConnector>,
 }
 
 impl ClientConfig {
@@ -47,6 +51,8 @@ impl ClientConfig {
             subscription_queue_size: 1024,
             slow_callback_warning: Duration::from_secs(5),
             max_message_size: 64 << 20,
+            wait_for_connection: Duration::ZERO,
+            tls_connector: None,
         }
     }
 
@@ -110,6 +116,35 @@ impl ClientConfig {
         self.max_message_size = bytes.max(1024);
         self
     }
+
+    /// How long a request waits for the connection when it is down (connecting or
+    /// reconnecting) before failing with [`Error::NotConnected`](crate::Error::NotConnected).
+    /// Default: `Duration::ZERO`, which fails at once.
+    ///
+    /// Applies to request-style calls (`get_states`, `call_service`, ...), not to
+    /// subscriptions, which are accepted while offline anyway. Nothing is sent while waiting,
+    /// so `NotConnected` still means the request did not reach Home Assistant. The request
+    /// timeout starts only once the request is handed over, so a call takes at most this plus
+    /// the request timeout.
+    pub fn wait_for_connection(mut self, wait: Duration) -> Self {
+        self.wait_for_connection = wait.min(MAX_DURATION);
+        self
+    }
+
+    /// Uses a custom TLS connector for `wss://` URLs, e.g. to trust a private CA or a
+    /// self-signed certificate. Default: the system trust store.
+    ///
+    /// ```ignore
+    /// // With the default `native-tls` feature (and `native-tls` as a dependency):
+    /// let cert = native_tls::Certificate::from_pem(&std::fs::read("ha-ca.pem")?)?;
+    /// let tls = native_tls::TlsConnector::builder().add_root_certificate(cert).build()?;
+    /// let config = ClientConfig::new("wss://ha.lan:8123/api/websocket", "TOKEN")
+    ///     .tls_connector(ha_core_client::TlsConnector::NativeTls(tls));
+    /// ```
+    pub fn tls_connector(mut self, connector: TlsConnector) -> Self {
+        self.tls_connector = Some(connector);
+        self
+    }
 }
 
 impl fmt::Debug for ClientConfig {
@@ -126,6 +161,8 @@ impl fmt::Debug for ClientConfig {
             .field("subscription_queue_size", &self.subscription_queue_size)
             .field("slow_callback_warning", &self.slow_callback_warning)
             .field("max_message_size", &self.max_message_size)
+            .field("wait_for_connection", &self.wait_for_connection)
+            .field("tls_connector", &if self.tls_connector.is_some() { "custom" } else { "default" })
             .finish()
     }
 }
@@ -140,5 +177,7 @@ mod tests {
         let s = format!("{cfg:?}");
         assert!(!s.contains("secret-token"));
         assert!(s.contains("<redacted>"));
+        assert!(s.contains("tls_connector: \"default\""));
+        assert!(s.contains("wait_for_connection: 0ns"));
     }
 }

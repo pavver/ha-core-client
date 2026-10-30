@@ -21,7 +21,7 @@ serde_json = "1"
 
 Requires Home Assistant 2024.10+ (triggers use the `trigger` key; raw triggers should too: `json!({"trigger": "mqtt", ...})`).
 
-Features: `native-tls` (default) or `rustls-tls` for `wss://`.
+Features: `native-tls` (default) or `rustls-tls` for `wss://`. For a private CA or self-signed certificate pass a custom connector with `ClientConfig::tls_connector(TlsConnector::NativeTls(..))` (or `Rustls(..)`); `TlsConnector` is a re-export of `tokio_tungstenite::Connector`, and you add `native-tls`/`rustls` as your own dependency to build it.
 
 ## 3. Errors
 
@@ -30,7 +30,7 @@ All client methods return `ha_core_client::Result<T>` = `Result<T, ha_core_clien
 `Error` variants (`#[non_exhaustive]`):
 *   `Auth(String)`: token rejected (from `connect`).
 *   `Connection(String)`: could not connect (from `connect`).
-*   `NotConnected`: the client is reconnecting; nothing was sent. Safe to retry later.
+*   `NotConnected`: the client is reconnecting; nothing was sent. Safe to retry later. With `wait_for_connection` set, request-style calls wait up to that long for the connection first, and only then fail with this error.
 *   `ConnectionLost`: the connection dropped after sending; the outcome is unknown.
 *   `Timeout`: no answer within `request_timeout`.
 *   `Stopped`: the client was stopped.
@@ -42,11 +42,13 @@ All client methods return `ha_core_client::Result<T>` = `Result<T, ha_core_clien
 ### Lifecycle
 *   `async fn connect(url: impl Into<String>, token: impl Into<String>) -> Result<HAClient>`: connects and authenticates; the first attempt is not retried. The URL must be `ws://` or `wss://` (`.../api/websocket`); `http(s)://` fails with `Error::InvalidInput`.
 *   `async fn connect_with(config: ClientConfig) -> Result<HAClient>`.
-*   `ClientConfig::new(url, token)` with builder methods `.connect_timeout(Duration)` (10s), `.request_timeout(Duration)` (30s), `.ping_interval(Duration)` (30s), `.pong_timeout(Duration)` (10s, also bounds each write), `.reconnect_delay(min, max)` (1s, 60s), `.subscription_queue_size(usize)` (1024), `.slow_callback_warning(Duration)` (5s; `ZERO` disables), `.max_message_size(usize)` (64 MiB, also bounds frames). Durations are capped at one year (`Duration::MAX` is fine).
+*   `fn connect_lazy(config: ClientConfig) -> Result<HAClient>` (not async, call inside a Tokio runtime): does not wait for the first connection; only `Error::InvalidInput` for a bad URL. State is `Connecting` during the first attempt (made immediately), then `Reconnecting` with backoff. Requests fail with `NotConnected` until connected; subscriptions are accepted and start `Interrupted`. Wrong token: `AuthFailed`.
+*   `async fn connected(&self) -> Result<()>`: waits for `Connected` (no internal timeout); `Err(Error::Auth(msg))` on `AuthFailed`, `Err(Error::Stopped)` on `Stopped`.
+*   `ClientConfig::new(url, token)` with builder methods `.connect_timeout(Duration)` (10s), `.request_timeout(Duration)` (30s), `.ping_interval(Duration)` (30s), `.pong_timeout(Duration)` (10s, also bounds each write), `.reconnect_delay(min, max)` (1s, 60s), `.subscription_queue_size(usize)` (1024), `.slow_callback_warning(Duration)` (5s; `ZERO` disables), `.max_message_size(usize)` (64 MiB, also bounds frames), `.wait_for_connection(Duration)` (`ZERO`: requests wait this long for a down connection before `NotConnected`), `.tls_connector(TlsConnector)`. Durations are capped at one year (`Duration::MAX` is fine).
 *   `async fn stop(&self)`: stops the client for all handles. Subscriptions receive `SubscriptionStatus::Closed`. Waits up to 5s for callbacks to handle queued events (not when called from inside a callback).
 *   `async fn closed(&self) -> ConnectionState`: waits for `Stopped` or `AuthFailed`.
 *   `fn connection_state(&self) -> ConnectionState`, `fn watch_connection_state(&self) -> tokio::sync::watch::Receiver<ConnectionState>`.
-*   `ConnectionState`: `Connected`, `Reconnecting { attempt: u32 }`, `AuthFailed(String)`, `Stopped`; `is_terminal()`.
+*   `ConnectionState`: `Connecting` (only after `connect_lazy`), `Connected`, `Reconnecting { attempt: u32 }`, `AuthFailed(String)`, `Stopped`; `is_terminal()`.
 
 ### State Operations
 *   `async fn get_state(&self, entity_id: &str) -> Result<events::State>`: `Error::Ha { code: HaErrorCode::NotFound, .. }` if missing.
@@ -214,4 +216,4 @@ async fn main() -> anyhow::Result<()> {
 *   **Logging**: through the `log` facade. Use `RUST_LOG=ha_core_client=debug`; `trace` logs raw WebSocket messages (the token is never logged).
 *   **Time**: `chrono::DateTime<Utc>` for timestamps, `std::time::Duration` for trigger `for`, `chrono::TimeDelta` for signed offsets and lookbacks.
 *   **Stale data**: react to `Update::Status` with `SubscriptionStatus::Interrupted`/`Restored` instead of polling `connection_state()`.
-*   **Retries**: `NotConnected` means nothing was sent, so retrying is safe. `ConnectionLost`/`Timeout` mean the outcome is unknown, so check the state before retrying non-idempotent calls.
+*   **Retries**: `NotConnected` means nothing was sent, so retrying is safe (or set `wait_for_connection` to let the client wait for the connection). `ConnectionLost`/`Timeout` mean the outcome is unknown, so check the state before retrying non-idempotent calls.
