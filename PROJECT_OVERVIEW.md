@@ -38,6 +38,10 @@ Below is a list of Home Assistant WebSocket API features that are not yet implem
 
 ## Current Development State
 
+### October 30, 2026 (Relicensing to MPL-2.0)
+
+Relicensed from GPL-3.0-only to MPL-2.0 as part of 0.4.0 (the first release under MPL; 0.2.0 and 0.3.0 stay GPL-3.0-only). Added `CONTRIBUTING.md` with contribution terms (license grant to the maintainer including relicensing, patent grant, no claims) and a PR template checkbox for them. `Cargo.toml` `exclude` keeps `.github/`, `CLAUDE.md`, `PROJECT_OVERVIEW.md` and `CONTRIBUTING.md` out of the published crate.
+
 ### October 30, 2026 (Raw command and subscription API)
 
 Added the escape hatch for what the crate does not model: `HAClient::command::<R>(request)` sends any one-shot WebSocket command and decodes its `result`; `Source::raw(request)` / `HAClient::subscribe_raw` subscribe with any subscribe-style command and deliver each `event` payload unchanged (`Update<Value>`, new crate-private `SubKind::Raw` / `SubEvent::Raw`). Both validate the request in `protocol::user_request` (object, string `type`, no `id`; `auth` and `unsubscribe_events` are refused); `command` additionally refuses `subscribe_*` and `render_template`. The uncovered HA commands from the review are now reachable through `command`. Tests: unit tests for the validation and two scenarios in `tests/client.rs` (command round trip incl. HA error and decode failure; raw subscription events and re-subscribe after reconnect).

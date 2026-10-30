@@ -1,10 +1,10 @@
 # Changelog
 
-## Unreleased
-
-*   License changed from GPL-3.0-only to MPL-2.0. The crate can now be used from projects under any license; modifications to its own files stay under MPL-2.0. Releases up to 0.4.0 remain under GPL-3.0-only.
-
 ## 0.4.0
+
+### License
+
+*   License changed from GPL-3.0-only to MPL-2.0. The crate can now be used from projects under any license; modifications to its own files stay under MPL-2.0. Releases up to 0.3.0 remain under GPL-3.0-only. Contribution terms are in `CONTRIBUTING.md`.
 
 ### Breaking
 
