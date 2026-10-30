@@ -509,6 +509,20 @@ impl HAClient {
         self.subscribe(Source::trigger(trigger), callback).await
     }
 
+    /// Subscribes to several triggers at once; any of them fires the callback. Give each
+    /// platform an `.id(..)` and read [`TriggerFired::id`] to tell them apart.
+    ///
+    /// Fails with [`Error::Ha`] if Home Assistant rejects a trigger configuration.
+    pub async fn subscribe_triggers<I, T, F, Fut>(&self, triggers: I, callback: F) -> Result<Subscription>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<triggers::Trigger>,
+        F: Fn(HAClient, Update<TriggerFired>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = CallbackResult> + Send + 'static,
+    {
+        self.subscribe(Source::triggers(triggers), callback).await
+    }
+
     /// Subscribes to a trigger given as raw JSON, for trigger platforms and options
     /// not modelled by [`triggers::Trigger`].
     ///

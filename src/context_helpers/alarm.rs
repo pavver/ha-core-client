@@ -3,7 +3,7 @@ use serde_json::json;
 
 use crate::{
     state::{Domain, Service},
-    HAClient,
+    HAClient, Target,
 };
 
 impl HAClient {
@@ -12,7 +12,7 @@ impl HAClient {
     /// Helper to call alarm services, optionally with a code.
     async fn call_alarm_service(
         &self,
-        entity_id: &str,
+        target: impl Into<Target>,
         service: Service,
         code: Option<&str>,
     ) -> Result<()> {
@@ -20,34 +20,34 @@ impl HAClient {
         self.call_service(
             Domain::AlarmControlPanel,
             service,
-            entity_id,
+            target,
             service_data,
         )
         .await
     }
 
-    pub async fn alarm_disarm(&self, entity_id: &str, code: Option<&str>) -> Result<()> {
-        self.call_alarm_service(entity_id, Service::AlarmDisarm, code)
+    pub async fn alarm_disarm(&self, target: impl Into<Target>, code: Option<&str>) -> Result<()> {
+        self.call_alarm_service(target, Service::AlarmDisarm, code)
             .await
     }
 
-    pub async fn alarm_arm_home(&self, entity_id: &str, code: Option<&str>) -> Result<()> {
-        self.call_alarm_service(entity_id, Service::AlarmArmHome, code)
+    pub async fn alarm_arm_home(&self, target: impl Into<Target>, code: Option<&str>) -> Result<()> {
+        self.call_alarm_service(target, Service::AlarmArmHome, code)
             .await
     }
 
-    pub async fn alarm_arm_away(&self, entity_id: &str, code: Option<&str>) -> Result<()> {
-        self.call_alarm_service(entity_id, Service::AlarmArmAway, code)
+    pub async fn alarm_arm_away(&self, target: impl Into<Target>, code: Option<&str>) -> Result<()> {
+        self.call_alarm_service(target, Service::AlarmArmAway, code)
             .await
     }
 
-    pub async fn alarm_arm_night(&self, entity_id: &str, code: Option<&str>) -> Result<()> {
-        self.call_alarm_service(entity_id, Service::AlarmArmNight, code)
+    pub async fn alarm_arm_night(&self, target: impl Into<Target>, code: Option<&str>) -> Result<()> {
+        self.call_alarm_service(target, Service::AlarmArmNight, code)
             .await
     }
 
-    pub async fn alarm_arm_vacation(&self, entity_id: &str, code: Option<&str>) -> Result<()> {
-        self.call_alarm_service(entity_id, Service::AlarmArmVacation, code)
+    pub async fn alarm_arm_vacation(&self, target: impl Into<Target>, code: Option<&str>) -> Result<()> {
+        self.call_alarm_service(target, Service::AlarmArmVacation, code)
             .await
     }
 }

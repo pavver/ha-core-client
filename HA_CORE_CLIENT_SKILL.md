@@ -72,6 +72,7 @@ Each `subscribe_*` returns `Result<Subscription>` after Home Assistant accepts i
 *   `subscribe_events(event_type: &str, cb)` (`Update<BusEvent>`): raw bus events of one type. `state_changed` and `call_service` are not special-cased here.
 *   `subscribe_service_calls(cb)` (`Update<ServiceCall>`): all `call_service` events.
 *   `subscribe_trigger(trigger: impl Into<triggers::Trigger>, cb)`, `subscribe_trigger_raw(trigger: serde_json::Value, cb)`: `TriggerFired` (`Update<TriggerFired>`). A raw trigger that is not a JSON object fails with `Error::InvalidInput`.
+*   `subscribe_triggers<I: IntoIterator<Item: Into<Trigger>>>(triggers, cb)`: several triggers in one subscription (`"trigger": [..]`). Give each `.id("..")`; `TriggerFired::id()` says which fired. `Source::triggers(..)` is the same; `Source<TriggerFired>::variables(impl Serialize) -> Result<Self>` sets the `variables` of the request (`Error::InvalidInput` unless a JSON object).
 *   `subscribe_template(template: &str, cb)`: Home Assistant renders the template and sends `TemplateUpdate::Rendered(Value)` (`Update<TemplateUpdate>`) right after subscribing, after every reconnect (following `Restored`, possibly unchanged) and whenever the result changes. Re-rendered when a referenced entity changes, and every minute if it uses `now()`. Results are typed (`2`, `true`, `"158 W"`). A syntax error fails the call with `Error::Ha`; a failing render arrives as `TemplateUpdate::RenderError { message, level: TemplateErrorLevel }` and the subscription stays.
 *   `subscribe_template_as::<T: DeserializeOwned>(template: &str, cb)` (`Update<TemplateUpdate<T>>`): like `subscribe_template`, decoding each result into `T` (`f64`, `bool`, `String`, a struct, …); a result that does not fit arrives as `TemplateUpdate::DecodeError { result: Value, error: String }`.
 *   `watch_silence(entity_id: &str, max_silence: std::time::Duration, cb)`: `Silence { entity_id, silent: bool }` (`Update<Silence>`): the current value right after subscribing and after every reconnect, then each flip. `silent` is `true` when the entity has not reported for longer than `max_silence`, counting reports of an unchanged value (`last_reported`), and for a missing entity. Built on `subscribe_template`; evaluated in Home Assistant on its clock, on entity changes and every minute, so flips can be up to a minute late. The way to implement "sensor silent for N minutes" without `get_states`. `Error::InvalidInput` for a malformed entity id.
@@ -117,21 +118,27 @@ client.subscribe_trigger(StateTrigger::new("binary_sensor.door").to(HaState::On)
 client.subscribe_trigger(NumericStateTrigger::new("sensor.temp").above(25.0), cb).await?;
 client.subscribe_trigger(SunTrigger::new(SunEvent::Sunset).offset(TimeDelta::minutes(-30)), cb).await?;
 client.subscribe_trigger(TimePatternTrigger::new().minutes("/5"), cb).await?;
-// also TimeTrigger::new("07:30:00"), TemplateTrigger::new(t).for_duration(d), ZoneTrigger::new(id, "zone.home", ZoneEvent::Enter)
+// also TimeTrigger::new("07:30").and_at("input_datetime.alarm"), TemplateTrigger::new(t).for_duration(d), ZoneTrigger::new(id, "zone.home", ZoneEvent::Enter)
+client.subscribe_triggers([StateTrigger::new("a.x").id("x"), StateTrigger::new("a.y").id("y")], cb).await?; // fired.id()
 ```
 
-*   Other platforms (`event`, `mqtt`, `homeassistant`, `calendar`, …, see `TRIGGERS_OVERVIEW.md`): `subscribe_trigger_raw(serde_json::json!({"trigger": "mqtt", "topic": "x"}), cb)`.
+*   All platform structs and `Trigger` are `#[non_exhaustive]`: use `new` + builders. Every platform has `.id(..)`.
+*   `StateTrigger`: `new(id)`, `entities(iter)`, `and_entity(id)` (entity_id is a list); `to(s)`, `to_any_of(iter)`, `to_any_state()` (sends `to: null`: any state change, not attribute-only changes); same for `from*`; `not_to(iter)`, `not_from(iter)`; `for_duration`, `attribute`.
+*   `NumericStateTrigger`: `new`/`entities`/`and_entity`; `above(f64)`, `above_entity(id)`, `below(f64)`, `below_entity(id)`, `value_template`, `for_duration`, `attribute`.
+*   `TimeTrigger`: `new(at)`, `and_at(at)`; `at` is `HH:MM[:SS]`, an `input_datetime` or a timestamp-sensor entity id.
+*   New platforms: `EventTrigger::new(type)`/`any_of(iter)` + `event_data(impl Serialize) -> Result<Self>`; `HomeAssistantTrigger::new(HomeAssistantEvent::Start|Shutdown)`; `MqttTrigger::new(topic)` + `payload`, `value_template`, `encoding`, `qos`; `WebhookTrigger::new(id)` + `allowed_methods([WebhookMethod::..])`, `local_only(bool)`; `CalendarTrigger::new(entity, CalendarEvent::Start|End)` + signed `offset(TimeDelta)`; `TagTrigger::new(tag)` + `and_tag`, `device`; `ConversationTrigger::new(sentence)` + `and_command`.
+*   Event `context` filters, `geo_location`, `device`, `persistent_notification` and `time` `weekday` are not modelled: use `subscribe_trigger_raw(serde_json::json!({"trigger": "mqtt", "topic": "x"}), cb)` (see `TRIGGERS_OVERVIEW.md`).
 
 ## 6. Domain Helpers (Recommended)
 
-Use these instead of `call_service` for cleaner code. All return `Result<()>`.
+Use these instead of `call_service` for cleaner code. All return `Result<()>`. Wherever `id` appears below, the parameter is `impl Into<Target>`: `"light.x"`, a list of ids, `Target::area("kitchen")`, …
 
-*   **General** (domain taken from the entity id): `turn_on(entity_id)`, `turn_off(entity_id)`, `toggle(entity_id)`.
+*   **General**: `turn_on(target)`, `turn_off(target)`, `toggle(target)`. Entity ids that all share one domain call `<domain>.<service>`; areas/devices/floors/labels, mixed domains or an empty target call `homeassistant.<service>`. An invalid entity id is `Error::InvalidInput`.
 *   **Climate**: `set_hvac_mode(id, HvacMode)`, `set_temperature(id, f64)`, `set_temperature_range(id, low, high)` (`heat_cool`), `set_fan_mode(id, FanMode)`, `set_preset_mode(id, PresetMode)`, `set_swing_mode(id, SwingMode)`.
 *   **Cover**: `open_cover(id)`, `close_cover(id)`, `stop_cover(id)`, `set_cover_position(id, u8)`, `set_cover_tilt_position(id, u8)`.
 *   **Alarm Control Panel**: `alarm_disarm(id, code: Option<&str>)`, `alarm_arm_home/away/night/vacation(id, code)`.
 *   **Lock**: `lock(id, code: Option<&str>)`, `unlock(id, code)`.
-*   **Input**: `set_number(id, f64)`, `set_text(id, &str)`, `select_option(id, &str)`. The service domain comes from the entity id (`number.x` → `number.set_value`); a bare name means `input_*` (`"x"` → `input_number.x`).
+*   **Input**: `set_number(id, f64)`, `set_text(id, &str)`, `select_option(id, &str)`. The service domain comes from the entity id (`number.x` → `number.set_value`); a bare name means `input_*` (`"x"` → `input_number.x`). Entity ids of different domains fail with `Error::InvalidInput`; a target without entity ids (an area) uses the `input_*` domain.
 
 ## 7. Important Types & Enums
 

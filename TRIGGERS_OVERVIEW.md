@@ -2,7 +2,7 @@
 
 This document provides a comprehensive overview of all available triggers in Home Assistant automations. This list can be used as a reference for adding typed trigger builders to the client.
 
-> **Using these platforms:** typed builders for `HAClient::subscribe_trigger` cover `state` (`StateTrigger`), `numeric_state` (`NumericStateTrigger`), `sun` (`SunTrigger`), `time` (`TimeTrigger`), `time_pattern` (`TimePatternTrigger`), `template` (`TemplateTrigger`) and `zone` (`ZoneTrigger`). Every platform below can be used through `HAClient::subscribe_trigger_raw`, e.g. `subscribe_trigger_raw(json!({"trigger": "event", "event_type": "my_event"}), cb)`. The platform goes in the `trigger` key (Home Assistant 2024.10+; older releases used `platform`, which current ones still accept). Durations and offsets use the `HH:MM:SS` format.
+> **Using these platforms:** typed builders for `HAClient::subscribe_trigger` cover `state` (`StateTrigger`), `numeric_state` (`NumericStateTrigger`), `sun` (`SunTrigger`), `time` (`TimeTrigger`), `time_pattern` (`TimePatternTrigger`), `template` (`TemplateTrigger`), `zone` (`ZoneTrigger`), `event` (`EventTrigger`, without the `context` filter), `homeassistant` (`HomeAssistantTrigger`), `mqtt` (`MqttTrigger`), `webhook` (`WebhookTrigger`), `calendar` (`CalendarTrigger`), `tag` (`TagTrigger`) and `conversation` (`ConversationTrigger`). All have `.id(..)`; `HAClient::subscribe_triggers` subscribes several at once. Not modelled (`geo_location`, `device`, `persistent_notification`, event `context`, `time` `weekday`): use `HAClient::subscribe_trigger_raw`, e.g. `subscribe_trigger_raw(json!({"trigger": "event", "event_type": "my_event"}), cb)`. The platform goes in the `trigger` key (Home Assistant 2024.10+; older releases used `platform`, which current ones still accept). Durations and offsets use the `HH:MM:SS` format.
 
 > **Note on WebSocket API Compatibility:**
 > According to the official Home Assistant developer documentation, the `subscribe_trigger` command in the WebSocket API supports the same trigger platforms and syntax as defined here for automations. This list is therefore considered accurate and complete for the purpose of creating WebSocket-based trigger subscriptions.
@@ -124,8 +124,8 @@ Fires when an HTTP request is made to a specific webhook endpoint.
 | Name        | Optional | Type   | Default | Description                                                                  |
 |-------------|----------|--------|---------|------------------------------------------------------------------------------|
 | `webhook_id`| No       | String |         | The unique ID for the webhook URL.                                           |
-| `local_only`| Yes      | Boolean| `false` | If `true`, only requests from the local network are allowed.                   |
-| `allowed_methods`| Yes | List of Strings | `POST` | A list of allowed HTTP methods (e.g., `GET`, `POST`, `PUT`). |
+| `local_only`| Yes      | Boolean| `true`  | If `true`, only requests from the local network are allowed.                   |
+| `allowed_methods`| Yes | List of Strings | `POST`, `PUT` | A list of allowed HTTP methods (`POST`, `PUT`, `GET`, `HEAD`; `GET` and `HEAD` are off by default). |
 
 ---
 
@@ -164,10 +164,10 @@ Fires when a persistent notification is updated.
 
 Fires when a command with a specific sentence is processed. Requires a conversation integration.
 
-**Trigger:** `sentence`
+**Trigger:** `conversation`
 
 ### Parameters
 
 | Name     | Optional | Type                     | Default | Description                                           |
 |----------|----------|--------------------------|---------|-------------------------------------------------------|
-| `sentence` | No       | String / List of Strings |         | The sentence(s) to match. Can include template slots. |
+| `command` | No       | String / List of Strings |         | The sentence(s) to match. Can include template slots. |

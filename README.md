@@ -11,7 +11,7 @@ A strongly-typed, ergonomic, and resilient asynchronous Rust client for the Home
 *   **Strongly typed, but tolerant**: enums for domains, services, states and attributes, each with an `Other(String)` fallback so values added by integrations or newer Home Assistant versions never break parsing.
 *   **Server-side filtering**: `subscribe_entity` receives only that entity's changes, not every state change in the house.
 *   **Ordered callbacks**: callbacks of one subscription run one after another, in event order; each receives an `HAClient` handle to make further calls.
-*   **Triggers**: State, Numeric State, Sun (with negative offsets), Time, Time Pattern, Template, Zone (with builders), plus raw JSON for any other platform.
+*   **Triggers**: State, Numeric State, Sun (with negative offsets), Time, Time Pattern, Template, Zone, Event, Home Assistant, MQTT, Webhook, Calendar, Tag, Conversation (with builders), several triggers per subscription, plus raw JSON for any other platform.
 *   **Templates**: subscribe to a template rendered by Home Assistant, and detect sensors that stopped reporting (`watch_silence`) without polling.
 *   **History**: entity history and the state at a past point in time.
 
@@ -175,17 +175,20 @@ While reconnecting, requests fail fast with `Error::NotConnected`, but new subsc
 *   `subscribe_template("{{ states('sensor.x') | float * 2 }}", callback)`: `TemplateUpdate::Rendered(Value)` with the current result and on every change, `RenderError` if a render fails. `subscribe_template_as::<f64>(template, callback)` decodes the result into `T` (`DecodeError` if it does not fit).
 *   `subscribe_events(event_type, callback)`: raw `BusEvent`s (with `data_as::<T>()`). `subscribe_state_changes(callback)`: every state change in the system as `StateChange`. `subscribe_service_calls(callback)`: `ServiceCall`.
 *   `subscribe(Source, callback)` / `stream(Source)`: the general forms the methods above are shortcuts for (`Source::entity`, `Source::trigger`, `Source::template_as::<T>`, …).
-*   `subscribe_trigger(trigger, callback)`: a trigger built with `StateTrigger`, `NumericStateTrigger`, `SunTrigger`, `TimeTrigger`, `TimePatternTrigger`, `TemplateTrigger` or `ZoneTrigger` (`triggers` module), as `TriggerFired`:
+*   `subscribe_trigger(trigger, callback)`: a trigger built with `StateTrigger`, `NumericStateTrigger`, `SunTrigger`, `TimeTrigger`, `TimePatternTrigger`, `TemplateTrigger`, `ZoneTrigger`, `EventTrigger`, `HomeAssistantTrigger`, `MqttTrigger`, `WebhookTrigger`, `CalendarTrigger`, `TagTrigger` or `ConversationTrigger` (`triggers` module; construct with `new` and builders), as `TriggerFired`:
     ```rust
     client.subscribe_trigger(StateTrigger::new("binary_sensor.door").to(HaState::On).for_duration(Duration::from_secs(60)), callback).await?;
     client.subscribe_trigger(TimePatternTrigger::new().minutes("/5"), callback).await?;
     ```
+*   `subscribe_triggers([a, b], callback)`: several triggers in one subscription; name each with `.id("..")` and tell them apart with `TriggerFired::id()`. `Source::triggers(..).variables(json!({..}))?` also sets trigger variables.
 *   `subscribe_trigger_raw(json!({"trigger": "mqtt", "topic": "x"}), callback)`: any other platform (see [TRIGGERS_OVERVIEW.md](TRIGGERS_OVERVIEW.md)).
 *   `unsubscribe(subscription)`, or `subscription.guard(&client)` to unsubscribe on drop.
 
 ### Domain Helpers
 
-*   **General**: `turn_on`, `turn_off`, `toggle` (any domain).
+Helpers take `impl Into<Target>`: an entity id (`"light.x"`), a list of ids, or `Target::area("kitchen")`, …
+
+*   **General**: `turn_on`, `turn_off`, `toggle` (any domain; entity ids of one domain call that domain's service, anything else `homeassistant.<service>`).
 *   **Climate**: `set_hvac_mode`, `set_temperature`, `set_temperature_range`, `set_fan_mode`, `set_preset_mode`, `set_swing_mode`.
 *   **Alarm**: `alarm_disarm`, `alarm_arm_home`, `alarm_arm_away`, `alarm_arm_night`, `alarm_arm_vacation`.
 *   **Cover**: `open_cover`, `close_cover`, `stop_cover`, `set_cover_position`, `set_cover_tilt_position`.
