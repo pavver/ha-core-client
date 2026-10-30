@@ -213,4 +213,6 @@ See [CHANGELOG.md](CHANGELOG.md) for the migration guides from 0.1 and 0.2.
 
 ## License
 
-GPL-3.0-only, see [LICENSE.md](LICENSE.md).
+[Mozilla Public License 2.0](LICENSE) (`MPL-2.0`). You can use the crate in projects under any license, including closed-source ones. Modified files of the crate itself must stay under MPL-2.0 and be made available in source form when you distribute them.
+
+Versions up to and including 0.4.0 were released under GPL-3.0-only.
