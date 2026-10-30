@@ -23,7 +23,7 @@ Home Assistant **2024.10 or newer**: triggers are sent with the `trigger` key (o
 
 ```toml
 [dependencies]
-ha-core-client = { git = "https://github.com/pavver/ha-core-client", tag = "v0.3.0" }
+ha-core-client = { git = "https://github.com/pavver/ha-core-client", tag = "v0.4.0" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 ```

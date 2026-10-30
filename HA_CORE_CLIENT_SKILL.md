@@ -13,7 +13,7 @@ This document serves as a comprehensive technical guide for AI agents to write a
 
 ```toml
 [dependencies]
-ha-core-client = { git = "https://github.com/pavver/ha-core-client", tag = "v0.3.0" }
+ha-core-client = { git = "https://github.com/pavver/ha-core-client", tag = "v0.4.0" }
 tokio = { version = "1", features = ["full"] }
 chrono = "0.4"
 serde_json = "1"
