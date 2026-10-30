@@ -71,7 +71,8 @@ const STOP_CALLBACKS_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConnectionState {
-    /// Connected and authenticated; subscriptions are active.
+    /// Connected and authenticated. After a reconnect, subscriptions are re-sent at this
+    /// point; each one is active again once it reports [`SubscriptionStatus::Restored`].
     Connected,
     /// The connection was lost; requests fail with [`Error::NotConnected`] until it is back.
     /// `attempt` counts reconnects since the last session that stayed up (for the longest

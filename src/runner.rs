@@ -508,6 +508,10 @@ impl Runner {
 
     async fn handle_command(&mut self, ws: &mut WsStream, cmd: Command) -> Result<(), String> {
         match cmd {
+            // The caller gave up while the command was queued: it has reported a timeout, so the
+            // request must not take effect afterwards (a service call would run unseen).
+            Command::Request { responder, .. } if responder.is_closed() => {}
+            Command::GetStateOnce { responder, .. } if responder.is_closed() => {}
             Command::Request { request, responder } => {
                 self.send(ws, request, PendingKind::Request(responder)).await?;
             }

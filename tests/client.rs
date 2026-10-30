@@ -1175,6 +1175,18 @@ async fn abandoned_subscribe_is_cancelled() {
 }
 
 #[tokio::test]
+async fn request_abandoned_while_queued_is_not_sent() {
+    use futures_util::FutureExt;
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    // Queued, then given up before the runner picks it up (single-threaded runtime).
+    assert!(client.call_service("light", "turn_on", "light.a", ()).now_or_never().is_none());
+    assert!(client.get_state("light.a").now_or_never().is_none());
+    // The next message is the round trip's `get_states`: neither request was sent.
+    round_trip(&client, &mut conn).await;
+}
+
+#[tokio::test]
 async fn orphan_ids_are_forgotten_once_unsubscribed() {
     let ha = MockHa::start().await;
     let (client, mut conn) = ha.connect(ha.config()).await;

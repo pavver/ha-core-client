@@ -65,6 +65,8 @@ impl Source<StateChange> {
     /// [`subscribe_entity_with`](crate::HAClient::subscribe_entity_with).
     pub fn entity_with(entity_id: impl Into<String>, changes: EntityChanges) -> Self {
         let entity_id = entity_id.into();
+        // A `state` trigger rather than `subscribe_entities`: Home Assistant dispatches it by
+        // entity id, while every `subscribe_entities` runs for all state changes. See ARCHITECTURE.md.
         let mut trigger = serde_json::json!({ "trigger": "state", "entity_id": entity_id });
         if changes == EntityChanges::State {
             // `to: null` makes Home Assistant skip attribute-only changes.

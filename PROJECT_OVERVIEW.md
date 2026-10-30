@@ -24,10 +24,6 @@ Below is a list of Home Assistant WebSocket API features that are not yet implem
 *   **`get_panels`**: Отримує список усіх панелей, доступних в інтерфейсі користувача Home Assistant.
 *   **`validate_config`**: Перевіряє, чи є певна частина конфігурації (наприклад, YAML) валідною.
 
-### Media Commands
-*   **`media_player_thumbnail`**: Отримує мініатюру для вказаної `media_player` сутності.
-*   **`camera_thumbnail`**: Отримує мініатюру для вказаної `camera` сутності.
-
 ### Advanced Commands
 *   **Target-related Commands**: Група команд (`extract_from_target`, `get_triggers_for_target` та ін.) для роботи з розширеними шаблонами та цілями (targets).
 *   **Registry Management**: Велика кількість команд для роботи з реєстрами системи:
@@ -41,6 +37,16 @@ Below is a list of Home Assistant WebSocket API features that are not yet implem
 ***Disclaimer: The features listed above are planned for future development. Do not implement any of these features without a direct and explicit command.***
 
 ## Current Development State
+
+### October 30, 2026 (Third Review: Fixes)
+
+*   Runner: a `Request`/`GetStateOnce` whose caller gave up while it was queued is not sent (a timed-out `call_service` no longer runs later). Scenario `request_abandoned_while_queued_is_not_sent`.
+*   Docs: `ConnectionState::Connected` no longer claims subscriptions are active (they are re-sent then, active on `Restored`); ARCHITECTURE.md records why live entity events use a `state` trigger rather than `subscribe_entities`; dropped the removed `camera_thumbnail`/`media_player_thumbnail` from the planned list.
+*   Not done (need API decisions): retrying the first connect, waiting for the connection instead of `NotConnected`, opting out of entity merging, a raw command/subscription API, batched resync after reconnect, typed `Context`, wider trigger options, `Target` in domain helpers.
+
+### October 29, 2026 (Typed subscriptions, streams, WeakClient)
+
+Callbacks no longer receive one `Event` enum. Each subscription kind delivers its own type wrapped in `Update<T>`; `Source<T>` describes a subscription (`HAClient::subscribe` for callbacks, `HAClient::stream` for `EventStream<T>`). The runner and queue still work with the crate-private `SubEvent`; conversion runs in the worker (or in the stream's `poll_next`). Added `subscribe_state_changes`, `subscribe_template_as`, `BusEvent::data_as`, `WeakClient`. See `CHANGELOG.md` for the migration table.
 
 ### October 29, 2026 (Second Review: Fixes)
 
@@ -328,6 +334,3 @@ An extensive refactoring was performed to move the client to a "Handle/Runner" p
 
 **Refactoring Complete:**
 The refactoring, while architecturally significant, is now complete and the project compiles successfully. The ownership and lifetime issues related to sharing the command channel across the `HAClient` handle and the background `ClientRunner` have been resolved by using `Arc` for the senders. The client now correctly implements the Handle/Runner pattern.
-### October 29, 2026 (Typed subscriptions, streams, WeakClient)
-
-Callbacks no longer receive one `Event` enum. Each subscription kind delivers its own type wrapped in `Update<T>`; `Source<T>` describes a subscription (`HAClient::subscribe` for callbacks, `HAClient::stream` for `EventStream<T>`). The runner and queue still work with the crate-private `SubEvent`; conversion runs in the worker (or in the stream's `poll_next`). Added `subscribe_state_changes`, `subscribe_template_as`, `BusEvent::data_as`, `WeakClient`. See `CHANGELOG.md` for the migration table.
