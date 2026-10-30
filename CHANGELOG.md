@@ -51,12 +51,14 @@
 *   `HAClient::stream(source) -> EventStream<T>`: consume any subscription as a `futures_util::Stream<Item = Update<T>>` (same statuses, resync and ordering as callbacks; dropping the stream unsubscribes).
 *   `subscribe_state_changes` (the `state_changed` bus event as typed `StateChange`s), `subscribe_template_as::<T>` (`TemplateUpdate<T>` with `DecodeError`), `StateChange::{is_state_change, added, removed}`, `BusEvent::data_as`, `TemplateErrorLevel`.
 *   `HAClient::downgrade() -> WeakClient` (`upgrade() -> Option<HAClient>`), for callbacks that need a client handle without keeping the client alive.
+*   `Source::without_merging()`: entity subscriptions keep every change when the callback falls behind, instead of merging them (the queue then drops the oldest events past `subscription_queue_size` and reports `SubscriptionStatus::Lagged`, like other subscriptions). No effect on other sources.
 
 ### Changed
 
 *   `connect`/`connect_with` fail with `Error::InvalidInput` for a URL that is not `ws://` or `wss://`, with a hint for the common `http://host:8123` mistake (was an opaque `Error::Connection`).
 *   `subscribe_trigger_raw` fails with `Error::InvalidInput` for a trigger that is not a JSON object, instead of sending it to Home Assistant.
 *   A `Subscription` belongs to the client that created it. Since ids are per client, passing one to another client's `unsubscribe` (or `guard`) cancelled an unrelated subscription; it now fails with `Error::InvalidInput`.
+*   After a reconnect, the states of all restored entity subscriptions are read with one `subscribe_entities` (listing each entity once) instead of one read plus one unsubscribe per subscription, so a restore sends fewer messages. The read is sent once every entity subscription has been answered; until then their live events are held as before.
 
 ## 0.3.0
 

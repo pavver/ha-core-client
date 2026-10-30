@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,13 +82,16 @@ enum PendingKind {
         entity_id: String,
         responder: oneshot::Sender<Result<State>>,
     },
-    /// Reads the state of an entity subscription: the baseline after subscribing,
-    /// or the current state after a reconnect (`restoring`). On the initial subscribe,
+    /// Reads the baseline state of an entity subscription made while connected.
     /// `responder` is answered only after this read, so a missing entity is an error.
     Resync {
         sub_id: u64,
-        restoring: bool,
         responder: Option<SubscribeResponder>,
+    },
+    /// One `subscribe_entities` for all entity subscriptions restored after a reconnect;
+    /// reports what each missed, then `Restored`.
+    ResyncBatch {
+        sub_ids: Vec<u64>,
     },
     /// `unsubscribe_events` of `ha_id`; `responder` is `None` for internal cleanups.
     Unsubscribe {
@@ -122,6 +125,11 @@ pub(crate) struct Runner {
     routes: HashMap<u64, u64>,
     /// Server-side subscriptions we unsubscribed from; late events for them are ignored.
     orphans: HashSet<u64>,
+    /// Entity subscriptions whose re-subscription is not yet answered.
+    restoring: BTreeSet<u64>,
+    /// Entity subscriptions re-subscribed and waiting (their events held) for the batched
+    /// state read, which is sent once `restoring` is empty.
+    restore_acked: Vec<u64>,
     last_rx: Instant,
     ping: Option<(u64, Instant)>,
 }
@@ -148,6 +156,8 @@ impl Runner {
             pending: HashMap::new(),
             routes: HashMap::new(),
             orphans: HashSet::new(),
+            restoring: BTreeSet::new(),
+            restore_acked: Vec::new(),
             last_rx: Instant::now(),
             ping: None,
         }
@@ -236,9 +246,10 @@ impl Runner {
         let sub_id = self.next_sub_id;
         self.next_sub_id += 1;
         let filter = match kind {
-            SubKind::EntityState { changes: EntityChanges::State, .. } => queue::Filter::StateChanges,
-            SubKind::EntityState { .. } => queue::Filter::Merge,
-            _ => queue::Filter::None,
+            SubKind::EntityState { changes, merge, .. } => {
+                queue::Filter { merge, state_only: changes == EntityChanges::State }
+            }
+            _ => queue::Filter::NONE,
         };
         let subscription = Subscription { id: sub_id, client: self.shared.client_id };
         let (events, rx) = queue::channel(subscription, self.shared.config.subscription_queue_size, filter);
@@ -277,10 +288,17 @@ impl Runner {
         self.remove_subscription(sub_id)
     }
 
+    /// A subscription that left no longer takes part in the batched state read.
+    fn forget_restore(&mut self, sub_id: u64) {
+        self.restoring.remove(&sub_id);
+        self.restore_acked.retain(|id| *id != sub_id);
+    }
+
     /// Removes a subscription that was never handed out: queued events are discarded and
     /// the callback is not told. Returns its Home Assistant id.
     fn remove_subscription(&mut self, sub_id: u64) -> Option<u64> {
         let entry = self.subs.remove(&sub_id)?;
+        self.forget_restore(sub_id);
         entry.events.discard();
         let ha_id = entry.ha_id?;
         self.routes.remove(&ha_id);
@@ -291,6 +309,7 @@ impl Runner {
     /// Returns its Home Assistant id.
     fn close_subscription(&mut self, sub_id: u64, status: SubscriptionStatus) -> Option<u64> {
         let entry = self.subs.remove(&sub_id)?;
+        self.forget_restore(sub_id);
         entry.events.push_status(status);
         let ha_id = entry.ha_id?;
         self.routes.remove(&ha_id);
@@ -417,11 +436,14 @@ impl Runner {
                 PendingKind::Unsubscribe { responder: Some(r), .. } => drop(r.send(Ok(Value::Null))),
                 PendingKind::Subscribe { responder: None, .. }
                 | PendingKind::Resync { .. }
+                | PendingKind::ResyncBatch { .. }
                 | PendingKind::Unsubscribe { .. } => {}
             }
         }
         self.routes.clear();
         self.orphans.clear();
+        self.restoring.clear();
+        self.restore_acked.clear();
         self.ping = None;
 
         for entry in self.subs.values_mut() {
@@ -495,6 +517,13 @@ impl Runner {
         if !subs.is_empty() {
             log::info!("Restoring {} subscription(s)...", subs.len());
         }
+        self.restoring = self
+            .subs
+            .iter()
+            .filter(|(_, s)| matches!(s.kind, SubKind::EntityState { .. }))
+            .map(|(id, _)| *id)
+            .collect();
+        self.restore_acked.clear();
         for (sub_id, request) in subs {
             if *shutdown_rx.borrow() {
                 return Some(SessionEnd::Stop);
@@ -529,7 +558,26 @@ impl Runner {
                 }
             }
         }
-        Ok(())
+        self.send_restore_read(ws).await
+    }
+
+    /// Once every entity subscription has been re-subscribed (or has left), reads the
+    /// current state of all of them with one `subscribe_entities`.
+    async fn send_restore_read(&mut self, ws: &mut WsStream) -> Result<(), String> {
+        if !self.restoring.is_empty() || self.restore_acked.is_empty() {
+            return Ok(());
+        }
+        let sub_ids = std::mem::take(&mut self.restore_acked);
+        // Several subscriptions may watch the same entity.
+        let entity_ids: BTreeSet<&str> = sub_ids
+            .iter()
+            .filter_map(|id| match &self.subs.get(id)?.kind {
+                SubKind::EntityState { entity_id, .. } => Some(entity_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let request = protocol::subscribe_entities(&entity_ids.into_iter().collect::<Vec<_>>());
+        self.send(ws, request, PendingKind::ResyncBatch { sub_ids }).await.map(drop)
     }
 
     async fn handle_text(&mut self, ws: &mut WsStream, text: &str) -> Result<(), String> {
@@ -571,6 +619,12 @@ impl Runner {
     }
 
     async fn handle_result(&mut self, ws: &mut WsStream, id: u64, outcome: Result<Box<RawValue>>) -> Result<(), String> {
+        self.process_result(ws, id, outcome).await?;
+        // The result may have been the last outstanding re-subscription.
+        self.send_restore_read(ws).await
+    }
+
+    async fn process_result(&mut self, ws: &mut WsStream, id: u64, outcome: Result<Box<RawValue>>) -> Result<(), String> {
         let Some(pending) = self.pending.remove(&id) else {
             log::debug!("Result for unknown or expired request id {id}");
             return Ok(());
@@ -604,7 +658,9 @@ impl Runner {
                 },
             },
             // Acknowledged; the state arrives as the first event.
-            kind @ (PendingKind::StateOnce { .. } | PendingKind::Resync { .. }) if outcome.is_ok() => {
+            kind @ (PendingKind::StateOnce { .. } | PendingKind::Resync { .. } | PendingKind::ResyncBatch { .. })
+                if outcome.is_ok() =>
+            {
                 self.pending.insert(id, Pending { kind, deadline: pending.deadline });
             }
             PendingKind::StateOnce { responder, .. } => {
@@ -612,12 +668,20 @@ impl Runner {
                     let _ = responder.send(Err(e));
                 }
             }
-            PendingKind::Resync { sub_id, restoring, responder } => {
+            PendingKind::Resync { sub_id, responder } => {
                 if let Err(e) = outcome {
                     log::warn!("Could not read the state of subscription {sub_id}: {e}");
                 }
-                if let Some(ha_id) = self.resync_failed(sub_id, restoring, responder) {
+                if let Some(ha_id) = self.resync_failed(sub_id, false, responder) {
                     self.unsubscribe_orphan(ws, ha_id).await?;
+                }
+            }
+            PendingKind::ResyncBatch { sub_ids } => {
+                if let Err(e) = outcome {
+                    log::warn!("Could not read the state of the restored entity subscriptions: {e}");
+                }
+                for sub_id in sub_ids {
+                    self.restored(sub_id);
                 }
             }
         }
@@ -659,8 +723,12 @@ impl Runner {
         };
         let early = std::mem::take(&mut entry.early);
         if read.is_some() && restoring {
-            // Live events wait until the re-read tells what was missed meanwhile.
+            // Live events wait until the batched re-read tells what was missed meanwhile.
             entry.held = Some(early);
+            self.routes.insert(ha_id, sub_id);
+            self.restoring.remove(&sub_id);
+            self.restore_acked.push(sub_id);
+            return Ok(());
         } else if read.is_some() {
             // The baseline read that follows already includes them.
         } else {
@@ -671,7 +739,7 @@ impl Runner {
             // Read the entity's state: the baseline now, or what changed while disconnected.
             // Within the subscribe's deadline, so that the caller's timeout covers both steps.
             Some(request) => {
-                let kind = PendingKind::Resync { sub_id, restoring, responder };
+                let kind = PendingKind::Resync { sub_id, responder };
                 self.send_until(ws, request, kind, deadline).await?;
             }
             None => {
@@ -708,13 +776,21 @@ impl Runner {
                 return self.unsubscribe_orphan(ws, id).await;
             }
             Some(PendingKind::Resync { .. }) => {
-                let Some(Pending { kind: PendingKind::Resync { sub_id, restoring, responder }, .. }) =
-                    self.pending.remove(&id)
+                let Some(Pending { kind: PendingKind::Resync { sub_id, responder }, .. }) = self.pending.remove(&id)
                 else {
                     unreachable!()
                 };
-                if let Some(dropped) = self.apply_resync(sub_id, restoring, responder, &payload) {
+                if let Some(dropped) = self.apply_resync(sub_id, false, responder, &payload) {
                     self.unsubscribe_orphan(ws, dropped).await?;
+                }
+                return self.unsubscribe_orphan(ws, id).await;
+            }
+            Some(PendingKind::ResyncBatch { .. }) => {
+                let Some(Pending { kind: PendingKind::ResyncBatch { sub_ids }, .. }) = self.pending.remove(&id) else {
+                    unreachable!()
+                };
+                for sub_id in sub_ids {
+                    self.apply_resync(sub_id, true, None, &payload);
                 }
                 return self.unsubscribe_orphan(ws, id).await;
             }
@@ -814,8 +890,9 @@ impl Runner {
                     abandoned.extend(self.remove_subscription(sub_id));
                     let _ = r.send(Err(Error::Timeout));
                 }
-                PendingKind::Resync { sub_id, restoring, responder: None } => {
-                    if restoring {
+                PendingKind::Resync { responder: None, .. } => {}
+                PendingKind::ResyncBatch { sub_ids } => {
+                    for sub_id in sub_ids {
                         self.restored(sub_id);
                     }
                 }
@@ -829,6 +906,8 @@ impl Runner {
         for ha_id in abandoned {
             self.unsubscribe_orphan(ws, ha_id).await?;
         }
+        // A removed subscription may have been the last one the batched read waited for.
+        self.send_restore_read(ws).await?;
         for sub_id in retry {
             let Some(entry) = self.subs.get_mut(&sub_id) else { continue };
             log::warn!("Home Assistant did not confirm restored subscription {sub_id} in time; retrying");

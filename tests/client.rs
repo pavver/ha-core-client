@@ -204,6 +204,22 @@ async fn answer_state_read(conn: &mut Conn, entity_id: &str, state: &str, last_u
     assert_eq!(unsub["subscription"], msg["id"]);
 }
 
+/// Receives the client's single read of all restored entity subscriptions, expects it to
+/// list exactly the `reads` entities (sorted), answers it and expects the cleanup.
+async fn answer_batch_read(conn: &mut Conn, reads: &[(&str, &str, f64)]) {
+    let msg = conn.recv_type("subscribe_entities").await;
+    let ids: Vec<&str> = reads.iter().map(|(id, ..)| *id).collect();
+    assert_eq!(msg["entity_ids"], json!(ids));
+    conn.ok(&msg["id"], Value::Null).await;
+    let states: serde_json::Map<String, Value> = reads
+        .iter()
+        .map(|(id, state, lu)| (id.to_string(), json!({"s": state, "a": {}, "c": "01X", "lc": lu, "lu": lu})))
+        .collect();
+    conn.event(&msg["id"], json!({"a": states})).await;
+    let unsub = conn.recv_type("unsubscribe_events").await;
+    assert_eq!(unsub["subscription"], msg["id"]);
+}
+
 /// Closes the server side of `conn` and returns the client's next, fully connected session.
 async fn reconnect(ha: &MockHa, client: &HAClient, mut conn: Conn) -> Conn {
     conn.ws.close(None).await.unwrap();
@@ -369,13 +385,8 @@ async fn reconnect_after_server_close_restores_subscriptions() {
     conn.ok(&second["id"], Value::Null).await;
     wait_state(&client, |s| *s == ConnectionState::Connected).await;
 
-    // The states are re-read: `a` did not change, `b` changed while disconnected.
-    let read_a = conn.recv_type("subscribe_entities").await;
-    let read_b = conn.recv_type("subscribe_entities").await;
-    answer_read(&mut conn, &read_a, "sensor.a", "1", 100.0).await;
-    answer_read(&mut conn, &read_b, "sensor.b", "2", 200.0).await;
-    conn.recv_type("unsubscribe_events").await;
-    conn.recv_type("unsubscribe_events").await;
+    // The states are re-read at once: `a` did not change, `b` changed while disconnected.
+    answer_batch_read(&mut conn, &[("sensor.a", "1", 100.0), ("sensor.b", "2", 200.0)]).await;
     assert_eq!(recv_within(&mut rx_a).await, "Restored");
     assert_eq!(recv_within(&mut rx_b).await, "1->2");
     assert_eq!(recv_within(&mut rx_b).await, "Restored");
@@ -387,6 +398,91 @@ async fn reconnect_after_server_close_restores_subscriptions() {
 
     // Requests work again on the new connection.
     round_trip(&client, &mut conn).await;
+}
+
+#[tokio::test]
+async fn restored_entity_subscriptions_share_one_state_read() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let (mut rx_a1, _) = subscribe_collecting(&client, &mut conn, "sensor.a").await;
+    let (mut rx_b, _) = subscribe_collecting(&client, &mut conn, "sensor.b").await;
+    let mut rx_t = subscribe_trigger_collecting(&client, &mut conn).await;
+    let (mut rx_a2, _) = subscribe_collecting(&client, &mut conn, "sensor.a").await;
+    conn.ws.close(None).await.unwrap();
+    for rx in [&mut rx_a1, &mut rx_b, &mut rx_a2] {
+        assert_eq!(recv_within(rx).await, "Interrupted");
+    }
+    assert_eq!(recv_within(&mut rx_t).await, "Interrupted");
+
+    let mut conn = ha.accept().await;
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        let sub = conn.recv_type("subscribe_trigger").await;
+        ids.push(sub["id"].clone());
+    }
+    // The trigger is restored on its own ack; the read waits for the last entity ack.
+    conn.ok(&ids[2], Value::Null).await;
+    assert_eq!(recv_within(&mut rx_t).await, "Restored");
+    for id in [&ids[0], &ids[1], &ids[3]] {
+        conn.ok(id, Value::Null).await;
+    }
+    // One read lists each entity once; `a` changed meanwhile, `b` did not.
+    answer_batch_read(&mut conn, &[("sensor.a", "5", 300.0), ("sensor.b", "1", 100.0)]).await;
+    for rx in [&mut rx_a1, &mut rx_a2] {
+        assert_eq!(recv_within(rx).await, "1->5");
+        assert_eq!(recv_within(rx).await, "Restored");
+    }
+    assert_eq!(recv_within(&mut rx_b).await, "Restored");
+    // Nothing else was sent.
+    round_trip(&client, &mut conn).await;
+}
+
+#[tokio::test]
+async fn rejected_entity_resubscription_does_not_block_the_state_read() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let (mut rx_a, _) = subscribe_collecting(&client, &mut conn, "sensor.a").await;
+    let (mut rx_b, _) = subscribe_collecting(&client, &mut conn, "sensor.b").await;
+    conn.ws.close(None).await.unwrap();
+    assert_eq!(recv_within(&mut rx_a).await, "Interrupted");
+    assert_eq!(recv_within(&mut rx_b).await, "Interrupted");
+
+    let mut conn = ha.accept().await;
+    let first = conn.recv_type("subscribe_trigger").await;
+    let second = conn.recv_type("subscribe_trigger").await;
+    conn.ok(&first["id"], Value::Null).await;
+    conn.send(json!({"id": second["id"], "type": "result", "success": false,
+        "error": {"code": "not_found", "message": "gone"}}))
+        .await;
+    answer_batch_read(&mut conn, &[("sensor.a", "1", 100.0)]).await;
+    assert_eq!(recv_within(&mut rx_a).await, "Restored");
+    assert_eq!(recv_within(&mut rx_b).await, r#"Rejected { code: NotFound, message: "gone" }"#);
+}
+
+#[tokio::test]
+async fn state_read_timeout_after_reconnect_still_restores() {
+    let ha = MockHa::start().await;
+    let config = ha.config().request_timeout(Duration::from_millis(300));
+    let (client, mut conn) = ha.connect(config).await;
+    let (mut rx_a, _) = subscribe_collecting(&client, &mut conn, "sensor.a").await;
+    let (mut rx_b, _) = subscribe_collecting(&client, &mut conn, "sensor.b").await;
+    conn.ws.close(None).await.unwrap();
+    assert_eq!(recv_within(&mut rx_a).await, "Interrupted");
+    assert_eq!(recv_within(&mut rx_b).await, "Interrupted");
+
+    let mut conn = ha.accept().await;
+    let first = conn.recv_type("subscribe_trigger").await;
+    let second = conn.recv_type("subscribe_trigger").await;
+    conn.ok(&first["id"], Value::Null).await;
+    conn.ok(&second["id"], Value::Null).await;
+    // The read is never answered.
+    let read = conn.recv_type("subscribe_entities").await;
+    assert_eq!(read["entity_ids"], json!(["sensor.a", "sensor.b"]));
+    assert_eq!(recv_within(&mut rx_a).await, "Restored");
+    assert_eq!(recv_within(&mut rx_b).await, "Restored");
+    assert_eq!(client.connection_state(), ConnectionState::Connected);
+    conn.event(&first["id"], entity_trigger_event("sensor.a", "1", "2")).await;
+    assert_eq!(recv_within(&mut rx_a).await, "1->2");
 }
 
 #[tokio::test]
@@ -996,6 +1092,33 @@ async fn slow_entity_callback_gets_merged_state_changes() {
     gate.add_permits(10);
     assert_eq!(recv_within(&mut rx).await, "Lagged { dropped: 3 }");
     assert_eq!(recv_within(&mut rx).await, "1->5");
+}
+
+#[tokio::test]
+async fn without_merging_delivers_every_change_to_a_slow_callback() {
+    let ha = MockHa::start().await;
+    let (client, mut conn) = ha.connect(ha.config()).await;
+    let (callback, mut rx, gate) = gated_collector();
+    let sub = tokio::spawn({
+        let client = client.clone();
+        async move { client.subscribe(Source::entity("sensor.power").without_merging(), callback).await }
+    });
+    let msg = conn.recv_type("subscribe_trigger").await;
+    conn.ok(&msg["id"], Value::Null).await;
+    answer_state_read(&mut conn, "sensor.power", "0", 100.0).await;
+    sub.await.unwrap().unwrap();
+
+    conn.event(&msg["id"], entity_trigger_event("sensor.power", "0", "1")).await;
+    assert_eq!(recv_within(&mut rx).await, "0->1");
+    for n in 2..=5 {
+        conn.event(&msg["id"], entity_trigger_event("sensor.power", &(n - 1).to_string(), &n.to_string())).await;
+    }
+    round_trip(&client, &mut conn).await;
+
+    gate.add_permits(10);
+    for expected in ["1->2", "2->3", "3->4", "4->5"] {
+        assert_eq!(recv_within(&mut rx).await, expected);
+    }
 }
 
 #[tokio::test]
