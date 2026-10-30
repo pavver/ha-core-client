@@ -165,7 +165,7 @@ While reconnecting, requests fail fast with `Error::NotConnected`, but new subsc
     client.call_service("light", "turn_off", Target::area("kitchen").and_entity("light.porch"), ()).await?;
     ```
 *   `call_service_with_response::<R>(...)`: for services that return data, such as `weather.get_forecasts`; the `response` is decoded into `R` (`serde_json::Value` works).
-*   Errors from Home Assistant carry a typed `HaErrorCode` (`Error::Ha { code, message }`, `SubscriptionStatus::Rejected`), with `Other(String)` for unknown codes.
+*   Errors from Home Assistant carry a typed `HaErrorCode` (`Error::Ha { code, message, translation }`, `SubscriptionStatus::Rejected`), with `Other(String)` for unknown codes. `translation` (`HaErrorTranslation`) is set when Home Assistant sends a `translation_key`. State, event and trigger `context` is a typed `Context` (`id`, `parent_id`, `user_id`).
 
 ### Subscriptions
 

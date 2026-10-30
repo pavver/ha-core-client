@@ -37,9 +37,9 @@ mod target;
 pub mod triggers;
 
 pub use config::ClientConfig;
-pub use error::{Error, HaErrorCode, Result};
+pub use error::{Error, HaErrorCode, HaErrorTranslation, Result};
 pub use target::Target;
-pub use events::{BusEvent, ServiceCall, Silence, State, StateChange, SubscriptionStatus, TemplateUpdate, TriggerFired, Update};
+pub use events::{BusEvent, Context, ServiceCall, Silence, State, StateChange, SubscriptionStatus, TemplateUpdate, TriggerFired, Update};
 pub use source::Source;
 pub use stream::EventStream;
 pub use subscription::{BoxError, CallbackResult, EntityChanges, Subscription, SubscriptionGuard};
@@ -274,10 +274,10 @@ impl HAClient {
             .filter(|state| state.last_updated <= timestamp)
             .max_by_key(|state| state.last_updated)
             .map(Into::into)
-            .ok_or_else(|| Error::Ha {
-                code: HaErrorCode::NotFound,
-                message: format!("No state for '{entity_id}' in the window ending at {timestamp}"),
-            })
+            .ok_or_else(|| Error::ha(
+                HaErrorCode::NotFound,
+                format!("No state for '{entity_id}' in the window ending at {timestamp}"),
+            ))
     }
 
     // --- Services ---

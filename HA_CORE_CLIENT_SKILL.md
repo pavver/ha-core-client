@@ -34,7 +34,7 @@ All client methods return `ha_core_client::Result<T>` = `Result<T, ha_core_clien
 *   `ConnectionLost`: the connection dropped after sending; the outcome is unknown.
 *   `Timeout`: no answer within `request_timeout`.
 *   `Stopped`: the client was stopped.
-*   `Ha { code, message }`: Home Assistant returned an error (`code: HaErrorCode`, e.g. `InvalidFormat`, `NotFound`, `HomeAssistantError`, `ServiceValidationError`; unknown codes are `Other(String)`).
+*   `Ha { code, message, translation }`: Home Assistant returned an error (`code: HaErrorCode`, e.g. `InvalidFormat`, `NotFound`, `HomeAssistantError`, `ServiceValidationError`; unknown codes are `Other(String)`). `translation: Option<Box<HaErrorTranslation>>` is `Some` when Home Assistant sent a `translation_key`: `HaErrorTranslation { domain: Option<String>, key: String, placeholders: Map<String, Value> }` (`#[non_exhaustive]`). Match with `..` to ignore it.
 *   `Protocol(String)`, `Decode(serde_json::Error)`, `InvalidInput(String)`.
 
 ## 4. Main API: `HAClient`
@@ -146,9 +146,9 @@ Use these instead of `call_service` for cleaner code. All return `Result<()>`.
 *   `Update<T>` (`#[non_exhaustive]`, re-exported at the crate root): `Event(T)` (a data event) or `Status { subscription: Subscription, status: SubscriptionStatus }`. Helpers `into_event() -> Option<T>`, `event() -> Option<&T>`, `status() -> Option<&SubscriptionStatus>`. A data event that does not fit the subscription's type (e.g. a malformed payload) is logged with `warn!` and skipped.
 *   Item types by subscription (`events` module):
     *   `StateChange { entity_id: String, old_state: Option<State>, new_state: Option<State> }` (`subscribe_entity[_with]`, `subscribe_state_changes`): `old_state` is `None` if the entity was added, `new_state` is `None` if it was removed. `old_state.state` may equal `new_state.state` (attribute-only change, or merged changes). Helpers: `is_state_change()` (state string differs, or added/removed), `added()`, `removed()`.
-    *   `ServiceCall { domain: Domain, service: Service, service_data: Value }` (`subscribe_service_calls`).
-    *   `BusEvent { event_type: String, data: Value, origin: Option<String>, time_fired: Option<DateTime<Utc>>, context: Option<Value> }` (`subscribe_events`) with `data_as::<T: DeserializeOwned>() -> Result<T>` (`Error::Decode`). `time_fired` is `None` if absent or unparsable.
-    *   `TriggerFired { trigger: Value, context: Option<Value> }` (`subscribe_trigger[_raw]`) with `platform()`, `description()`, `entity_id()`, `from_state()`, `to_state()`.
+    *   `ServiceCall { domain: Domain, service: Service, service_data: Value, context: Option<Context> }` (`subscribe_service_calls`).
+    *   `BusEvent { event_type: String, data: Value, origin: Option<String>, time_fired: Option<DateTime<Utc>>, context: Option<Context> }` (`subscribe_events`) with `data_as::<T: DeserializeOwned>() -> Result<T>` (`Error::Decode`). `time_fired` is `None` if absent or unparsable.
+    *   `TriggerFired { trigger: Value, context: Option<Context> }` (`subscribe_trigger[_raw]`) with `platform()`, `description()`, `entity_id()`, `from_state()`, `to_state()`.
     *   `TemplateUpdate<T = Value>` (`#[non_exhaustive]`; `subscribe_template`, `subscribe_template_as`): `Rendered(T)`, `RenderError { message: String, level: TemplateErrorLevel }` (`Error`/`Warning`/`Other`; the subscription stays active), `DecodeError { result: Value, error: String }`.
     *   `Silence { entity_id: String, silent: bool }` (`watch_silence`).
 *   `SubscriptionStatus` (`#[non_exhaustive]`; the `status` of `Update::Status`): lifecycle of the subscription itself, delivered in order with its data:
@@ -159,7 +159,8 @@ Use these instead of `call_service` for cleaner code. All return `Result<()>`.
     *   `Closed`: the client stopped. No more events.
     *   `Unsubscribed`: cancelled by `unsubscribe()` or a dropped `SubscriptionGuard`/`EventStream`. No more events.
     *   `subscription` can be passed to `client.unsubscribe(...)`, also while offline.
-*   `State { entity_id, state: String, attributes: AttributeSet, last_changed, last_updated, last_reported: Option<_>, context: Value }` with `ha_state() -> HaState`, `domain() -> Option<Domain>` and `last_seen() -> DateTime<Utc>` (`last_reported`, or `last_updated` when it is `None`, as in `get_state` and history results).
+*   `Context { id: String, parent_id: Option<String>, user_id: Option<String> }` (crate root, `#[non_exhaustive]`): who or what caused a change. `is_user()` (`user_id` set: a user's action) and `is_automated()` (`parent_id` set: caused by an automation or script reacting to another event). Parsing never fails; unknown shapes give `Context::default()`.
+*   `State { entity_id, state: String, attributes: AttributeSet, last_changed, last_updated, last_reported: Option<_>, context: Context }` with `ha_state() -> HaState`, `domain() -> Option<Domain>` and `last_seen() -> DateTime<Utc>` (`last_reported`, or `last_updated` when it is `None`, as in `get_state` and history results).
 *   `AttributeSet` (`#[non_exhaustive]`, match with a wildcard arm), typed by the entity's domain; every typed struct is `#[non_exhaustive]`, has `friendly_name`, `icon` and `rest: serde_json::Map` (all other keys), and every field is `Option` unless noted. If a domain's attributes do not parse, the entity is `Generic` (never an error). Variants (all `Box<..>` except `Generic`), accessor `as_<name>() -> Option<&T>`:
     *   `Climate(ClimateAttributes)` (`climate`; no `icon` field, it is in `rest`), `as_climate`: see below.
     *   `Sensor(SensorAttributes)` (`sensor`), `as_sensor`: `unit_of_measurement: UnitOfMeasurement`, `device_class: DeviceClass`, `state_class: StateClass`, `options: Vec<String>` (enum sensors), `last_reset: DateTime<Utc>`.

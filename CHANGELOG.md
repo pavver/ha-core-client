@@ -27,6 +27,8 @@
 *   `subscribe_events` always delivers `BusEvent`; `state_changed` and `call_service` are no longer special-cased.
 *   A `watch_silence` template render error (and an entity-subscription payload that cannot be parsed) is logged and skipped instead of being delivered as another event type.
 *   `AttributeSet` has new variants (`Sensor`, `BinarySensor`, `Light`, `Cover`, `Fan`, `MediaPlayer`, `Number`, `Select`, `Update`, `Weather`, `Sun`, `Person`, `DeviceTracker`, `Zone`, `Automation`). Code matching only `Climate`/`Generic` must add a wildcard arm, and entities of these domains no longer come as `Generic` (attributes that do not match the schema still do). Typed fields moved out of `rest` for these entities.
+*   `State::context` is `Context` (was `serde_json::Value`), and `BusEvent::context` and `TriggerFired::context` are `Option<Context>`. Migrate `state.context["user_id"]` to `state.context.user_id` (an `Option<String>`), `["id"]` to `.id`, `["parent_id"]` to `.parent_id`. A context that cannot be parsed becomes `Context::default()` instead of the raw value.
+*   `Error::Ha` gained a `translation: Option<Box<HaErrorTranslation>>` field. Patterns without `..` must add it (`Error::Ha { code, message, .. }`); the Display output is unchanged.
 
 ### Fixed
 
@@ -44,6 +46,9 @@
 
 ### Added
 
+*   `Context { id, parent_id, user_id }` (also in `events`) with `is_user()` and `is_automated()`; parsing accepts the object form and the bare id string of compressed states, and never fails.
+*   `ServiceCall::context: Option<Context>`, taken from the `call_service` bus event.
+*   `HaErrorTranslation { domain, key, placeholders }` in `Error::Ha`, filled from the `translation_key`, `translation_domain` and `translation_placeholders` that Home Assistant sends with e.g. `service_validation_error`.
 *   Typed attribute structs per domain (`SensorAttributes`, `BinarySensorAttributes`, `LightAttributes`, `CoverAttributes`, `FanAttributes`, `MediaPlayerAttributes`, `NumberAttributes`, `SelectAttributes`, `UpdateAttributes`, `WeatherAttributes`, `SunAttributes`, `PersonAttributes`, `DeviceTrackerAttributes`, `ZoneAttributes`, `AutomationAttributes`) and the enums `ColorMode`, `FanDirection`, `RepeatMode`, `NumberMode`, `SourceType`, `RunMode`. `AttributeSet` gained `icon()`, `get_as::<T>(key)` and one `as_*` accessor per variant.
 *   `Target`: what a service call acts on (entities, devices, areas, floors, labels), with `From` impls for entity ids.
 *   `HaErrorCode`: typed Home Assistant error codes with an `Other(String)` fallback.

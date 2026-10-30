@@ -596,7 +596,7 @@ impl Runner {
                     None => {
                         log::error!("Home Assistant rejected re-subscription {sub_id}: {e}. Dropping it.");
                         let (code, message) = match e {
-                            Error::Ha { code, message } => (code, message),
+                            Error::Ha { code, message, .. } => (code, message),
                             other => (HaErrorCode::UnknownError, other.to_string()),
                         };
                         self.close_subscription(sub_id, SubscriptionStatus::Rejected { code, message });
@@ -701,7 +701,7 @@ impl Runner {
                 };
                 let state = match read_compressed(&payload, &entity_id) {
                     Ok(Some(state)) => Ok(state),
-                    Ok(None) => Err(Error::Ha { code: HaErrorCode::NotFound, message: format!("Entity '{entity_id}' not found") }),
+                    Ok(None) => Err(Error::ha(HaErrorCode::NotFound, format!("Entity '{entity_id}' not found"))),
                     Err(e) => Err(Error::from(e)),
                 };
                 let _ = responder.send(state);
@@ -774,7 +774,7 @@ impl Runner {
             if current.is_none() {
                 let ha_id = self.remove_subscription(sub_id);
                 let message = format!("Entity '{entity_id}' not found");
-                let _ = r.send(Err(Error::Ha { code: HaErrorCode::NotFound, message }));
+                let _ = r.send(Err(Error::ha(HaErrorCode::NotFound, message)));
                 return ha_id;
             }
             entry.last_state = Some(current);
